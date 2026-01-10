@@ -9,9 +9,9 @@ Provides CFG extraction for:
 
 Based on staticfg pattern but simplified for TLDR-code use case.
 """
+
 import ast
 from dataclasses import dataclass, field
-from typing import Any
 
 # Tree-sitter imports (optional)
 TREE_SITTER_AVAILABLE = False
@@ -22,18 +22,21 @@ try:
     from tree_sitter import Language, Parser
     import tree_sitter_typescript
     import tree_sitter_javascript
+
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     pass
 
 try:
     import tree_sitter_go
+
     TREE_SITTER_GO_AVAILABLE = True
 except ImportError:
     pass
 
 try:
     import tree_sitter_rust
+
     TREE_SITTER_RUST_AVAILABLE = True
 except ImportError:
     pass
@@ -41,6 +44,7 @@ except ImportError:
 TREE_SITTER_JAVA_AVAILABLE = False
 try:
     import tree_sitter_java
+
     TREE_SITTER_JAVA_AVAILABLE = True
 except ImportError:
     pass
@@ -48,6 +52,7 @@ except ImportError:
 TREE_SITTER_C_AVAILABLE = False
 try:
     import tree_sitter_c
+
     TREE_SITTER_C_AVAILABLE = True
 except ImportError:
     pass
@@ -55,6 +60,7 @@ except ImportError:
 TREE_SITTER_RUBY_AVAILABLE = False
 try:
     import tree_sitter_ruby
+
     TREE_SITTER_RUBY_AVAILABLE = True
 except ImportError:
     pass
@@ -62,6 +68,7 @@ except ImportError:
 TREE_SITTER_PHP_AVAILABLE = False
 try:
     import tree_sitter_php
+
     TREE_SITTER_PHP_AVAILABLE = True
 except ImportError:
     pass
@@ -69,6 +76,7 @@ except ImportError:
 TREE_SITTER_CPP_AVAILABLE = False
 try:
     import tree_sitter_cpp
+
     TREE_SITTER_CPP_AVAILABLE = True
 except ImportError:
     pass
@@ -76,6 +84,7 @@ except ImportError:
 TREE_SITTER_SWIFT_AVAILABLE = False
 try:
     import tree_sitter_swift
+
     TREE_SITTER_SWIFT_AVAILABLE = True
 except ImportError:
     pass
@@ -83,6 +92,7 @@ except ImportError:
 TREE_SITTER_CSHARP_AVAILABLE = False
 try:
     import tree_sitter_c_sharp
+
     TREE_SITTER_CSHARP_AVAILABLE = True
 except ImportError:
     pass
@@ -90,6 +100,7 @@ except ImportError:
 TREE_SITTER_KOTLIN_AVAILABLE = False
 try:
     import tree_sitter_kotlin
+
     TREE_SITTER_KOTLIN_AVAILABLE = True
 except ImportError:
     pass
@@ -97,6 +108,7 @@ except ImportError:
 TREE_SITTER_SCALA_AVAILABLE = False
 try:
     import tree_sitter_scala
+
     TREE_SITTER_SCALA_AVAILABLE = True
 except ImportError:
     pass
@@ -104,6 +116,7 @@ except ImportError:
 TREE_SITTER_ELIXIR_AVAILABLE = False
 try:
     import tree_sitter_elixir
+
     TREE_SITTER_ELIXIR_AVAILABLE = True
 except ImportError:
     pass
@@ -111,12 +124,13 @@ except ImportError:
 TREE_SITTER_LUA_AVAILABLE = False
 try:
     import tree_sitter_lua
+
     TREE_SITTER_LUA_AVAILABLE = True
 except ImportError:
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class CFGBlock:
     """
     Basic block - sequential statements with no internal branches.
@@ -125,13 +139,20 @@ class CFGBlock:
     - Control enters only at the first statement
     - Control leaves only at the last statement
     """
+
     id: int
     start_line: int
     end_line: int
-    block_type: str  # "entry", "branch", "loop_header", "loop_body", "return", "exit", "body"
+    block_type: (
+        str  # "entry", "branch", "loop_header", "loop_body", "return", "exit", "body"
+    )
     statements: list[str] = field(default_factory=list)  # Optional statement summaries
-    func_calls: list[str] = field(default_factory=list)  # Functions called in this block
-    predecessors: list[int] = field(default_factory=list)  # IDs of blocks that lead here
+    func_calls: list[str] = field(
+        default_factory=list
+    )  # Functions called in this block
+    predecessors: list[int] = field(
+        default_factory=list
+    )  # IDs of blocks that lead here
 
     def to_dict(self) -> dict:
         d = {
@@ -156,10 +177,10 @@ class CFGBlock:
         # Line numbers are 1-indexed, list is 0-indexed
         start_idx = max(0, self.start_line - 1)
         end_idx = min(len(lines), self.end_line)
-        return '\n'.join(lines[start_idx:end_idx])
+        return "\n".join(lines[start_idx:end_idx])
 
 
-@dataclass
+@dataclass(slots=True)
 class CFGEdge:
     """
     Edge between blocks with optional branch condition.
@@ -173,6 +194,7 @@ class CFGEdge:
     - "iterate": for-loop enters body
     - "exhausted": for-loop exits when iterator is done
     """
+
     source_id: int
     target_id: int
     edge_type: str
@@ -189,7 +211,7 @@ class CFGEdge:
         return d
 
 
-@dataclass
+@dataclass(slots=True)
 class CFGInfo:
     """
     Control flow graph for a function.
@@ -201,13 +223,16 @@ class CFGInfo:
     - Cyclomatic complexity metric
     - Nested function CFGs (closures, inner functions)
     """
+
     function_name: str
     blocks: list[CFGBlock]
     edges: list[CFGEdge]
     entry_block_id: int
     exit_block_ids: list[int]
     cyclomatic_complexity: int  # edges - nodes + 2
-    nested_cfgs: dict[str, "CFGInfo"] = field(default_factory=dict)  # name -> CFG for nested functions
+    nested_cfgs: dict[str, "CFGInfo"] = field(
+        default_factory=dict
+    )  # name -> CFG for nested functions
 
     def to_dict(self) -> dict:
         d = {
@@ -219,13 +244,16 @@ class CFGInfo:
             "cyclomatic_complexity": self.cyclomatic_complexity,
         }
         if self.nested_cfgs:
-            d["nested_functions"] = {name: cfg.to_dict() for name, cfg in self.nested_cfgs.items()}
+            d["nested_functions"] = {
+                name: cfg.to_dict() for name, cfg in self.nested_cfgs.items()
+            }
         return d
 
 
 # =============================================================================
 # Python CFG Extraction (using ast module)
 # =============================================================================
+
 
 class PythonCFGBuilder(ast.NodeVisitor):
     """
@@ -257,7 +285,9 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Nested function CFGs (closures, inner functions)
         self.nested_cfgs: dict[str, CFGInfo] = {}
 
-    def new_block(self, block_type: str, start_line: int, end_line: int | None = None) -> CFGBlock:
+    def new_block(
+        self, block_type: str, start_line: int, end_line: int | None = None
+    ) -> CFGBlock:
         """Create a new block and add it to the graph."""
         block = CFGBlock(
             id=self.current_block_id,
@@ -269,7 +299,13 @@ class PythonCFGBuilder(ast.NodeVisitor):
         self.current_block_id += 1
         return block
 
-    def add_edge(self, source_id: int, target_id: int, edge_type: str, condition: str | None = None):
+    def add_edge(
+        self,
+        source_id: int,
+        target_id: int,
+        edge_type: str,
+        condition: str | None = None,
+    ):
         """Add an edge between blocks."""
         edge = CFGEdge(
             source_id=source_id,
@@ -434,9 +470,15 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Process false branch (else/elif)
         if node.orelse:
             else_body_start = node.orelse[0].lineno
-            else_body_end = node.orelse[-1].end_lineno if hasattr(node.orelse[-1], 'end_lineno') else node.orelse[-1].lineno
+            else_body_end = (
+                node.orelse[-1].end_lineno
+                if hasattr(node.orelse[-1], "end_lineno")
+                else node.orelse[-1].lineno
+            )
             false_block = self.new_block("body", else_body_start, else_body_end)
-            self.add_edge(branch_block_id, false_block.id, "false", f"not ({condition})")
+            self.add_edge(
+                branch_block_id, false_block.id, "false", f"not ({condition})"
+            )
 
             self.current_block = false_block
             for stmt in node.orelse:
@@ -477,7 +519,11 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Create loop body block
         if node.body:
             body_start = node.body[0].lineno
-            body_end = node.body[-1].end_lineno if hasattr(node.body[-1], 'end_lineno') else node.body[-1].lineno
+            body_end = (
+                node.body[-1].end_lineno
+                if hasattr(node.body[-1], "end_lineno")
+                else node.body[-1].lineno
+            )
         else:
             body_start = node.lineno
             body_end = node.lineno
@@ -529,14 +575,22 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Create loop body block
         if node.body:
             body_start = node.body[0].lineno
-            body_end = node.body[-1].end_lineno if hasattr(node.body[-1], 'end_lineno') else node.body[-1].lineno
+            body_end = (
+                node.body[-1].end_lineno
+                if hasattr(node.body[-1], "end_lineno")
+                else node.body[-1].lineno
+            )
         else:
             body_start = node.lineno
             body_end = node.lineno
         body = self.new_block("loop_body", body_start, body_end)
 
         # Edge from guard to body (iterator has next)
-        target_str = self._get_condition_str(node.target) if isinstance(node.target, ast.expr) else str(node.target)
+        target_str = (
+            self._get_condition_str(node.target)
+            if isinstance(node.target, ast.expr)
+            else str(node.target)
+        )
         iter_str = self._get_condition_str(node.iter)
         self.add_edge(guard.id, body.id, "iterate", f"{target_str} in {iter_str}")
 
@@ -618,7 +672,9 @@ def extract_python_cfg(source: str, function_name: str) -> CFGInfo:
     raise ValueError(f"Function '{function_name}' not found in source")
 
 
-def extract_python_cfgs_batch(source: str, function_names: set[str] | None = None) -> dict[str, CFGInfo]:
+def extract_python_cfgs_batch(
+    source: str, function_names: set[str] | None = None
+) -> dict[str, CFGInfo]:
     """
     Extract CFGs for multiple functions in a single parse pass.
 
@@ -660,6 +716,7 @@ def extract_python_cfgs_batch(source: str, function_names: set[str] | None = Non
 # Tree-sitter based CFG extraction (TypeScript, Go, Rust)
 # =============================================================================
 
+
 class TreeSitterCFGBuilder:
     """
     Build CFG from tree-sitter parse tree.
@@ -670,18 +727,48 @@ class TreeSitterCFGBuilder:
     # Node type mappings per language
     IF_TYPES = {"if_statement", "if_expression", "if"}  # Ruby uses "if"
     WHILE_TYPES = {"while_statement", "while_expression", "while"}  # Ruby uses "while"
-    FOR_TYPES = {"for_statement", "for_expression", "for_in_statement", "for", "foreach_statement", "for_range_loop", "for_generic_clause", "for_numeric_clause"}  # Ruby uses "for", PHP uses "foreach_statement", C++ uses "for_range_loop", Lua uses for_generic/for_numeric
+    FOR_TYPES = {
+        "for_statement",
+        "for_expression",
+        "for_in_statement",
+        "for",
+        "foreach_statement",
+        "for_range_loop",
+        "for_generic_clause",
+        "for_numeric_clause",
+    }  # Ruby uses "for", PHP uses "foreach_statement", C++ uses "for_range_loop", Lua uses for_generic/for_numeric
     LOOP_TYPES = {"loop_expression"}  # Rust's infinite loop
     REPEAT_TYPES = {"repeat_statement"}  # Lua's repeat-until loop
-    RETURN_TYPES = {"return_statement", "return_expression", "return"}  # Ruby uses "return"
+    RETURN_TYPES = {
+        "return_statement",
+        "return_expression",
+        "return",
+    }  # Ruby uses "return"
     BREAK_TYPES = {"break_statement", "break_expression", "break"}  # Ruby uses "break"
-    CONTINUE_TYPES = {"continue_statement", "continue_expression", "next"}  # Ruby uses "next" for continue
-    CASE_TYPES = {"case_statement", "switch_statement", "case", "when_expression"}  # Ruby uses "case", Kotlin uses "when_expression"
-    BEGIN_RESCUE_TYPES = {"begin", "try_statement", "do_statement"}  # Ruby uses "begin" for try/rescue, Swift uses "do_statement" for do/catch
+    CONTINUE_TYPES = {
+        "continue_statement",
+        "continue_expression",
+        "next",
+    }  # Ruby uses "next" for continue
+    CASE_TYPES = {
+        "case_statement",
+        "switch_statement",
+        "case",
+        "when_expression",
+    }  # Ruby uses "case", Kotlin uses "when_expression"
+    BEGIN_RESCUE_TYPES = {
+        "begin",
+        "try_statement",
+        "do_statement",
+    }  # Ruby uses "begin" for try/rescue, Swift uses "do_statement" for do/catch
     GUARD_TYPES = {"guard_statement"}  # Swift guard statement
     FUNCTION_TYPES = {
-        "function_declaration", "function_definition", "function_item",
-        "method_definition", "arrow_function", "function_expression",
+        "function_declaration",
+        "function_definition",
+        "function_item",
+        "method_definition",
+        "arrow_function",
+        "function_expression",
         "method",  # Ruby uses "method"
     }
 
@@ -702,7 +789,9 @@ class TreeSitterCFGBuilder:
         # Decision points for complexity calculation
         self.decision_points: int = 0
 
-    def new_block(self, block_type: str, start_line: int, end_line: int | None = None) -> CFGBlock:
+    def new_block(
+        self, block_type: str, start_line: int, end_line: int | None = None
+    ) -> CFGBlock:
         block = CFGBlock(
             id=self.current_block_id,
             start_line=start_line,
@@ -713,7 +802,13 @@ class TreeSitterCFGBuilder:
         self.current_block_id += 1
         return block
 
-    def add_edge(self, source_id: int, target_id: int, edge_type: str, condition: str | None = None):
+    def add_edge(
+        self,
+        source_id: int,
+        target_id: int,
+        edge_type: str,
+        condition: str | None = None,
+    ):
         edge = CFGEdge(
             source_id=source_id,
             target_id=target_id,
@@ -724,7 +819,7 @@ class TreeSitterCFGBuilder:
 
     def get_node_text(self, node) -> str:
         """Get source text for a node."""
-        return self.source[node.start_byte:node.end_byte].decode('utf-8')
+        return self.source[node.start_byte : node.end_byte].decode("utf-8")
 
     def build(self, func_node, func_name: str) -> CFGInfo:
         """Build CFG from a function node."""
@@ -740,8 +835,7 @@ class TreeSitterCFGBuilder:
             # Update current block's end line to cover the body
             if self.current_block:
                 self.current_block.end_line = max(
-                    self.current_block.end_line,
-                    body.end_point[0] + 1
+                    self.current_block.end_line, body.end_point[0] + 1
                 )
 
         # Mark final block as exit if not already
@@ -750,8 +844,7 @@ class TreeSitterCFGBuilder:
             self.current_block.block_type = "exit"
             # Ensure exit block covers the whole function for simple functions
             self.current_block.end_line = max(
-                self.current_block.end_line,
-                func_node.end_point[0] + 1
+                self.current_block.end_line, func_node.end_point[0] + 1
             )
 
         # Calculate cyclomatic complexity: decision points + 1
@@ -769,7 +862,13 @@ class TreeSitterCFGBuilder:
     def _find_function_body(self, node):
         """Find the body/block child of a function node."""
         for child in node.children:
-            if child.type in {"statement_block", "block", "compound_statement", "expression_statement", "code_block"}:
+            if child.type in {
+                "statement_block",
+                "block",
+                "compound_statement",
+                "expression_statement",
+                "code_block",
+            }:
                 return child
             if child.type == "body":
                 return child
@@ -843,14 +942,19 @@ class TreeSitterCFGBuilder:
                     break
 
             if body:
-                loop_body = self.new_block("loop_body", body.start_point[0] + 1, body.end_point[0] + 1)
+                loop_body = self.new_block(
+                    "loop_body", body.start_point[0] + 1, body.end_point[0] + 1
+                )
                 self.add_edge(guard.id, loop_body.id, "iterate")
                 self.add_edge(guard.id, after_loop.id, "exhausted")
 
                 self.current_block = loop_body
                 self._visit_node(body)
 
-                if self.current_block and self.current_block.id not in self.exit_block_ids:
+                if (
+                    self.current_block
+                    and self.current_block.id not in self.exit_block_ids
+                ):
                     self.add_edge(self.current_block.id, guard.id, "back_edge")
 
             self.loop_guard_stack.pop()
@@ -898,7 +1002,9 @@ class TreeSitterCFGBuilder:
                 if child.type == "binary":
                     condition_node = child
                     break
-        condition = self.get_node_text(condition_node) if condition_node else "<condition>"
+        condition = (
+            self.get_node_text(condition_node) if condition_node else "<condition>"
+        )
 
         # Create after-if block
         after_if = self.new_block("body", node.end_point[0] + 1)
@@ -908,7 +1014,12 @@ class TreeSitterCFGBuilder:
         if not consequence:
             # Try statement_block for JS/TS
             for child in node.children:
-                if child.type in {"statement_block", "block", "compound_statement", "statements"}:
+                if child.type in {
+                    "statement_block",
+                    "block",
+                    "compound_statement",
+                    "statements",
+                }:
                     consequence = child
                     break
                 # Ruby: if body is in "then" child
@@ -917,7 +1028,9 @@ class TreeSitterCFGBuilder:
                     break
 
         if consequence:
-            true_block = self.new_block("body", consequence.start_point[0] + 1, consequence.end_point[0] + 1)
+            true_block = self.new_block(
+                "body", consequence.start_point[0] + 1, consequence.end_point[0] + 1
+            )
             self.add_edge(branch_block_id, true_block.id, "true", condition)
 
             self.current_block = true_block
@@ -935,8 +1048,12 @@ class TreeSitterCFGBuilder:
                     break
 
         if alternative:
-            false_block = self.new_block("body", alternative.start_point[0] + 1, alternative.end_point[0] + 1)
-            self.add_edge(branch_block_id, false_block.id, "false", f"not ({condition})")
+            false_block = self.new_block(
+                "body", alternative.start_point[0] + 1, alternative.end_point[0] + 1
+            )
+            self.add_edge(
+                branch_block_id, false_block.id, "false", f"not ({condition})"
+            )
 
             self.current_block = false_block
             self._visit_node(alternative)
@@ -966,7 +1083,9 @@ class TreeSitterCFGBuilder:
                 if child.type == "binary":
                     condition_node = child
                     break
-        condition = self.get_node_text(condition_node) if condition_node else "<condition>"
+        condition = (
+            self.get_node_text(condition_node) if condition_node else "<condition>"
+        )
 
         after_loop = self.new_block("body", node.end_point[0] + 1)
 
@@ -977,7 +1096,12 @@ class TreeSitterCFGBuilder:
         body = self._find_child_by_field(node, "body")
         if not body:
             for child in node.children:
-                if child.type in {"statement_block", "block", "compound_statement", "statements"}:
+                if child.type in {
+                    "statement_block",
+                    "block",
+                    "compound_statement",
+                    "statements",
+                }:
                     body = child
                     break
                 # Ruby: while body is in "do" child
@@ -986,7 +1110,9 @@ class TreeSitterCFGBuilder:
                     break
 
         if body:
-            loop_body = self.new_block("loop_body", body.start_point[0] + 1, body.end_point[0] + 1)
+            loop_body = self.new_block(
+                "loop_body", body.start_point[0] + 1, body.end_point[0] + 1
+            )
             self.add_edge(guard.id, loop_body.id, "true", condition)
             self.add_edge(guard.id, after_loop.id, "false", f"not ({condition})")
 
@@ -1019,12 +1145,19 @@ class TreeSitterCFGBuilder:
         body = self._find_child_by_field(node, "body")
         if not body:
             for child in node.children:
-                if child.type in {"statement_block", "block", "compound_statement", "statements"}:
+                if child.type in {
+                    "statement_block",
+                    "block",
+                    "compound_statement",
+                    "statements",
+                }:
                     body = child
                     break
 
         if body:
-            loop_body = self.new_block("loop_body", body.start_point[0] + 1, body.end_point[0] + 1)
+            loop_body = self.new_block(
+                "loop_body", body.start_point[0] + 1, body.end_point[0] + 1
+            )
             self.add_edge(guard.id, loop_body.id, "iterate")
             self.add_edge(guard.id, after_loop.id, "exhausted")
 
@@ -1061,7 +1194,9 @@ class TreeSitterCFGBuilder:
                 break
 
         if body:
-            loop_body = self.new_block("loop_body", body.start_point[0] + 1, body.end_point[0] + 1)
+            loop_body = self.new_block(
+                "loop_body", body.start_point[0] + 1, body.end_point[0] + 1
+            )
             # Infinite loop - always enters body
             self.add_edge(guard.id, loop_body.id, "unconditional")
 
@@ -1096,7 +1231,9 @@ class TreeSitterCFGBuilder:
         after_loop = self.new_block("body", node.end_point[0] + 1)
 
         # Track for break
-        self.loop_guard_stack.append(body.id)  # For repeat, body is the target for continue
+        self.loop_guard_stack.append(
+            body.id
+        )  # For repeat, body is the target for continue
         self.after_loop_stack.append(after_loop.id)
 
         # Visit body statements
@@ -1108,12 +1245,16 @@ class TreeSitterCFGBuilder:
 
         # Get condition (until clause)
         condition_node = node.child_by_field_name("condition")
-        condition = self.get_node_text(condition_node) if condition_node else "<condition>"
+        condition = (
+            self.get_node_text(condition_node) if condition_node else "<condition>"
+        )
 
         # After body, check condition: if true -> exit, if false -> repeat
         if self.current_block and self.current_block.id not in self.exit_block_ids:
             # False condition -> back to body
-            self.add_edge(self.current_block.id, body.id, "back_edge", f"not ({condition})")
+            self.add_edge(
+                self.current_block.id, body.id, "back_edge", f"not ({condition})"
+            )
             # True condition -> exit loop
             self.add_edge(self.current_block.id, after_loop.id, "true", condition)
 
@@ -1169,7 +1310,9 @@ class TreeSitterCFGBuilder:
                 break
 
         if else_body:
-            false_block = self.new_block("body", else_body.start_point[0] + 1, else_body.end_point[0] + 1)
+            false_block = self.new_block(
+                "body", else_body.start_point[0] + 1, else_body.end_point[0] + 1
+            )
             self.add_edge(branch_block_id, false_block.id, "false", "guard failed")
 
             self.current_block = false_block
@@ -1206,7 +1349,13 @@ class TreeSitterCFGBuilder:
         # C/C++: case_statement inside compound_statement
         # PHP: case_statement/default_statement inside switch_block
         # Others: switch_case, switch_entry, case_item directly under switch
-        case_types = ("case_statement", "default_statement", "switch_case", "switch_entry", "case_item")
+        case_types = (
+            "case_statement",
+            "default_statement",
+            "switch_case",
+            "switch_entry",
+            "case_item",
+        )
 
         def find_cases(parent_node):
             """Recursively find case nodes (they may be inside compound_statement/switch_block)."""
@@ -1222,14 +1371,17 @@ class TreeSitterCFGBuilder:
         for child in find_cases(node):
             # Each case is a new decision point
             self.decision_points += 1
-            case_block = self.new_block("body", child.start_point[0] + 1, child.end_point[0] + 1)
+            case_block = self.new_block(
+                "body", child.start_point[0] + 1, child.end_point[0] + 1
+            )
             self.add_edge(switch_block_id, case_block.id, "case")
 
             # Handle fallthrough from previous case (if no break/return)
             if prev_case_block and prev_case_block.id not in self.exit_block_ids:
                 has_break = any(
                     c.type in ("break_statement", "return_statement")
-                    for c in child.children if c.is_named
+                    for c in child.children
+                    if c.is_named
                 )
                 if not has_break:
                     self.add_edge(prev_case_block.id, case_block.id, "fallthrough")
@@ -1237,7 +1389,11 @@ class TreeSitterCFGBuilder:
             self.current_block = case_block
             # Visit case body
             for case_child in child.children:
-                if case_child.is_named and case_child.type not in ("case_pattern", "default_keyword", "number_literal"):
+                if case_child.is_named and case_child.type not in (
+                    "case_pattern",
+                    "default_keyword",
+                    "number_literal",
+                ):
                     self._visit_node(case_child)
 
             # Connect case to after_switch (unless it returns/breaks)
@@ -1260,6 +1416,7 @@ def _get_ts_parser(language: str):
         if not TREE_SITTER_AVAILABLE:
             raise ImportError("tree-sitter-typescript not available")
         import tree_sitter_typescript
+
         if language == "tsx":
             parser.language = Language(tree_sitter_typescript.language_tsx())
         else:
@@ -1268,72 +1425,86 @@ def _get_ts_parser(language: str):
         if not TREE_SITTER_AVAILABLE:
             raise ImportError("tree-sitter-javascript not available")
         import tree_sitter_javascript
+
         parser.language = Language(tree_sitter_javascript.language())
     elif language == "go":
         if not TREE_SITTER_GO_AVAILABLE:
             raise ImportError("tree-sitter-go not available")
         import tree_sitter_go
+
         parser.language = Language(tree_sitter_go.language())
     elif language == "rust":
         if not TREE_SITTER_RUST_AVAILABLE:
             raise ImportError("tree-sitter-rust not available")
         import tree_sitter_rust
+
         parser.language = Language(tree_sitter_rust.language())
     elif language == "java":
         if not TREE_SITTER_JAVA_AVAILABLE:
             raise ImportError("tree-sitter-java not available")
         import tree_sitter_java
+
         parser.language = Language(tree_sitter_java.language())
     elif language == "c":
         if not TREE_SITTER_C_AVAILABLE:
             raise ImportError("tree-sitter-c not available")
         import tree_sitter_c
+
         parser.language = Language(tree_sitter_c.language())
     elif language == "ruby":
         if not TREE_SITTER_RUBY_AVAILABLE:
             raise ImportError("tree-sitter-ruby not available")
         import tree_sitter_ruby
+
         parser.language = Language(tree_sitter_ruby.language())
     elif language == "php":
         if not TREE_SITTER_PHP_AVAILABLE:
             raise ImportError("tree-sitter-php not available")
         import tree_sitter_php
+
         # Use language_php() which handles PHP with embedded HTML
         parser.language = Language(tree_sitter_php.language_php())
     elif language == "cpp":
         if not TREE_SITTER_CPP_AVAILABLE:
             raise ImportError("tree-sitter-cpp not available")
         import tree_sitter_cpp
+
         parser.language = Language(tree_sitter_cpp.language())
     elif language == "swift":
         if not TREE_SITTER_SWIFT_AVAILABLE:
             raise ImportError("tree-sitter-swift not available")
         import tree_sitter_swift
+
         parser.language = Language(tree_sitter_swift.language())
     elif language == "csharp":
         if not TREE_SITTER_CSHARP_AVAILABLE:
             raise ImportError("tree-sitter-c-sharp not available")
         import tree_sitter_c_sharp
+
         parser.language = Language(tree_sitter_c_sharp.language())
     elif language == "kotlin":
         if not TREE_SITTER_KOTLIN_AVAILABLE:
             raise ImportError("tree-sitter-kotlin not available")
         import tree_sitter_kotlin
+
         parser.language = Language(tree_sitter_kotlin.language())
     elif language == "scala":
         if not TREE_SITTER_SCALA_AVAILABLE:
             raise ImportError("tree-sitter-scala not available")
         import tree_sitter_scala
+
         parser.language = Language(tree_sitter_scala.language())
     elif language == "elixir":
         if not TREE_SITTER_ELIXIR_AVAILABLE:
             raise ImportError("tree-sitter-elixir not available")
         import tree_sitter_elixir
+
         parser.language = Language(tree_sitter_elixir.language())
     elif language == "lua":
         if not TREE_SITTER_LUA_AVAILABLE:
             raise ImportError("tree-sitter-lua not available")
         import tree_sitter_lua
+
         parser.language = Language(tree_sitter_lua.language())
     else:
         raise ValueError(f"Unsupported language: {language}")
@@ -1344,8 +1515,12 @@ def _get_ts_parser(language: str):
 def _find_function_node(tree, function_name: str, language: str):
     """Find function node in tree-sitter tree by name."""
     func_types = {
-        "function_declaration", "function_definition", "function_item",
-        "method_definition", "arrow_function", "function_expression",
+        "function_declaration",
+        "function_definition",
+        "function_item",
+        "method_definition",
+        "arrow_function",
+        "function_expression",
         "method_declaration",
         "method",  # Ruby: def method_name ... end
     }
@@ -1355,7 +1530,11 @@ def _find_function_node(tree, function_name: str, language: str):
             # Try to get function name
             name_node = node.child_by_field_name("name")
             if name_node:
-                name = name_node.text.decode('utf-8') if hasattr(name_node, 'text') else str(name_node)
+                name = (
+                    name_node.text.decode("utf-8")
+                    if hasattr(name_node, "text")
+                    else str(name_node)
+                )
                 if name == function_name:
                     return node
             # For C/C++, the function name is in declarator.declarator (function_declarator -> identifier)
@@ -1372,20 +1551,35 @@ def _find_function_node(tree, function_name: str, language: str):
                 if declarator and declarator.type == "function_declarator":
                     inner_decl = declarator.child_by_field_name("declarator")
                     # Check both identifier (standalone functions) and field_identifier (class methods)
-                    if inner_decl and inner_decl.type in ("identifier", "field_identifier"):
-                        name = inner_decl.text.decode('utf-8') if hasattr(inner_decl, 'text') else str(inner_decl)
+                    if inner_decl and inner_decl.type in (
+                        "identifier",
+                        "field_identifier",
+                    ):
+                        name = (
+                            inner_decl.text.decode("utf-8")
+                            if hasattr(inner_decl, "text")
+                            else str(inner_decl)
+                        )
                         if name == function_name:
                             return node
             # For Go, check identifier child
             for child in node.children:
                 if child.type == "identifier":
-                    name = child.text.decode('utf-8') if hasattr(child, 'text') else str(child)
+                    name = (
+                        child.text.decode("utf-8")
+                        if hasattr(child, "text")
+                        else str(child)
+                    )
                     if name == function_name:
                         return node
             # For Swift/Kotlin, check simple_identifier child
             for child in node.children:
                 if child.type == "simple_identifier":
-                    name = child.text.decode('utf-8') if hasattr(child, 'text') else str(child)
+                    name = (
+                        child.text.decode("utf-8")
+                        if hasattr(child, "text")
+                        else str(child)
+                    )
                     if name == function_name:
                         return node
 
@@ -1403,7 +1597,7 @@ def extract_typescript_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_AVAILABLE:
         raise ImportError("tree-sitter not available for TypeScript parsing")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("typescript")
     tree = parser.parse(source_bytes)
 
@@ -1420,7 +1614,7 @@ def extract_go_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_GO_AVAILABLE:
         raise ImportError("tree-sitter-go not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("go")
     tree = parser.parse(source_bytes)
 
@@ -1437,7 +1631,7 @@ def extract_rust_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_RUST_AVAILABLE:
         raise ImportError("tree-sitter-rust not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("rust")
     tree = parser.parse(source_bytes)
 
@@ -1454,7 +1648,7 @@ def extract_java_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_JAVA_AVAILABLE:
         raise ImportError("tree-sitter-java not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("java")
     tree = parser.parse(source_bytes)
 
@@ -1471,7 +1665,7 @@ def extract_c_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_C_AVAILABLE:
         raise ImportError("tree-sitter-c not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("c")
     tree = parser.parse(source_bytes)
 
@@ -1488,7 +1682,7 @@ def extract_cpp_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_CPP_AVAILABLE:
         raise ImportError("tree-sitter-cpp not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("cpp")
     tree = parser.parse(source_bytes)
 
@@ -1517,7 +1711,7 @@ def extract_php_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_PHP_AVAILABLE:
         raise ImportError("tree-sitter-php not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("php")
     tree = parser.parse(source_bytes)
 
@@ -1534,7 +1728,7 @@ def extract_ruby_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_RUBY_AVAILABLE:
         raise ImportError("tree-sitter-ruby not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("ruby")
     tree = parser.parse(source_bytes)
 
@@ -1563,7 +1757,7 @@ def extract_swift_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_SWIFT_AVAILABLE:
         raise ImportError("tree-sitter-swift not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("swift")
     tree = parser.parse(source_bytes)
 
@@ -1592,7 +1786,7 @@ def extract_csharp_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_CSHARP_AVAILABLE:
         raise ImportError("tree-sitter-c-sharp not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("csharp")
     tree = parser.parse(source_bytes)
 
@@ -1621,7 +1815,7 @@ def extract_kotlin_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_KOTLIN_AVAILABLE:
         raise ImportError("tree-sitter-kotlin not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("kotlin")
     tree = parser.parse(source_bytes)
 
@@ -1650,7 +1844,7 @@ def extract_scala_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_SCALA_AVAILABLE:
         raise ImportError("tree-sitter-scala not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("scala")
     tree = parser.parse(source_bytes)
 
@@ -1679,7 +1873,7 @@ def extract_lua_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_LUA_AVAILABLE:
         raise ImportError("tree-sitter-lua not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("lua")
     tree = parser.parse(source_bytes)
 
@@ -1700,13 +1894,16 @@ def _find_lua_function_by_name(root, name: str, source: bytes):
     - function Table.name() ... end (table method)
     - function Table:name() ... end (table method with self)
     """
+
     def search(node):
         # Check function_declaration: function name() end or local function name() end
         if node.type == "function_declaration":
             # Find the identifier child (the function name)
             for child in node.children:
                 if child.type == "identifier":
-                    func_name = source[child.start_byte:child.end_byte].decode('utf-8')
+                    func_name = source[child.start_byte : child.end_byte].decode(
+                        "utf-8"
+                    )
                     if func_name == name:
                         return node
                     break  # Only check first identifier
@@ -1714,7 +1911,9 @@ def _find_lua_function_by_name(root, name: str, source: bytes):
                     # Table.method or Table:method - get the field name
                     field = child.child_by_field_name("field")
                     if field:
-                        func_name = source[field.start_byte:field.end_byte].decode('utf-8')
+                        func_name = source[field.start_byte : field.end_byte].decode(
+                            "utf-8"
+                        )
                         if func_name == name:
                             return node
                     break
@@ -1731,6 +1930,7 @@ def _find_lua_function_by_name(root, name: str, source: bytes):
 # =============================================================================
 # Elixir CFG Extraction
 # =============================================================================
+
 
 class ElixirCFGBuilder:
     """
@@ -1758,7 +1958,9 @@ class ElixirCFGBuilder:
         # Decision points for complexity
         self.decision_points: int = 0
 
-    def new_block(self, block_type: str, start_line: int, end_line: int | None = None) -> CFGBlock:
+    def new_block(
+        self, block_type: str, start_line: int, end_line: int | None = None
+    ) -> CFGBlock:
         block = CFGBlock(
             id=self.current_block_id,
             start_line=start_line,
@@ -1769,7 +1971,13 @@ class ElixirCFGBuilder:
         self.current_block_id += 1
         return block
 
-    def add_edge(self, source_id: int, target_id: int, edge_type: str, condition: str | None = None):
+    def add_edge(
+        self,
+        source_id: int,
+        target_id: int,
+        edge_type: str,
+        condition: str | None = None,
+    ):
         edge = CFGEdge(
             source_id=source_id,
             target_id=target_id,
@@ -1780,7 +1988,7 @@ class ElixirCFGBuilder:
 
     def get_node_text(self, node) -> str:
         """Get source text for a node."""
-        return self.source[node.start_byte:node.end_byte].decode('utf-8')
+        return self.source[node.start_byte : node.end_byte].decode("utf-8")
 
     def _get_call_name(self, node) -> str | None:
         """Get the name of a call node (e.g., 'if', 'def', 'case')."""
@@ -1810,8 +2018,7 @@ class ElixirCFGBuilder:
             self._visit_node(do_block)
             if self.current_block:
                 self.current_block.end_line = max(
-                    self.current_block.end_line,
-                    do_block.end_point[0] + 1
+                    self.current_block.end_line, do_block.end_point[0] + 1
                 )
 
         # Mark final block as exit
@@ -1819,13 +2026,16 @@ class ElixirCFGBuilder:
             self.exit_block_ids.append(self.current_block.id)
             self.current_block.block_type = "exit"
             self.current_block.end_line = max(
-                self.current_block.end_line,
-                func_node.end_point[0] + 1
+                self.current_block.end_line, func_node.end_point[0] + 1
             )
 
         # If no edges were created (simple straight-line function), create a separate
         # exit block and add an unconditional edge from entry to exit
-        if len(self.edges) == 0 and len(self.blocks) == 1 and self.entry_block_id is not None:
+        if (
+            len(self.edges) == 0
+            and len(self.blocks) == 1
+            and self.entry_block_id is not None
+        ):
             # Change entry block back to "body" type
             self.blocks[0].block_type = "entry"
             # Create a proper exit block
@@ -1915,7 +2125,9 @@ class ElixirCFGBuilder:
                         break
 
         if do_block:
-            true_block = self.new_block("body", do_block.start_point[0] + 1, do_block.end_point[0] + 1)
+            true_block = self.new_block(
+                "body", do_block.start_point[0] + 1, do_block.end_point[0] + 1
+            )
             self.add_edge(branch_block_id, true_block.id, "true", condition)
 
             self.current_block = true_block
@@ -1928,8 +2140,14 @@ class ElixirCFGBuilder:
                 self.add_edge(self.current_block.id, after_if.id, "unconditional")
 
         if else_block_node:
-            false_block = self.new_block("body", else_block_node.start_point[0] + 1, else_block_node.end_point[0] + 1)
-            self.add_edge(branch_block_id, false_block.id, "false", f"not ({condition})")
+            false_block = self.new_block(
+                "body",
+                else_block_node.start_point[0] + 1,
+                else_block_node.end_point[0] + 1,
+            )
+            self.add_edge(
+                branch_block_id, false_block.id, "false", f"not ({condition})"
+            )
 
             self.current_block = false_block
             self._visit_node(else_block_node)
@@ -1966,14 +2184,21 @@ class ElixirCFGBuilder:
             for child in do_block.children:
                 if child.type == "stab_clause":
                     self.decision_points += 1
-                    clause_block = self.new_block("body", child.start_point[0] + 1, child.end_point[0] + 1)
+                    clause_block = self.new_block(
+                        "body", child.start_point[0] + 1, child.end_point[0] + 1
+                    )
                     self.add_edge(case_block_id, clause_block.id, "case")
 
                     self.current_block = clause_block
                     self._visit_node(child)
 
-                    if self.current_block and self.current_block.id not in self.exit_block_ids:
-                        self.add_edge(self.current_block.id, after_case.id, "unconditional")
+                    if (
+                        self.current_block
+                        and self.current_block.id not in self.exit_block_ids
+                    ):
+                        self.add_edge(
+                            self.current_block.id, after_case.id, "unconditional"
+                        )
 
         self.current_block = after_case
 
@@ -2002,14 +2227,21 @@ class ElixirCFGBuilder:
             for child in do_block.children:
                 if child.type == "stab_clause":
                     self.decision_points += 1
-                    clause_block = self.new_block("body", child.start_point[0] + 1, child.end_point[0] + 1)
+                    clause_block = self.new_block(
+                        "body", child.start_point[0] + 1, child.end_point[0] + 1
+                    )
                     self.add_edge(cond_block_id, clause_block.id, "case")
 
                     self.current_block = clause_block
                     self._visit_node(child)
 
-                    if self.current_block and self.current_block.id not in self.exit_block_ids:
-                        self.add_edge(self.current_block.id, after_cond.id, "unconditional")
+                    if (
+                        self.current_block
+                        and self.current_block.id not in self.exit_block_ids
+                    ):
+                        self.add_edge(
+                            self.current_block.id, after_cond.id, "unconditional"
+                        )
 
         self.current_block = after_cond
 
@@ -2040,7 +2272,9 @@ class ElixirCFGBuilder:
 
         if do_block:
             # Success path
-            success_block = self.new_block("body", do_block.start_point[0] + 1, do_block.end_point[0] + 1)
+            success_block = self.new_block(
+                "body", do_block.start_point[0] + 1, do_block.end_point[0] + 1
+            )
             self.add_edge(with_block_id, success_block.id, "true", "with success")
 
             self.current_block = success_block
@@ -2053,7 +2287,11 @@ class ElixirCFGBuilder:
 
         if else_block_node:
             # Failure path
-            fail_block = self.new_block("body", else_block_node.start_point[0] + 1, else_block_node.end_point[0] + 1)
+            fail_block = self.new_block(
+                "body",
+                else_block_node.start_point[0] + 1,
+                else_block_node.end_point[0] + 1,
+            )
             self.add_edge(with_block_id, fail_block.id, "false", "with failure")
 
             self.current_block = fail_block
@@ -2078,13 +2316,16 @@ def _find_elixir_function_node(tree, function_name: str):
     - call node with identifier "def" or "defp"
     - arguments contain another call node with the function name
     """
+
     def find_in_node(node):
         if node.type == "call":
             # Check if this is a def/defp call
             call_name = None
             for child in node.children:
                 if child.type == "identifier":
-                    call_name = tree.root_node.text[child.start_byte:child.end_byte].decode('utf-8')
+                    call_name = tree.root_node.text[
+                        child.start_byte : child.end_byte
+                    ].decode("utf-8")
                     break
 
             if call_name in ("def", "defp"):
@@ -2101,12 +2342,16 @@ def _find_elixir_function_node(tree, function_name: str):
                             # This is the function call pattern: def func_name(args)
                             for c in arg_child.children:
                                 if c.type == "identifier":
-                                    name = tree.root_node.text[c.start_byte:c.end_byte].decode('utf-8')
+                                    name = tree.root_node.text[
+                                        c.start_byte : c.end_byte
+                                    ].decode("utf-8")
                                     if name == function_name:
                                         return node
                         elif arg_child.type == "identifier":
                             # Simple function with no args: def func_name do
-                            name = tree.root_node.text[arg_child.start_byte:arg_child.end_byte].decode('utf-8')
+                            name = tree.root_node.text[
+                                arg_child.start_byte : arg_child.end_byte
+                            ].decode("utf-8")
                             if name == function_name:
                                 return node
 
@@ -2136,7 +2381,7 @@ def extract_elixir_cfg(source: str, function_name: str) -> CFGInfo:
     if not TREE_SITTER_ELIXIR_AVAILABLE:
         raise ImportError("tree-sitter-elixir not available")
 
-    source_bytes = source.encode('utf-8')
+    source_bytes = source.encode("utf-8")
     parser = _get_ts_parser("elixir")
     tree = parser.parse(source_bytes)
 

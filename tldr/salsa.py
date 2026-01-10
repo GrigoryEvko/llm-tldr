@@ -26,6 +26,7 @@ Example usage:
     db.set_file("auth.py", "def login(): pass\\ndef logout(): pass")
     result = db.query(parse_file, db, "auth.py")  # Recomputes
 """
+
 from __future__ import annotations
 
 import functools
@@ -398,7 +399,10 @@ class SalsaDB:
             # Fast path: JSON serialize for large dicts (>10 items)
             if len(obj) > 10:
                 try:
-                    return ("__dict_hash__", hash(json.dumps(obj, sort_keys=True, default=str)))
+                    return (
+                        "__dict_hash__",
+                        hash(json.dumps(obj, sort_keys=True, default=str)),
+                    )
                 except (TypeError, ValueError):
                     pass
             # Small dicts: use tuple approach for better debuggability

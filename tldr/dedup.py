@@ -11,12 +11,29 @@ Benefits:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from tldr.patch import compute_file_hash, extract_edges_from_file, Edge
+
+# Use orjson for 3-10x JSON speedup, fallback to stdlib
+try:
+    import orjson
+
+    def _json_dumps(obj: Any) -> bytes:
+        return orjson.dumps(obj)
+
+    def _json_loads(data: bytes) -> Any:
+        return orjson.loads(data)
+except ImportError:
+    import json
+
+    def _json_dumps(obj: Any) -> bytes:
+        return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+    def _json_loads(data: bytes) -> Any:
+        return json.loads(data)
 
 
 @dataclass
@@ -44,11 +61,7 @@ class ContentHashedIndex:
     _extractions: int = field(default=0)
     _cache_hits: int = field(default=0)
 
-    def get_or_create_edges(
-        self,
-        file_path: str,
-        lang: str = "python"
-    ) -> List[Edge]:
+    def get_or_create_edges(self, file_path: str, lang: str = "python") -> List[Edge]:
         """Get edges for file, creating if needed. Uses content-hash dedup.
 
         Args:
@@ -62,6 +75,16 @@ class ContentHashedIndex:
         try:
             content_hash = compute_file_hash(file_path)
         except (FileNotFoundError, IOError):
+            # File deleted - clean up stale entries to prevent memory leak
+            if file_path in self._path_to_hash:
+                old_hash = self._path_to_hash.pop(file_path)
+                if old_hash in self._hash_to_paths:
+                    self._hash_to_paths[old_hash].discard(file_path)
+                    # Remove orphaned hash entries
+                    if not self._hash_to_paths[old_hash]:
+                        del self._hash_to_paths[old_hash]
+                        if old_hash in self._by_hash:
+                            del self._by_hash[old_hash]
             return []
 
         # Check if we've seen this file before with different content
@@ -85,13 +108,17 @@ class ContentHashedIndex:
             self._hash_to_paths[content_hash].add(file_path)
             # Remap edge paths to current file (cached edges have original file's path)
             cached_tuples = self._by_hash[content_hash]
-            remapped = [(file_path, func, file_path, target)
-                       for (_, func, _, target) in cached_tuples]
+            remapped = [
+                (file_path, func, file_path, target)
+                for (_, func, _, target) in cached_tuples
+            ]
             return self._edges_from_tuples(remapped)
 
         # Extract edges (new content or changed content)
         self._extractions += 1
-        edges = extract_edges_from_file(file_path, lang=lang, project_root=self.project_root)
+        edges = extract_edges_from_file(
+            file_path, lang=lang, project_root=self.project_root
+        )
 
         # Store by content hash
         edge_tuples = [e.to_tuple() for e in edges]
@@ -160,10 +187,10 @@ class ContentHashedIndex:
             "stats": {
                 "extractions": self._extractions,
                 "cache_hits": self._cache_hits,
-            }
+            },
         }
 
-        index_file.write_text(json.dumps(data, separators=(',', ':')))
+        index_file.write_bytes(_json_dumps(data))
 
     def load(self) -> bool:
         """Load index from disk.
@@ -178,8 +205,9 @@ class ContentHashedIndex:
             return False
 
         try:
-            data = json.loads(index_file.read_text())
-        except (json.JSONDecodeError, IOError):
+            data = _json_loads(index_file.read_bytes())
+        except (ValueError, IOError):
+            # ValueError covers both json.JSONDecodeError and orjson errors
             return False
 
         self._by_hash = data.get("by_hash", {})

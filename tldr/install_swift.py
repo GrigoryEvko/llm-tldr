@@ -35,7 +35,7 @@ def install_swift():
     if system == "darwin" and machine == "arm64":
         wheel = vendor_dir / "tree_sitter_swift-0.0.1-cp38-abi3-macosx_11_0_arm64.whl"
         if wheel.exists():
-            print(f"Found pre-built wheel for macOS ARM64")
+            print("Found pre-built wheel for macOS ARM64")
             print(f"Installing: {wheel.name}")
             print()
 
@@ -43,13 +43,20 @@ def install_swift():
             result = subprocess.run(
                 ["uv", "pip", "install", "--force-reinstall", str(wheel)],
                 capture_output=True,
-                text=True
+                text=True,
             )
             if result.returncode != 0:
                 result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--force-reinstall", str(wheel)],
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--force-reinstall",
+                        str(wheel),
+                    ],
                     capture_output=True,
-                    text=True
+                    text=True,
                 )
 
             if result.returncode == 0:

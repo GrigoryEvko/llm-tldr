@@ -16,10 +16,11 @@ import json
 import os
 import sys
 import threading
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 # Lazy imports for heavy dependencies
 _model = None
@@ -45,7 +46,7 @@ SUPPORTED_MODELS = {
 DEFAULT_MODEL = "bge-large-en-v1.5"
 
 
-@dataclass
+@dataclass(slots=True)
 class EmbeddingUnit:
     """A code unit (function/method/class) for embedding.
 
@@ -56,6 +57,7 @@ class EmbeddingUnit:
     - L4: dfg_summary
     - L5: dependencies
     """
+
     name: str
     qualified_name: str
     file: str
@@ -98,6 +100,7 @@ def _model_exists_locally(hf_name: str) -> bool:
     """Check if a model is already downloaded locally."""
     try:
         from huggingface_hub import try_to_load_from_cache
+
         # Check if model config exists in cache
         result = try_to_load_from_cache(hf_name, "config.json")
         return result is not None
@@ -170,9 +173,12 @@ def get_model(model_name: Optional[str] = None):
         if not _model_exists_locally(hf_name):
             model_key = model_name if model_name in SUPPORTED_MODELS else None
             if model_key and not _confirm_download(model_key):
-                raise ValueError("Model download declined. Use --model to choose a smaller model.")
+                raise ValueError(
+                    "Model download declined. Use --model to choose a smaller model."
+                )
 
         from sentence_transformers import SentenceTransformer
+
         _model = SentenceTransformer(hf_name)
         _model_name = hf_name
         return _model
@@ -252,7 +258,145 @@ def compute_embedding(text: str, model_name: Optional[str] = None):
     return np.array(embedding, dtype=np.float32)
 
 
-def extract_units_from_project(project_path: str, lang: str = "python", respect_ignore: bool = True) -> List[EmbeddingUnit]:
+# Threshold for switching to parallel processing
+MIN_FILES_FOR_PARALLEL = 15
+
+
+def _extract_units_from_file(
+    args: Tuple[Dict[str, Any], str, str, Dict[str, List[str]], Dict[str, List[str]]],
+) -> List[EmbeddingUnit]:
+    """Worker function for parallel unit extraction from a single file.
+
+    Processes one file and returns all EmbeddingUnit objects found.
+    Designed to be called via ProcessPoolExecutor.map().
+
+    Args:
+        args: Tuple of (file_info, project_path, lang, calls_map, called_by_map)
+            - file_info: Dict with 'path', 'functions', 'classes' keys
+            - project_path: String path to project root
+            - lang: Programming language
+            - calls_map: Dict mapping function names to their callees
+            - called_by_map: Dict mapping function names to their callers
+
+    Returns:
+        List of EmbeddingUnit objects extracted from the file.
+    """
+    file_info, project_path_str, lang, calls_map, called_by_map = args
+    project = Path(project_path_str)
+    units: List[EmbeddingUnit] = []
+
+    file_path = file_info.get("path", "")
+    full_path = project / file_path
+
+    # Parse AST once per file - extracts line numbers, code preview, signature, and docstring
+    ast_info, file_content, _ = _parse_file_ast(full_path, lang)
+
+    # Get imports for dependencies (L5)
+    dependencies = _get_file_dependencies(full_path, lang)
+
+    # Process functions
+    for func_name in file_info.get("functions", []):
+        func_data = ast_info.get("functions", {}).get(func_name, {})
+        signature = func_data.get("signature")
+        docstring = func_data.get("docstring")
+        line = func_data.get("line", 1)
+
+        # Get CFG summary (L3) - pass pre-read content to avoid file I/O
+        cfg_summary = _get_cfg_summary(full_path, func_name, lang, file_content)
+
+        # Get DFG summary (L4) - pass pre-read content to avoid file I/O
+        dfg_summary = _get_dfg_summary(full_path, func_name, lang, file_content)
+
+        code_preview = func_data.get("code_preview", "")
+
+        unit = EmbeddingUnit(
+            name=func_name,
+            qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
+            file=file_path,
+            line=line,
+            language=lang,
+            unit_type="function",
+            signature=signature or f"def {func_name}(...)",
+            docstring=docstring or "",
+            calls=calls_map.get(func_name, [])[:5],
+            called_by=called_by_map.get(func_name, [])[:5],
+            cfg_summary=cfg_summary,
+            dfg_summary=dfg_summary,
+            dependencies=dependencies,
+            code_preview=code_preview,
+        )
+        units.append(unit)
+
+    # Process classes
+    for class_info in file_info.get("classes", []):
+        if isinstance(class_info, dict):
+            class_name = class_info.get("name", "")
+            methods = class_info.get("methods", [])
+        else:
+            class_name = class_info
+            methods = []
+
+        class_data = ast_info.get("classes", {}).get(class_name, {})
+        class_line = class_data.get("line", 1)
+        class_docstring = class_data.get("docstring") or ""
+
+        # Add class itself
+        unit = EmbeddingUnit(
+            name=class_name,
+            qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
+            file=file_path,
+            line=class_line,
+            language=lang,
+            unit_type="class",
+            signature=f"class {class_name}",
+            docstring=class_docstring,
+            calls=[],
+            called_by=[],
+            cfg_summary="",
+            dfg_summary="",
+            dependencies=dependencies,
+            code_preview="",
+        )
+        units.append(unit)
+
+        # Add methods
+        for method in methods:
+            method_qualified = f"{class_name}.{method}"
+            method_data = ast_info.get("methods", {}).get(f"{class_name}.{method}", {})
+            method_line = method_data.get("line", 1)
+            method_preview = method_data.get("code_preview", "")
+            method_signature = (
+                method_data.get("signature") or f"def {method}(self, ...)"
+            )
+            method_docstring = method_data.get("docstring") or ""
+
+            cfg_summary = _get_cfg_summary(full_path, method, lang, file_content)
+            dfg_summary = _get_dfg_summary(full_path, method, lang, file_content)
+
+            unit = EmbeddingUnit(
+                name=method,
+                qualified_name=f"{file_path.replace('/', '.')}.{method_qualified}",
+                file=file_path,
+                line=method_line,
+                language=lang,
+                unit_type="method",
+                signature=method_signature,
+                docstring=method_docstring,
+                calls=calls_map.get(method, [])[:5],
+                called_by=called_by_map.get(method, [])[:5],
+                cfg_summary=cfg_summary,
+                dfg_summary=dfg_summary,
+                dependencies=dependencies,
+                code_preview=method_preview,
+            )
+            units.append(unit)
+
+    return units
+
+
+def extract_units_from_project(
+    project_path: str, lang: str = "python", respect_ignore: bool = True
+) -> List[EmbeddingUnit]:
     """Extract all functions/methods/classes from a project.
 
     Uses existing TLDR APIs:
@@ -282,7 +426,8 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
     if respect_ignore:
         spec = load_ignore_patterns(project)
         structure["files"] = [
-            f for f in structure.get("files", [])
+            f
+            for f in structure.get("files", [])
             if not should_ignore(project / f.get("path", ""), project, spec)
         ]
 
@@ -312,119 +457,27 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
         called_by_map = {}
 
     # Process each file in structure
-    for file_info in structure.get("files", []):
-        file_path = file_info.get("path", "")
-        full_path = project / file_path
+    files = structure.get("files", [])
+    project_str = str(project)
 
-        # Parse AST once per file - extracts line numbers, code preview, signature, and docstring
-        # Returns (ast_info, file_content, ast_tree) for reuse by CFG/DFG functions
-        # This eliminates 4N+1 file reads: 1 read replaces N reads each for signature, docstring, CFG, DFG
-        ast_info, file_content, _ = _parse_file_ast(full_path, lang)
+    if len(files) >= MIN_FILES_FOR_PARALLEL:
+        # Parallel processing for large projects
+        # Each worker processes one file independently
+        max_workers = min(os.cpu_count() or 4, 8)
+        args_list = [(f, project_str, lang, calls_map, called_by_map) for f in files]
 
-        # Get imports for dependencies (L5)
-        dependencies = _get_file_dependencies(full_path, lang)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_extract_units_from_file, args_list))
 
-        # Process functions
-        for func_name in file_info.get("functions", []):
-            # Get pre-extracted data from single AST parse (eliminates redundant parsing)
-            func_data = ast_info.get("functions", {}).get(func_name, {})
-            signature = func_data.get("signature")
-            docstring = func_data.get("docstring")
-
-            # Get line number from AST
-            line = func_data.get("line", 1)
-
-            # Get CFG summary (L3) - pass pre-read content to avoid file I/O
-            cfg_summary = _get_cfg_summary(full_path, func_name, lang, file_content)
-
-            # Get DFG summary (L4) - pass pre-read content to avoid file I/O
-            dfg_summary = _get_dfg_summary(full_path, func_name, lang, file_content)
-
-            # Get code preview from pre-extracted data
-            code_preview = func_data.get("code_preview", "")
-
-            unit = EmbeddingUnit(
-                name=func_name,
-                qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
-                file=file_path,
-                line=line,
-                language=lang,
-                unit_type="function",
-                signature=signature or f"def {func_name}(...)",
-                docstring=docstring or "",
-                calls=calls_map.get(func_name, [])[:5],
-                called_by=called_by_map.get(func_name, [])[:5],
-                cfg_summary=cfg_summary,
-                dfg_summary=dfg_summary,
-                dependencies=dependencies,
-                code_preview=code_preview,
-            )
-            units.append(unit)
-
-        # Process classes
-        for class_info in file_info.get("classes", []):
-            if isinstance(class_info, dict):
-                class_name = class_info.get("name", "")
-                methods = class_info.get("methods", [])
-            else:
-                class_name = class_info
-                methods = []
-
-            # Get pre-extracted class data from single AST parse
-            class_data = ast_info.get("classes", {}).get(class_name, {})
-            class_line = class_data.get("line", 1)
-            class_docstring = class_data.get("docstring") or ""
-
-            # Add class itself
-            unit = EmbeddingUnit(
-                name=class_name,
-                qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
-                file=file_path,
-                line=class_line,
-                language=lang,
-                unit_type="class",
-                signature=f"class {class_name}",
-                docstring=class_docstring,
-                calls=[],
-                called_by=[],
-                cfg_summary="",
-                dfg_summary="",
-                dependencies=dependencies,
-                code_preview="",
-            )
-            units.append(unit)
-
-            # Add methods
-            for method in methods:
-                method_qualified = f"{class_name}.{method}"
-                # Get pre-extracted method data from single AST parse
-                method_data = ast_info.get("methods", {}).get(f"{class_name}.{method}", {})
-                method_line = method_data.get("line", 1)
-                method_preview = method_data.get("code_preview", "")
-                method_signature = method_data.get("signature") or f"def {method}(self, ...)"
-                method_docstring = method_data.get("docstring") or ""
-
-                # CFG/DFG for methods - pass pre-read content to avoid file I/O
-                cfg_summary = _get_cfg_summary(full_path, method, lang, file_content)
-                dfg_summary = _get_dfg_summary(full_path, method, lang, file_content)
-
-                unit = EmbeddingUnit(
-                    name=method,
-                    qualified_name=f"{file_path.replace('/', '.')}.{method_qualified}",
-                    file=file_path,
-                    line=method_line,
-                    language=lang,
-                    unit_type="method",
-                    signature=method_signature,
-                    docstring=method_docstring,
-                    calls=calls_map.get(method, [])[:5],
-                    called_by=called_by_map.get(method, [])[:5],
-                    cfg_summary=cfg_summary,
-                    dfg_summary=dfg_summary,
-                    dependencies=dependencies,
-                    code_preview=method_preview,
-                )
-                units.append(unit)
+        # Flatten results from all workers
+        for batch in results:
+            units.extend(batch)
+    else:
+        # Sequential processing for small projects (avoids process spawn overhead)
+        for file_info in files:
+            args = (file_info, project_str, lang, calls_map, called_by_map)
+            file_units = _extract_units_from_file(args)
+            units.extend(file_units)
 
     return units
 
@@ -439,6 +492,7 @@ def _build_parent_map(tree) -> dict:
         Dict mapping child nodes to their parent nodes.
     """
     import ast
+
     parents = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
@@ -460,6 +514,7 @@ def _get_parent_class(node, parents: dict) -> str | None:
         Class name if node is a direct method of a class, None otherwise.
     """
     import ast
+
     current = parents.get(node)
     while current:
         if isinstance(current, ast.ClassDef):
@@ -544,11 +599,12 @@ def _parse_file_ast(file_path: Path, lang: str, content: Optional[str] = None) -
         except Exception:
             return result, "", None
 
-    lines = content.split('\n')
+    lines = content.split("\n")
 
     try:
         if lang == "python":
             import ast
+
             ast_tree = ast.parse(content)
 
             # Build parent map in O(N) - replaces O(N^3) nested ast.walk() calls
@@ -562,9 +618,11 @@ def _parse_file_ast(file_path: Path, lang: str, content: Optional[str] = None) -
                     # Extract code preview (first 10 lines of body)
                     # AST uses 1-indexed line numbers, Python lists are 0-indexed
                     start_line = node.lineno - 1  # Convert to 0-indexed for list access
-                    end_line = getattr(node, 'end_lineno', node.lineno + 10)  # end_lineno is 1-indexed, works as exclusive slice bound
-                    body_lines = lines[start_line:min(end_line, start_line + 10)]
-                    code_preview = '\n'.join(body_lines[:10])
+                    end_line = getattr(
+                        node, "end_lineno", node.lineno + 10
+                    )  # end_lineno is 1-indexed, works as exclusive slice bound
+                    body_lines = lines[start_line : min(end_line, start_line + 10)]
+                    code_preview = "\n".join(body_lines[:10])
 
                     # Extract signature and docstring in the same AST walk
                     # This eliminates 2N redundant ast.parse() calls per file
@@ -603,6 +661,7 @@ def _get_file_dependencies(file_path: Path, lang: str) -> str:
 
     try:
         from tldr.api import get_imports
+
         imports = get_imports(str(file_path), language=lang)
 
         # Extract module names (limit to first 5 for brevity)
@@ -617,7 +676,9 @@ def _get_file_dependencies(file_path: Path, lang: str) -> str:
         return ""
 
 
-def _get_cfg_summary(file_path: Path, func_name: str, lang: str, content: Optional[str] = None) -> str:
+def _get_cfg_summary(
+    file_path: Path, func_name: str, lang: str, content: Optional[str] = None
+) -> str:
     """Get CFG summary (complexity, block count) for a function.
 
     Args:
@@ -640,6 +701,7 @@ def _get_cfg_summary(file_path: Path, func_name: str, lang: str, content: Option
     try:
         if lang == "python":
             from tldr.cfg_extractor import extract_python_cfg
+
             cfg = extract_python_cfg(content, func_name)
             return f"complexity:{cfg.cyclomatic_complexity}, blocks:{len(cfg.blocks)}"
         # Add other languages as needed
@@ -649,7 +711,9 @@ def _get_cfg_summary(file_path: Path, func_name: str, lang: str, content: Option
     return ""
 
 
-def _get_dfg_summary(file_path: Path, func_name: str, lang: str, content: Optional[str] = None) -> str:
+def _get_dfg_summary(
+    file_path: Path, func_name: str, lang: str, content: Optional[str] = None
+) -> str:
     """Get DFG summary (variable count, def-use chains) for a function.
 
     Args:
@@ -672,6 +736,7 @@ def _get_dfg_summary(file_path: Path, func_name: str, lang: str, content: Option
     try:
         if lang == "python":
             from tldr.dfg_extractor import extract_python_dfg
+
             dfg = extract_python_dfg(content, func_name)
 
             # Count unique variables and def-use chains
@@ -690,6 +755,7 @@ def _get_dfg_summary(file_path: Path, func_name: str, lang: str, content: Option
 # Cached wrappers for CFG/DFG extraction to avoid repeated file I/O and parsing.
 # Uses string paths (hashable) as cache keys.
 # Cache size of 1000 handles typical project sizes; entries evicted LRU when exceeded.
+
 
 @lru_cache(maxsize=1000)
 def _get_cfg_summary_cached(file_path_str: str, func_name: str, lang: str) -> str:
@@ -828,6 +894,7 @@ def _get_progress_console():
         return None
     try:
         from rich.console import Console
+
         return Console()
     except ImportError:
         return None
@@ -880,10 +947,14 @@ def build_semantic_index(
     # Extract all units (respecting .tldrignore)
     if console:
         with console.status("[bold green]Extracting code units...") as status:
-            units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
+            units = extract_units_from_project(
+                str(project), lang=lang, respect_ignore=respect_ignore
+            )
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
-        units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
+        units = extract_units_from_project(
+            str(project), lang=lang, respect_ignore=respect_ignore
+        )
 
     if not units:
         return 0
@@ -977,10 +1048,14 @@ def semantic_search(
 
     # Check index exists
     if not index_file.exists():
-        raise FileNotFoundError(f"Semantic index not found at {index_file}. Run build_semantic_index first.")
+        raise FileNotFoundError(
+            f"Semantic index not found at {index_file}. Run build_semantic_index first."
+        )
 
     if not metadata_file.exists():
-        raise FileNotFoundError(f"Metadata not found at {metadata_file}. Run build_semantic_index first.")
+        raise FileNotFoundError(
+            f"Metadata not found at {metadata_file}. Run build_semantic_index first."
+        )
 
     # Load index and metadata
     index = faiss.read_index(str(index_file))
@@ -1022,7 +1097,9 @@ def semantic_search(
         if expand_graph:
             result["calls"] = unit.get("calls", [])
             result["called_by"] = unit.get("called_by", [])
-            result["related"] = list(set(unit.get("calls", []) + unit.get("called_by", [])))
+            result["related"] = list(
+                set(unit.get("calls", []) + unit.get("called_by", []))
+            )
 
         results.append(result)
 

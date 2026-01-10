@@ -14,7 +14,6 @@ P5 Features (Incremental Performance):
 - File change notifications trigger cache invalidation
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -27,6 +26,65 @@ from typing import Any, Optional
 
 from tldr.dedup import ContentHashedIndex
 from tldr.salsa import SalsaDB, salsa_query
+
+
+# Fast hashing: blake3 (5-10x faster than md5) with hashlib fallback
+try:
+    import blake3
+
+    def _hash_string(s: str, length: int = 8) -> str:
+        """Hash a string using blake3 for speed.
+
+        Args:
+            s: String to hash
+            length: Number of hex characters to return (default 8)
+
+        Returns:
+            Truncated hexadecimal hash string
+        """
+        return blake3.blake3(s.encode()).hexdigest()[:length]
+
+except ImportError:
+    import hashlib
+
+    def _hash_string(s: str, length: int = 8) -> str:
+        """Hash a string using md5 (fallback when blake3 unavailable).
+
+        Args:
+            s: String to hash
+            length: Number of hex characters to return (default 8)
+
+        Returns:
+            Truncated hexadecimal hash string
+        """
+        return hashlib.md5(s.encode()).hexdigest()[:length]
+
+
+# Fast JSON serialization for IPC hot paths
+# orjson is 3-10x faster than stdlib json for encoding/decoding
+try:
+    import orjson
+
+    def _json_dumps(obj: Any) -> bytes:
+        """Serialize object to JSON bytes using orjson (fast path)."""
+        return orjson.dumps(obj)
+
+    def _json_loads(data: bytes | str) -> Any:
+        """Deserialize JSON bytes/str to object using orjson (fast path)."""
+        return orjson.loads(data)
+
+except ImportError:
+    # Fallback to stdlib json if orjson not installed
+    def _json_dumps(obj: Any) -> bytes:
+        """Serialize object to JSON bytes using stdlib json (slow path)."""
+        return json.dumps(obj).encode("utf-8")
+
+    def _json_loads(data: bytes | str) -> Any:
+        """Deserialize JSON bytes/str to object using stdlib json (slow path)."""
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return json.loads(data)
+
 
 # Idle timeout: default 30 minutes, configurable via TLDR_IDLE_TIMEOUT env var
 # Set to 0 to disable idle timeout (daemon runs forever)
@@ -47,10 +105,12 @@ logger = logging.getLogger(__name__)
 # Salsa Query Functions (P5)
 # -------------------------------------------------------------------------
 
+
 @salsa_query
 def cached_search(db: SalsaDB, project: str, pattern: str, max_results: int) -> dict:
     """Cached search query - memoized by SalsaDB."""
     from tldr import api
+
     results = api.search(pattern=pattern, root=Path(project), max_results=max_results)
     return {"status": "ok", "results": results}
 
@@ -59,14 +119,18 @@ def cached_search(db: SalsaDB, project: str, pattern: str, max_results: int) -> 
 def cached_extract(db: SalsaDB, file_path: str) -> dict:
     """Cached file extraction - memoized by SalsaDB."""
     from tldr import api
+
     result = api.extract_file(file_path)
     return {"status": "ok", "result": result}
 
 
 @salsa_query
-def cached_dead_code(db: SalsaDB, project: str, entry_points: tuple, language: str) -> dict:
+def cached_dead_code(
+    db: SalsaDB, project: str, entry_points: tuple, language: str
+) -> dict:
     """Cached dead code analysis - memoized by SalsaDB."""
     from tldr.analysis import analyze_dead_code
+
     # Convert tuple back to list for the API
     entry_list = list(entry_points) if entry_points else None
     result = analyze_dead_code(project, entry_points=entry_list, language=language)
@@ -77,6 +141,7 @@ def cached_dead_code(db: SalsaDB, project: str, entry_points: tuple, language: s
 def cached_architecture(db: SalsaDB, project: str, language: str) -> dict:
     """Cached architecture analysis - memoized by SalsaDB."""
     from tldr.analysis import analyze_architecture
+
     result = analyze_architecture(project, language=language)
     return {"status": "ok", "result": result}
 
@@ -85,6 +150,7 @@ def cached_architecture(db: SalsaDB, project: str, language: str) -> dict:
 def cached_cfg(db: SalsaDB, file_path: str, function: str, language: str) -> dict:
     """Cached CFG extraction - memoized by SalsaDB."""
     from tldr.api import get_cfg_context
+
     result = get_cfg_context(file_path, function, language=language)
     return {"status": "ok", "result": result}
 
@@ -93,42 +159,57 @@ def cached_cfg(db: SalsaDB, file_path: str, function: str, language: str) -> dic
 def cached_dfg(db: SalsaDB, file_path: str, function: str, language: str) -> dict:
     """Cached DFG extraction - memoized by SalsaDB."""
     from tldr.api import get_dfg_context
+
     result = get_dfg_context(file_path, function, language=language)
     return {"status": "ok", "result": result}
 
 
 @salsa_query
-def cached_slice(db: SalsaDB, file_path: str, function: str, line: int, direction: str, variable: str) -> dict:
+def cached_slice(
+    db: SalsaDB, file_path: str, function: str, line: int, direction: str, variable: str
+) -> dict:
     """Cached program slice - memoized by SalsaDB."""
     from tldr.api import get_slice
+
     var = variable if variable else None
     lines = get_slice(file_path, function, line, direction=direction, variable=var)
     return {"status": "ok", "lines": sorted(lines), "count": len(lines)}
 
 
 @salsa_query
-def cached_tree(db: SalsaDB, project: str, extensions: tuple, exclude_hidden: bool) -> dict:
+def cached_tree(
+    db: SalsaDB, project: str, extensions: tuple, exclude_hidden: bool
+) -> dict:
     """Cached file tree - memoized by SalsaDB."""
     from tldr.api import get_file_tree
+
     ext_set = set(extensions) if extensions else None
     result = get_file_tree(project, extensions=ext_set, exclude_hidden=exclude_hidden)
     return {"status": "ok", "result": result}
 
 
 @salsa_query
-def cached_structure(db: SalsaDB, project: str, language: str, max_results: int) -> dict:
+def cached_structure(
+    db: SalsaDB, project: str, language: str, max_results: int
+) -> dict:
     """Cached code structure - memoized by SalsaDB."""
     from tldr.api import get_code_structure
+
     result = get_code_structure(project, language=language, max_results=max_results)
     return {"status": "ok", "result": result}
 
 
 @salsa_query
-def cached_context(db: SalsaDB, project: str, entry: str, language: str, depth: int) -> dict:
+def cached_context(
+    db: SalsaDB, project: str, entry: str, language: str, depth: int
+) -> dict:
     """Cached relevant context - memoized by SalsaDB."""
     from dataclasses import asdict
     from tldr.api import get_relevant_context
-    result = get_relevant_context(project=project, entry_point=entry, language=language, depth=depth)
+
+    result = get_relevant_context(
+        project=project, entry_point=entry, language=language, depth=depth
+    )
     # Convert dataclass to dict for JSON serialization
     return {"status": "ok", "result": asdict(result)}
 
@@ -137,6 +218,7 @@ def cached_context(db: SalsaDB, project: str, entry: str, language: str, depth: 
 def cached_imports(db: SalsaDB, file_path: str, language: str) -> dict:
     """Cached imports extraction - memoized by SalsaDB."""
     from tldr.api import get_imports
+
     result = get_imports(file_path, language=language)
     return {"status": "ok", "imports": result}
 
@@ -158,10 +240,12 @@ def cached_importers(db: SalsaDB, project: str, module: str, language: str) -> d
                 mod = imp.get("module", "")
                 names = imp.get("names", [])
                 if module in mod or module in names:
-                    importers.append({
-                        "file": str(Path(file_path).relative_to(project_path)),
-                        "import": imp,
-                    })
+                    importers.append(
+                        {
+                            "file": str(Path(file_path).relative_to(project_path)),
+                            "import": imp,
+                        }
+                    )
         except Exception:
             pass
 
@@ -210,7 +294,7 @@ class TLDRDaemon:
 
     def _compute_socket_path(self) -> Path:
         """Compute deterministic socket path from project path."""
-        hash_val = hashlib.md5(str(self.project).encode()).hexdigest()[:8]
+        hash_val = _hash_string(str(self.project))
         return Path(f"/tmp/tldr-{hash_val}.sock")
 
     def _load_semantic_config(self) -> dict:
@@ -258,7 +342,7 @@ class TLDRDaemon:
         """
         if sys.platform == "win32":
             # TCP on localhost with deterministic port from hash
-            hash_val = hashlib.md5(str(self.project).encode()).hexdigest()[:8]
+            hash_val = _hash_string(str(self.project))
             port = 49152 + (int(hash_val, 16) % 10000)
             return ("127.0.0.1", port)
         else:
@@ -429,11 +513,13 @@ class TLDRDaemon:
             if callee:
                 if callee not in reverse_index:
                     reverse_index[callee] = []
-                reverse_index[callee].append({
-                    "caller": caller,
-                    "file": caller_file,
-                    "line": line,
-                })
+                reverse_index[callee].append(
+                    {
+                        "caller": caller,
+                        "file": caller_file,
+                        "line": line,
+                    }
+                )
         return reverse_index
 
     def _ensure_call_graph_loaded(self):
@@ -446,7 +532,9 @@ class TLDRDaemon:
             try:
                 call_graph = json.loads(call_graph_path.read_text())
                 self.indexes["call_graph"] = call_graph
-                self.indexes["reverse_call_graph"] = self._build_reverse_index(call_graph)
+                self.indexes["reverse_call_graph"] = self._build_reverse_index(
+                    call_graph
+                )
                 logger.info(
                     f"Loaded call graph from {call_graph_path}: "
                     f"{len(call_graph.get('edges', []))} edges, "
@@ -502,7 +590,10 @@ class TLDRDaemon:
         file_path = command.get("file")
         function = command.get("function")
         if not file_path or not function:
-            return {"status": "error", "message": "Missing required parameters: file, function"}
+            return {
+                "status": "error",
+                "message": "Missing required parameters: file, function",
+            }
 
         try:
             language = command.get("language", "python")
@@ -522,7 +613,10 @@ class TLDRDaemon:
         file_path = command.get("file")
         function = command.get("function")
         if not file_path or not function:
-            return {"status": "error", "message": "Missing required parameters: file, function"}
+            return {
+                "status": "error",
+                "message": "Missing required parameters: file, function",
+            }
 
         try:
             language = command.get("language", "python")
@@ -543,7 +637,10 @@ class TLDRDaemon:
         function = command.get("function")
         line = command.get("line")
         if not file_path or not function or line is None:
-            return {"status": "error", "message": "Missing required parameters: file, function, line"}
+            return {
+                "status": "error",
+                "message": "Missing required parameters: file, function, line",
+            }
 
         try:
             direction = command.get("direction", "backward")
@@ -566,10 +663,16 @@ class TLDRDaemon:
         try:
             language = command.get("language", "python")
             from tldr.cross_file_calls import build_project_call_graph
+
             graph = build_project_call_graph(self.project, language=language)
             result = {
                 "edges": [
-                    {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
+                    {
+                        "from_file": e[0],
+                        "from_func": e[1],
+                        "to_file": e[2],
+                        "to_func": e[3],
+                    }
                     for e in graph.edges
                 ],
                 "count": len(graph.edges),
@@ -594,7 +697,12 @@ class TLDRDaemon:
             cache_file = cache_dir / "call_graph.json"
             cache_data = {
                 "edges": [
-                    {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
+                    {
+                        "from_file": e[0],
+                        "from_func": e[1],
+                        "to_file": e[2],
+                        "to_func": e[3],
+                    }
                     for e in graph.edges
                 ],
                 "timestamp": time.time(),
@@ -625,7 +733,10 @@ class TLDRDaemon:
             elif action == "search":
                 query = command.get("query")
                 if not query:
-                    return {"status": "error", "message": "Missing required parameter: query"}
+                    return {
+                        "status": "error",
+                        "message": "Missing required parameter: query",
+                    }
                 k = command.get("k", 10)
                 results = semantic_search(str(self.project), query, k=k)
                 return {"status": "ok", "results": results}
@@ -801,12 +912,13 @@ class TLDRDaemon:
             if file_path not in self._dirty_files:
                 self._dirty_files.add(file_path)
                 self._dirty_count += 1
-                logger.info(f"Dirty file tracked: {file_path} (count: {self._dirty_count})")
+                logger.info(
+                    f"Dirty file tracked: {file_path} (count: {self._dirty_count})"
+                )
 
             # Check if we should trigger background re-indexing
             should_reindex = (
-                self._dirty_count >= threshold
-                and not self._reindex_in_progress
+                self._dirty_count >= threshold and not self._reindex_in_progress
             )
             # Capture current count for response while holding lock
             current_dirty_count = self._dirty_count
@@ -843,14 +955,20 @@ class TLDRDaemon:
             self._reindex_in_progress = True
             dirty_files = list(self._dirty_files)
 
-        logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
+        logger.info(
+            f"Triggering background semantic re-index for {len(dirty_files)} files"
+        )
 
         def do_reindex():
             try:
                 # Run semantic index command
                 cmd = [
-                    sys.executable, "-m", "tldr.cli",
-                    "semantic", "index", str(self.project)
+                    sys.executable,
+                    "-m",
+                    "tldr.cli",
+                    "semantic",
+                    "index",
+                    str(self.project),
                 ]
                 result = subprocess.run(
                     cmd,
@@ -862,7 +980,9 @@ class TLDRDaemon:
                 if result.returncode == 0:
                     logger.info("Background semantic re-index completed successfully")
                 else:
-                    logger.error(f"Background semantic re-index failed: {result.stderr}")
+                    logger.error(
+                        f"Background semantic re-index failed: {result.stderr}"
+                    )
 
             except Exception as e:
                 logger.exception(f"Background semantic re-index error: {e}")
@@ -900,7 +1020,10 @@ class TLDRDaemon:
 
         target = str(self.project) if check_project else file_path
         if not target:
-            return {"status": "error", "message": "Missing required parameter: file or project"}
+            return {
+                "status": "error",
+                "message": "Missing required parameter: file or project",
+            }
 
         errors = []
 
@@ -917,16 +1040,21 @@ class TLDRDaemon:
             if result.stdout:
                 try:
                     import json
+
                     pyright_output = json.loads(result.stdout)
                     for diag in pyright_output.get("generalDiagnostics", []):
-                        errors.append({
-                            "type": "type",
-                            "severity": diag.get("severity", "error"),
-                            "file": diag.get("file", ""),
-                            "line": diag.get("range", {}).get("start", {}).get("line", 0),
-                            "message": diag.get("message", ""),
-                            "rule": diag.get("rule", "pyright"),
-                        })
+                        errors.append(
+                            {
+                                "type": "type",
+                                "severity": diag.get("severity", "error"),
+                                "file": diag.get("file", ""),
+                                "line": diag.get("range", {})
+                                .get("start", {})
+                                .get("line", 0),
+                                "message": diag.get("message", ""),
+                                "rule": diag.get("rule", "pyright"),
+                            }
+                        )
                 except json.JSONDecodeError:
                     pass
         except FileNotFoundError:
@@ -950,16 +1078,21 @@ class TLDRDaemon:
                 if result.stdout:
                     try:
                         import json
+
                         ruff_output = json.loads(result.stdout)
                         for diag in ruff_output:
-                            errors.append({
-                                "type": "lint",
-                                "severity": "warning" if diag.get("fix") else "error",
-                                "file": diag.get("filename", ""),
-                                "line": diag.get("location", {}).get("row", 0),
-                                "message": diag.get("message", ""),
-                                "rule": diag.get("code", "ruff"),
-                            })
+                            errors.append(
+                                {
+                                    "type": "lint",
+                                    "severity": "warning"
+                                    if diag.get("fix")
+                                    else "error",
+                                    "file": diag.get("filename", ""),
+                                    "line": diag.get("location", {}).get("row", 0),
+                                    "message": diag.get("message", ""),
+                                    "rule": diag.get("code", "ruff"),
+                                }
+                            )
                     except json.JSONDecodeError:
                         pass
             except FileNotFoundError:
@@ -1021,7 +1154,11 @@ class TLDRDaemon:
                     cwd=str(self.project),
                 )
                 if result.returncode == 0:
-                    files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+                    files = [
+                        f.strip()
+                        for f in result.stdout.strip().split("\n")
+                        if f.strip()
+                    ]
             except Exception as e:
                 logger.debug(f"git diff failed: {e}")
 
@@ -1051,6 +1188,7 @@ class TLDRDaemon:
 
             try:
                 from tldr.ast_extractor import extract_file
+
                 info = extract_file(str(full_path))
                 for func in info.get("functions", []):
                     changed_functions.add(func.get("name", ""))
@@ -1072,16 +1210,16 @@ class TLDRDaemon:
 
         # Method 2: Import analysis - find test files that import changed modules
         # Optimization: Scan project once, read each test file once, check all modules
-        module_names = {
-            Path(fp).stem for fp in files if fp.endswith(".py")
-        }
+        module_names = {Path(fp).stem for fp in files if fp.endswith(".py")}
 
         if module_names:
             try:
                 from tldr.cross_file_calls import scan_project
 
                 # Scan project ONCE (was called once per file - O(f) down to O(1))
-                test_files = [f for f in scan_project(self.project) if "test" in f.lower()]
+                test_files = [
+                    f for f in scan_project(self.project) if "test" in f.lower()
+                ]
 
                 # Read each test file ONCE and check all module names
                 for test_file in test_files:
@@ -1090,7 +1228,10 @@ class TLDRDaemon:
                             content = f.read()
                             # Check all changed modules against this test file
                             for module_name in module_names:
-                                if f"import {module_name}" in content or f"from {module_name}" in content:
+                                if (
+                                    f"import {module_name}" in content
+                                    or f"from {module_name}" in content
+                                ):
                                     affected_tests.add(test_file)
                                     break  # No need to check more modules for this file
                     except Exception:
@@ -1285,15 +1426,15 @@ class TLDRDaemon:
                     "status": "error",
                     "message": f"Request too large: exceeds {MAX_REQUEST_SIZE} byte limit",
                 }
-                conn.sendall(json.dumps(response).encode() + b"\n")
+                conn.sendall(_json_dumps(response) + b"\n")
             elif data:
                 try:
-                    command = json.loads(data.decode().strip())
+                    command = _json_loads(data.strip())
                     response = self.handle_command(command)
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     response = {"status": "error", "message": f"Invalid JSON: {e}"}
 
-                conn.sendall(json.dumps(response).encode() + b"\n")
+                conn.sendall(_json_dumps(response) + b"\n")
         except BrokenPipeError:
             # Client disconnected before receiving response - normal occurrence
             logger.debug("Client disconnected before receiving response")
@@ -1439,7 +1580,7 @@ def stop_daemon(project_path: str | Path) -> bool:
 
     try:
         client = _create_client_socket(daemon)
-        client.sendall(json.dumps({"cmd": "shutdown"}).encode() + b"\n")
+        client.sendall(_json_dumps({"cmd": "shutdown"}) + b"\n")
         client.recv(4096)  # Wait for response before closing
         client.close()
         return True
@@ -1467,7 +1608,7 @@ def query_daemon(project_path: str | Path, command: dict) -> dict:
 
     client = _create_client_socket(daemon)
     try:
-        client.sendall(json.dumps(command).encode() + b"\n")
+        client.sendall(_json_dumps(command) + b"\n")
         # Read until newline (complete JSON response) using chunked reads
         response = b""
         while True:
@@ -1477,7 +1618,7 @@ def query_daemon(project_path: str | Path, command: dict) -> dict:
             response += chunk
             if b"\n" in response:
                 break
-        return json.loads(response.decode())
+        return _json_loads(response)
     finally:
         client.close()
 
@@ -1487,7 +1628,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="TLDR Daemon")
     parser.add_argument("project", help="Project path")
-    parser.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    parser.add_argument(
+        "--foreground", "-f", action="store_true", help="Run in foreground"
+    )
     parser.add_argument("--stop", action="store_true", help="Stop the daemon")
     parser.add_argument("--status", action="store_true", help="Get daemon status")
 

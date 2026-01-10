@@ -23,10 +23,38 @@ Usage:
 """
 
 import fcntl
-import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Set, Union
+from typing import Any, Iterable, List, Set, Union
+
+# orjson is faster but optional - fallback to stdlib json
+try:
+    import orjson
+
+    _JSONDecodeError = orjson.JSONDecodeError
+
+    def _json_dumps(obj: Any) -> str:
+        """Serialize object to compact JSON string."""
+        return orjson.dumps(obj).decode("utf-8")
+
+    def _json_loads(data: bytes | str) -> Any:
+        """Deserialize JSON data (bytes or str)."""
+        return orjson.loads(data)
+
+except ImportError:
+    import json
+
+    _JSONDecodeError = json.JSONDecodeError
+
+    def _json_dumps(obj: Any) -> str:
+        """Serialize object to compact JSON string."""
+        return json.dumps(obj, separators=(",", ":"))
+
+    def _json_loads(data: bytes | str) -> Any:
+        """Deserialize JSON data (bytes or str)."""
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return json.loads(data)
 
 
 # Path to dirty flag file relative to project root
@@ -85,8 +113,8 @@ def _mark_dirty_impl(
             # Parse existing data or create new
             if content:
                 try:
-                    data = json.loads(content)
-                except json.JSONDecodeError:
+                    data = _json_loads(content)
+                except _JSONDecodeError:
                     data = None
             else:
                 data = None
@@ -110,7 +138,7 @@ def _mark_dirty_impl(
                 # Write back atomically (truncate and rewrite)
                 f.seek(0)
                 f.truncate()
-                f.write(json.dumps(data, separators=(',', ':')))
+                f.write(_json_dumps(data))
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -177,9 +205,9 @@ def get_dirty_files(project_path: Union[str, Path]) -> List[str]:
         return []
 
     try:
-        data = json.loads(dirty_path.read_text())
+        data = _json_loads(dirty_path.read_bytes())
         return data.get("dirty_files", [])
-    except (json.JSONDecodeError, IOError):
+    except (_JSONDecodeError, IOError):
         return []
 
 

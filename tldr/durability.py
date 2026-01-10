@@ -11,11 +11,9 @@ volatile on demand.
 from __future__ import annotations
 
 import json
-import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from tldr.cross_file_calls import ProjectCallGraph
 
@@ -66,11 +64,16 @@ class DurablePartition:
     Stores edges from a specific package/dependency. The package_key
     identifies the package (e.g., "lodash@4.17.21", "numpy").
     """
+
     package_key: str = ""
     _edges: Set[Tuple[str, str, str, str]] = field(default_factory=set)
-    _edges_by_file: Dict[str, List[Tuple[str, str, str, str]]] = field(default_factory=dict)
+    _edges_by_file: Dict[str, List[Tuple[str, str, str, str]]] = field(
+        default_factory=dict
+    )
 
-    def add_edge(self, src_file: str, src_func: str, dst_file: str, dst_func: str) -> None:
+    def add_edge(
+        self, src_file: str, src_func: str, dst_file: str, dst_func: str
+    ) -> None:
         """Add a call edge to this partition."""
         edge = (src_file, src_func, dst_file, dst_func)
         self._edges.add(edge)
@@ -111,6 +114,7 @@ class VolatilePartition:
 
     Wraps a ProjectCallGraph for user source code that changes often.
     """
+
     graph: ProjectCallGraph = field(default_factory=ProjectCallGraph)
 
     @property
@@ -118,7 +122,9 @@ class VolatilePartition:
         """Return all edges in this partition."""
         return self.graph.edges
 
-    def add_edge(self, src_file: str, src_func: str, dst_file: str, dst_func: str) -> None:
+    def add_edge(
+        self, src_file: str, src_func: str, dst_file: str, dst_func: str
+    ) -> None:
         """Add a call edge to this partition."""
         self.graph.add_edge(src_file, src_func, dst_file, dst_func)
 
@@ -168,15 +174,12 @@ class PartitionedIndex:
     3. On-demand loading of volatile indexes
     4. Merged queries across both partitions
     """
+
     durable: Dict[str, DurablePartition] = field(default_factory=dict)
     volatile: VolatilePartition = field(default_factory=VolatilePartition)
 
     def add_edge(
-        self,
-        src_file: str,
-        src_func: str,
-        dst_file: str,
-        dst_func: str
+        self, src_file: str, src_func: str, dst_file: str, dst_func: str
     ) -> None:
         """Add an edge, routing to appropriate partition based on durability."""
         if is_durable(src_file):

@@ -37,6 +37,7 @@ class Edge:
 
     Format: (src_file, src_func, dst_file, dst_func)
     """
+
     id: str
     src_file: str
     src_func: str
@@ -54,7 +55,7 @@ class Edge:
         src_func: str,
         dst_file: str,
         dst_func: str,
-        edge_id: Optional[str] = None
+        edge_id: Optional[str] = None,
     ) -> Edge:
         """Create Edge from standard tuple format."""
         return cls(
@@ -62,7 +63,7 @@ class Edge:
             src_file=src_file,
             src_func=src_func,
             dst_file=dst_file,
-            dst_func=dst_func
+            dst_func=dst_func,
         )
 
     def to_dict(self) -> dict:
@@ -72,7 +73,7 @@ class Edge:
             "src_file": self.src_file,
             "src_func": self.src_func,
             "dst_file": self.dst_file,
-            "dst_func": self.dst_func
+            "dst_func": self.dst_func,
         }
 
     @classmethod
@@ -83,7 +84,7 @@ class Edge:
             src_file=data["src_file"],
             src_func=data["src_func"],
             dst_file=data["dst_file"],
-            dst_func=data["dst_func"]
+            dst_func=data["dst_func"],
         )
 
 
@@ -99,6 +100,7 @@ class ImmutableStack:
     Query semantics: Search current stack first, then parent, then grandparent, etc.
     If an edge ID is in `deletions`, it's treated as non-existent even if in parent.
     """
+
     id: str
     parent: Optional[ImmutableStack] = None
     created_at: datetime = field(default_factory=datetime.now)
@@ -178,7 +180,7 @@ class ImmutableStack:
             "created_at": self.created_at.isoformat(),
             "edges": [e.to_dict() for e in self.edges],
             "deletions": list(self.deletions),
-            "parent": self.parent.to_dict() if self.parent else None
+            "parent": self.parent.to_dict() if self.parent else None,
         }
 
     @classmethod
@@ -193,7 +195,7 @@ class ImmutableStack:
             parent=parent,
             created_at=datetime.fromisoformat(data["created_at"]),
             edges=[Edge.from_dict(e) for e in data.get("edges", [])],
-            deletions=set(data.get("deletions", []))
+            deletions=set(data.get("deletions", [])),
         )
 
 
@@ -215,11 +217,7 @@ class StackedDB:
         self.current = base
 
     def add_edge(
-        self,
-        src_file: str,
-        src_func: str,
-        dst_file: str,
-        dst_func: str
+        self, src_file: str, src_func: str, dst_file: str, dst_func: str
     ) -> Edge:
         """Add an edge to the current stack."""
         edge = Edge.from_tuple(src_file, src_func, dst_file, dst_func)
@@ -250,7 +248,7 @@ class StackedDB:
             parent=self.current,
             created_at=datetime.now(),
             edges=[],
-            deletions=set()
+            deletions=set(),
         )
         return StackedDB(base=new_stack)
 
@@ -280,7 +278,7 @@ class StackedDB:
             parent=None,
             created_at=datetime.now(),
             edges=all_edges,
-            deletions=set()
+            deletions=set(),
         )
         return StackedDB(base=new_stack)
 

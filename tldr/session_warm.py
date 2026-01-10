@@ -19,10 +19,11 @@ from typing import Optional
 
 def _get_subprocess_detach_kwargs():
     """Get platform-specific kwargs for detaching subprocess."""
-    if os.name == 'nt':  # Windows
-        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+    if os.name == "nt":  # Windows
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     else:  # Unix (Mac/Linux)
-        return {'start_new_session': True}
+        return {"start_new_session": True}
+
 
 # Default max age for cache in hours
 DEFAULT_MAX_AGE_HOURS = 24
@@ -82,7 +83,9 @@ def get_cache_age(project_path: Path) -> Optional[float]:
         return None
 
 
-def is_cache_stale(project_path: Path, max_age_hours: float = DEFAULT_MAX_AGE_HOURS) -> bool:
+def is_cache_stale(
+    project_path: Path, max_age_hours: float = DEFAULT_MAX_AGE_HOURS
+) -> bool:
     """
     Check if the call graph cache is stale.
 

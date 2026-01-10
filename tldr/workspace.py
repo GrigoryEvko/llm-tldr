@@ -52,8 +52,7 @@ def load_workspace_config(project_path: Union[str, Path]) -> WorkspaceConfig:
 
     if not config_file.exists():
         return WorkspaceConfig(
-            active_packages=[],
-            exclude_patterns=DEFAULT_EXCLUDE_PATTERNS.copy()
+            active_packages=[], exclude_patterns=DEFAULT_EXCLUDE_PATTERNS.copy()
         )
 
     try:
@@ -62,8 +61,7 @@ def load_workspace_config(project_path: Union[str, Path]) -> WorkspaceConfig:
     except (json.JSONDecodeError, IOError):
         # Invalid JSON or read error - return defaults
         return WorkspaceConfig(
-            active_packages=[],
-            exclude_patterns=DEFAULT_EXCLUDE_PATTERNS.copy()
+            active_packages=[], exclude_patterns=DEFAULT_EXCLUDE_PATTERNS.copy()
         )
 
     # Extract fields with defaults for missing keys
@@ -76,8 +74,7 @@ def load_workspace_config(project_path: Union[str, Path]) -> WorkspaceConfig:
         exclude_patterns = DEFAULT_EXCLUDE_PATTERNS.copy()
 
     return WorkspaceConfig(
-        active_packages=active_packages,
-        exclude_patterns=exclude_patterns
+        active_packages=active_packages, exclude_patterns=exclude_patterns
     )
 
 

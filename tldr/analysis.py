@@ -326,9 +326,7 @@ def architecture_analysis(call_graph: "CallGraph") -> dict:
         )
 
     return {
-        "entry_layer": [
-            {"file": f.file, "function": f.name} for f in entry_layer[:20]
-        ],
+        "entry_layer": [{"file": f.file, "function": f.name} for f in entry_layer[:20]],
         "leaf_layer": [{"file": f.file, "function": f.name} for f in leaf_layer[:20]],
         "middle_layer_count": len(middle_layer),
         "directory_layers": layer_inference,

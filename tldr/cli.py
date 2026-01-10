@@ -12,6 +12,7 @@ Usage:
     tldr dfg <file> <function>          Data flow graph
     tldr slice <file> <func> <line>     Program slice
 """
+
 import argparse
 import json
 import os
@@ -24,40 +25,41 @@ from . import __version__
 def _get_subprocess_detach_kwargs():
     """Get platform-specific kwargs for detaching subprocess."""
     import subprocess
-    if os.name == 'nt':  # Windows
-        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+
+    if os.name == "nt":  # Windows
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     else:  # Unix (Mac/Linux)
-        return {'start_new_session': True}
+        return {"start_new_session": True}
 
 
 # Extension to language mapping for auto-detection
 EXTENSION_TO_LANGUAGE = {
-    '.java': 'java',
-    '.py': 'python',
-    '.ts': 'typescript',
-    '.tsx': 'typescript',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.c': 'c',
-    '.h': 'c',
-    '.cpp': 'cpp',
-    '.hpp': 'cpp',
-    '.cc': 'cpp',
-    '.cxx': 'cpp',
-    '.hh': 'cpp',
-    '.rb': 'ruby',
-    '.php': 'php',
-    '.swift': 'swift',
-    '.cs': 'csharp',
-    '.kt': 'kotlin',
-    '.kts': 'kotlin',
-    '.scala': 'scala',
-    '.sc': 'scala',
-    '.lua': 'lua',
-    '.ex': 'elixir',
-    '.exs': 'elixir',
+    ".java": "java",
+    ".py": "python",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".go": "go",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".hpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hh": "cpp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".cs": "csharp",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".lua": "lua",
+    ".ex": "elixir",
+    ".exs": "elixir",
 }
 
 
@@ -71,7 +73,7 @@ def detect_language_from_extension(file_path: str) -> str:
         Language name (defaults to 'python' if unknown)
     """
     ext = Path(file_path).suffix.lower()
-    return EXTENSION_TO_LANGUAGE.get(ext, 'python')
+    return EXTENSION_TO_LANGUAGE.get(ext, "python")
 
 
 def _show_first_run_tip():
@@ -83,6 +85,7 @@ def _show_first_run_tip():
     # Check if Swift is already installed
     try:
         import tree_sitter_swift
+
         # Swift already works, no tip needed
         marker.touch()
         return
@@ -91,6 +94,7 @@ def _show_first_run_tip():
 
     # Show tip
     import sys
+
     print("Tip: For Swift support, run: python -m tldr.install_swift", file=sys.stderr)
     print("     (This message appears once)", file=sys.stderr)
     print(file=sys.stderr)
@@ -105,7 +109,9 @@ def main():
         description="Token-efficient code analysis for LLMs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Version: %(prog)s """ + __version__ + """
+Version: %(prog)s """
+        + __version__
+        + """
 
 Examples:
     tldr tree src/                      # File tree for src/
@@ -140,7 +146,8 @@ Semantic Search:
 
     # Global flags
     parser.add_argument(
-        "-v", "--version",
+        "-v",
+        "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
@@ -153,6 +160,7 @@ Semantic Search:
     # Shell completion support
     try:
         import shtab
+
         shtab.add_argument_to(parser, ["--print-completion", "-s"])
     except ImportError:
         pass  # shtab is optional
@@ -175,8 +183,24 @@ Semantic Search:
     struct_p.add_argument(
         "--lang",
         default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c",
-                 "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir"],
+        choices=[
+            "python",
+            "typescript",
+            "javascript",
+            "go",
+            "rust",
+            "java",
+            "c",
+            "cpp",
+            "ruby",
+            "php",
+            "kotlin",
+            "swift",
+            "csharp",
+            "scala",
+            "lua",
+            "elixir",
+        ],
         help="Language to analyze",
     )
     struct_p.add_argument(
@@ -195,15 +219,26 @@ Semantic Search:
         "--max", type=int, default=100, help="Max results (default: 100, 0=unlimited)"
     )
     search_p.add_argument(
-        "--max-files", type=int, default=10000, help="Max files to scan (default: 10000)"
+        "--max-files",
+        type=int,
+        default=10000,
+        help="Max files to scan (default: 10000)",
     )
 
     # tldr extract <file> [--class X] [--function Y] [--method Class.method]
     extract_p = subparsers.add_parser("extract", help="Extract full file info")
     extract_p.add_argument("file", help="File to analyze")
-    extract_p.add_argument("--class", dest="filter_class", help="Filter to specific class")
-    extract_p.add_argument("--function", dest="filter_function", help="Filter to specific function")
-    extract_p.add_argument("--method", dest="filter_method", help="Filter to specific method (Class.method)")
+    extract_p.add_argument(
+        "--class", dest="filter_class", help="Filter to specific class"
+    )
+    extract_p.add_argument(
+        "--function", dest="filter_function", help="Filter to specific function"
+    )
+    extract_p.add_argument(
+        "--method",
+        dest="filter_method",
+        help="Filter to specific method (Class.method)",
+    )
 
     # tldr context <entry>
     ctx_p = subparsers.add_parser("context", help="Get relevant context for LLM")
@@ -213,8 +248,24 @@ Semantic Search:
     ctx_p.add_argument(
         "--lang",
         default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c",
-                 "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir"],
+        choices=[
+            "python",
+            "typescript",
+            "javascript",
+            "go",
+            "rust",
+            "java",
+            "c",
+            "cpp",
+            "ruby",
+            "php",
+            "kotlin",
+            "swift",
+            "csharp",
+            "scala",
+            "lua",
+            "elixir",
+        ],
         help="Language",
     )
 
@@ -222,13 +273,21 @@ Semantic Search:
     cfg_p = subparsers.add_parser("cfg", help="Control flow graph")
     cfg_p.add_argument("file", help="Source file")
     cfg_p.add_argument("function", help="Function name")
-    cfg_p.add_argument("--lang", default=None, help="Language (auto-detected from extension if not specified)")
+    cfg_p.add_argument(
+        "--lang",
+        default=None,
+        help="Language (auto-detected from extension if not specified)",
+    )
 
     # tldr dfg <file> <function>
     dfg_p = subparsers.add_parser("dfg", help="Data flow graph")
     dfg_p.add_argument("file", help="Source file")
     dfg_p.add_argument("function", help="Function name")
-    dfg_p.add_argument("--lang", default=None, help="Language (auto-detected from extension if not specified)")
+    dfg_p.add_argument(
+        "--lang",
+        default=None,
+        help="Language (auto-detected from extension if not specified)",
+    )
 
     # tldr slice <file> <function> <line>
     slice_p = subparsers.add_parser("slice", help="Program slice")
@@ -242,7 +301,11 @@ Semantic Search:
         help="Slice direction",
     )
     slice_p.add_argument("--var", help="Variable to track (optional)")
-    slice_p.add_argument("--lang", default=None, help="Language (auto-detected from extension if not specified)")
+    slice_p.add_argument(
+        "--lang",
+        default=None,
+        help="Language (auto-detected from extension if not specified)",
+    )
 
     # tldr calls <path>
     calls_p = subparsers.add_parser("calls", help="Build cross-file call graph")
@@ -279,7 +342,11 @@ Semantic Search:
         "imports", help="Parse imports from a source file"
     )
     imports_p.add_argument("file", help="Source file to analyze")
-    imports_p.add_argument("--lang", default=None, help="Language (auto-detected from extension if not specified)")
+    imports_p.add_argument(
+        "--lang",
+        default=None,
+        help="Language (auto-detected from extension if not specified)",
+    )
 
     # tldr importers <module> [path]
     importers_p = subparsers.add_parser(
@@ -294,7 +361,9 @@ Semantic Search:
         "change-impact", help="Find tests affected by changed files"
     )
     impact_p.add_argument(
-        "files", nargs="*", help="Files to analyze (default: auto-detect from session/git)"
+        "files",
+        nargs="*",
+        help="Files to analyze (default: auto-detect from session/git)",
     )
     impact_p.add_argument(
         "--session", action="store_true", help="Use session-modified files (dirty_flag)"
@@ -314,12 +383,12 @@ Semantic Search:
     )
 
     # tldr diagnostics <file|path>
-    diag_p = subparsers.add_parser(
-        "diagnostics", help="Get type and lint diagnostics"
-    )
+    diag_p = subparsers.add_parser("diagnostics", help="Get type and lint diagnostics")
     diag_p.add_argument("target", help="File or project directory to check")
     diag_p.add_argument(
-        "--project", action="store_true", help="Check entire project (default: single file)"
+        "--project",
+        action="store_true",
+        help="Check entire project (default: single file)",
     )
     diag_p.add_argument(
         "--no-lint", action="store_true", help="Skip linter, only run type checker"
@@ -360,7 +429,9 @@ Semantic Search:
     search_p.add_argument("query", help="Natural language query")
     search_p.add_argument("--path", default=".", help="Project root")
     search_p.add_argument("--k", type=int, default=5, help="Number of results")
-    search_p.add_argument("--expand", action="store_true", help="Include call graph expansion")
+    search_p.add_argument(
+        "--expand", action="store_true", help="Include call graph expansion"
+    )
     search_p.add_argument("--lang", default="python", help="Language")
     search_p.add_argument(
         "--model",
@@ -369,43 +440,59 @@ Semantic Search:
     )
 
     # tldr daemon start/stop/status/query
-    daemon_p = subparsers.add_parser(
-        "daemon", help="Daemon management subcommands"
-    )
+    daemon_p = subparsers.add_parser("daemon", help="Daemon management subcommands")
     daemon_sub = daemon_p.add_subparsers(dest="action", required=True)
 
     # tldr daemon start [--project PATH]
-    daemon_start_p = daemon_sub.add_parser("start", help="Start daemon for project (background)")
-    daemon_start_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
+    daemon_start_p = daemon_sub.add_parser(
+        "start", help="Start daemon for project (background)"
+    )
+    daemon_start_p.add_argument(
+        "--project", "-p", default=".", help="Project path (default: current directory)"
+    )
 
     # tldr daemon stop [--project PATH]
     daemon_stop_p = daemon_sub.add_parser("stop", help="Stop daemon gracefully")
-    daemon_stop_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
+    daemon_stop_p.add_argument(
+        "--project", "-p", default=".", help="Project path (default: current directory)"
+    )
 
     # tldr daemon status [--project PATH]
     daemon_status_p = daemon_sub.add_parser("status", help="Check if daemon running")
-    daemon_status_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
+    daemon_status_p.add_argument(
+        "--project", "-p", default=".", help="Project path (default: current directory)"
+    )
 
     # tldr daemon query CMD [--project PATH]
-    daemon_query_p = daemon_sub.add_parser("query", help="Send raw JSON command to daemon")
-    daemon_query_p.add_argument("cmd", help="Command to send (e.g., ping, status, search)")
-    daemon_query_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
+    daemon_query_p = daemon_sub.add_parser(
+        "query", help="Send raw JSON command to daemon"
+    )
+    daemon_query_p.add_argument(
+        "cmd", help="Command to send (e.g., ping, status, search)"
+    )
+    daemon_query_p.add_argument(
+        "--project", "-p", default=".", help="Project path (default: current directory)"
+    )
 
     # tldr daemon notify FILE [--project PATH]
-    daemon_notify_p = daemon_sub.add_parser("notify", help="Notify daemon of file change (triggers reindex at threshold)")
+    daemon_notify_p = daemon_sub.add_parser(
+        "notify", help="Notify daemon of file change (triggers reindex at threshold)"
+    )
     daemon_notify_p.add_argument("file", help="Path to changed file")
-    daemon_notify_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
+    daemon_notify_p.add_argument(
+        "--project", "-p", default=".", help="Project path (default: current directory)"
+    )
 
     # tldr doctor [--install LANG]
     doctor_p = subparsers.add_parser(
         "doctor", help="Check and install diagnostic tools (type checkers, linters)"
     )
     doctor_p.add_argument(
-        "--install", metavar="LANG", help="Install missing tools for language (e.g., python, go)"
+        "--install",
+        metavar="LANG",
+        help="Install missing tools for language (e.g., python, go)",
     )
-    doctor_p.add_argument(
-        "--json", action="store_true", help="Output as JSON"
-    )
+    doctor_p.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
 
@@ -441,6 +528,7 @@ Semantic Search:
         3. If cache exists with dirty files, patch incrementally
         """
         import time
+
         project = Path(project_path).resolve()
         cache_dir = project / ".tldr" / "cache"
         cache_file = cache_dir / "call_graph.json"
@@ -452,7 +540,9 @@ Semantic Search:
                 # Reconstruct graph from cache
                 graph = ProjectCallGraph()
                 for e in cache_data.get("edges", []):
-                    graph.add_edge(e["from_file"], e["from_func"], e["to_file"], e["to_func"])
+                    graph.add_edge(
+                        e["from_file"], e["from_func"], e["to_file"], e["to_func"]
+                    )
 
                 # Check for dirty files
                 if is_dirty(project):
@@ -461,12 +551,19 @@ Semantic Search:
                     for rel_file in dirty_files:
                         abs_file = project / rel_file
                         if abs_file.exists():
-                            graph = patch_call_graph(graph, str(abs_file), str(project), lang=lang)
+                            graph = patch_call_graph(
+                                graph, str(abs_file), str(project), lang=lang
+                            )
 
                     # Update cache with patched graph
                     cache_data = {
                         "edges": [
-                            {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
+                            {
+                                "from_file": e[0],
+                                "from_func": e[1],
+                                "to_file": e[2],
+                                "to_func": e[3],
+                            }
                             for e in graph.edges
                         ],
                         "timestamp": time.time(),
@@ -517,7 +614,8 @@ Semantic Search:
         elif args.command == "search":
             ext = set(args.ext) if args.ext else None
             result = api_search(
-                args.pattern, args.path,
+                args.pattern,
+                args.path,
                 extensions=ext,
                 context_lines=args.context,
                 max_results=args.max,
@@ -537,7 +635,8 @@ Semantic Search:
                 # Filter classes
                 if filter_class:
                     result["classes"] = [
-                        c for c in result.get("classes", [])
+                        c
+                        for c in result.get("classes", [])
                         if c.get("name") == filter_class
                     ]
                 elif filter_method:
@@ -551,7 +650,8 @@ Semantic Search:
                                 # Filter to only the requested method
                                 c_copy = dict(c)
                                 c_copy["methods"] = [
-                                    m for m in c.get("methods", [])
+                                    m
+                                    for m in c.get("methods", [])
                                     if m.get("name") == method_name
                                 ]
                                 filtered_classes.append(c_copy)
@@ -563,7 +663,8 @@ Semantic Search:
                 # Filter functions
                 if filter_function:
                     result["functions"] = [
-                        f for f in result.get("functions", [])
+                        f
+                        for f in result.get("functions", [])
                         if f.get("name") == filter_function
                     ]
                 elif not filter_method:
@@ -659,8 +760,10 @@ Semantic Search:
                 sys.exit(1)
 
             # Scan all source files and check their imports
-            respect_ignore = not getattr(args, 'no_ignore', False)
-            files = scan_project_files(str(project), language=args.lang, respect_ignore=respect_ignore)
+            respect_ignore = not getattr(args, "no_ignore", False)
+            files = scan_project_files(
+                str(project), language=args.lang, respect_ignore=respect_ignore
+            )
             importers = []
             for file_path in files:
                 try:
@@ -670,10 +773,12 @@ Semantic Search:
                         names = imp.get("names", [])
                         # Check if module matches or if any imported name matches
                         if args.module in module or args.module in names:
-                            importers.append({
-                                "file": str(Path(file_path).relative_to(project)),
-                                "import": imp,
-                            })
+                            importers.append(
+                                {
+                                    "file": str(Path(file_path).relative_to(project)),
+                                    "import": imp,
+                                }
+                            )
                 except Exception:
                     # Skip files that can't be parsed
                     pass
@@ -697,6 +802,7 @@ Semantic Search:
                 # Actually run the tests (test_command is a list to avoid shell injection)
                 import shlex
                 import subprocess as sp
+
                 cmd = result["test_command"]
                 print(f"Running: {shlex.join(cmd)}", file=sys.stderr)
                 sp.run(cmd)  # No shell=True - safe from injection
@@ -734,7 +840,6 @@ Semantic Search:
                 print(json.dumps(result, indent=2))
 
         elif args.command == "warm":
-            import os
             import subprocess
             import time
 
@@ -748,7 +853,15 @@ Semantic Search:
             if args.background:
                 # Spawn background process (cross-platform)
                 subprocess.Popen(
-                    [sys.executable, "-m", "tldr.cli", "warm", str(project_path), "--lang", args.lang],
+                    [
+                        sys.executable,
+                        "-m",
+                        "tldr.cli",
+                        "warm",
+                        str(project_path),
+                        "--lang",
+                        args.lang,
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     **_get_subprocess_detach_kwargs(),
@@ -758,8 +871,10 @@ Semantic Search:
                 # Build call graph
                 from .cross_file_calls import scan_project
 
-                respect_ignore = not getattr(args, 'no_ignore', False)
-                files = scan_project(project_path, language=args.lang, respect_ignore=respect_ignore)
+                respect_ignore = not getattr(args, "no_ignore", False)
+                files = scan_project(
+                    project_path, language=args.lang, respect_ignore=respect_ignore
+                )
                 graph = build_project_call_graph(project_path, language=args.lang)
 
                 # Create cache directory
@@ -770,7 +885,12 @@ Semantic Search:
                 cache_file = cache_dir / "call_graph.json"
                 cache_data = {
                     "edges": [
-                        {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
+                        {
+                            "from_file": e[0],
+                            "from_func": e[1],
+                            "to_file": e[2],
+                            "to_func": e[3],
+                        }
                         for e in graph.edges
                     ],
                     "timestamp": time.time(),
@@ -784,8 +904,13 @@ Semantic Search:
             from .semantic import build_semantic_index, semantic_search
 
             if args.action == "index":
-                respect_ignore = not getattr(args, 'no_ignore', False)
-                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
+                respect_ignore = not getattr(args, "no_ignore", False)
+                count = build_semantic_index(
+                    args.path,
+                    lang=args.lang,
+                    model=args.model,
+                    respect_ignore=respect_ignore,
+                )
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
@@ -805,7 +930,10 @@ Semantic Search:
             # Tool definitions: language -> (type_checker, linter, install_commands)
             TOOL_INFO = {
                 "python": {
-                    "type_checker": ("pyright", "pip install pyright  OR  npm install -g pyright"),
+                    "type_checker": (
+                        "pyright",
+                        "pip install pyright  OR  npm install -g pyright",
+                    ),
                     "linter": ("ruff", "pip install ruff"),
                 },
                 "typescript": {
@@ -818,7 +946,10 @@ Semantic Search:
                 },
                 "go": {
                     "type_checker": ("go", "https://go.dev/dl/"),
-                    "linter": ("golangci-lint", "brew install golangci-lint  OR  go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"),
+                    "linter": (
+                        "golangci-lint",
+                        "brew install golangci-lint  OR  go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+                    ),
                 },
                 "rust": {
                     "type_checker": ("cargo", "https://rustup.rs/"),
@@ -826,15 +957,30 @@ Semantic Search:
                 },
                 "java": {
                     "type_checker": ("javac", "Install JDK: https://adoptium.net/"),
-                    "linter": ("checkstyle", "brew install checkstyle  OR  download from checkstyle.org"),
+                    "linter": (
+                        "checkstyle",
+                        "brew install checkstyle  OR  download from checkstyle.org",
+                    ),
                 },
                 "c": {
-                    "type_checker": ("gcc", "xcode-select --install  OR  apt install gcc"),
-                    "linter": ("cppcheck", "brew install cppcheck  OR  apt install cppcheck"),
+                    "type_checker": (
+                        "gcc",
+                        "xcode-select --install  OR  apt install gcc",
+                    ),
+                    "linter": (
+                        "cppcheck",
+                        "brew install cppcheck  OR  apt install cppcheck",
+                    ),
                 },
                 "cpp": {
-                    "type_checker": ("g++", "xcode-select --install  OR  apt install g++"),
-                    "linter": ("cppcheck", "brew install cppcheck  OR  apt install cppcheck"),
+                    "type_checker": (
+                        "g++",
+                        "xcode-select --install  OR  apt install g++",
+                    ),
+                    "linter": (
+                        "cppcheck",
+                        "brew install cppcheck  OR  apt install cppcheck",
+                    ),
                 },
                 "ruby": {
                     "type_checker": None,
@@ -845,7 +991,10 @@ Semantic Search:
                     "linter": ("phpstan", "composer global require phpstan/phpstan"),
                 },
                 "kotlin": {
-                    "type_checker": ("kotlinc", "brew install kotlin  OR  sdk install kotlin"),
+                    "type_checker": (
+                        "kotlinc",
+                        "brew install kotlin  OR  sdk install kotlin",
+                    ),
                     "linter": ("ktlint", "brew install ktlint"),
                 },
                 "swift": {
@@ -857,11 +1006,17 @@ Semantic Search:
                     "linter": None,
                 },
                 "scala": {
-                    "type_checker": ("scalac", "brew install scala  OR  sdk install scala"),
+                    "type_checker": (
+                        "scalac",
+                        "brew install scala  OR  sdk install scala",
+                    ),
                     "linter": None,
                 },
                 "elixir": {
-                    "type_checker": ("elixir", "brew install elixir  OR  asdf install elixir"),
+                    "type_checker": (
+                        "elixir",
+                        "brew install elixir  OR  asdf install elixir",
+                    ),
                     "linter": ("mix", "Included with Elixir"),
                 },
                 "lua": {
@@ -873,7 +1028,11 @@ Semantic Search:
             # Install commands for --install flag
             INSTALL_COMMANDS = {
                 "python": ["pip", "install", "pyright", "ruff"],
-                "go": ["go", "install", "github.com/golangci/golangci-lint/cmd/golangci-lint@latest"],
+                "go": [
+                    "go",
+                    "install",
+                    "github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+                ],
                 "rust": ["rustup", "component", "add", "clippy"],
                 "ruby": ["gem", "install", "rubocop"],
                 "kotlin": ["brew", "install", "kotlin", "ktlint"],
@@ -884,8 +1043,14 @@ Semantic Search:
             if args.install:
                 lang = args.install.lower()
                 if lang not in INSTALL_COMMANDS:
-                    print(f"Error: No auto-install available for '{lang}'", file=sys.stderr)
-                    print(f"Available: {', '.join(sorted(INSTALL_COMMANDS.keys()))}", file=sys.stderr)
+                    print(
+                        f"Error: No auto-install available for '{lang}'",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Available: {', '.join(sorted(INSTALL_COMMANDS.keys()))}",
+                        file=sys.stderr,
+                    )
                     sys.exit(1)
 
                 cmd = INSTALL_COMMANDS[lang]
@@ -966,7 +1131,9 @@ Semantic Search:
                             print()
 
                     if missing_count > 0:
-                        print(f"Missing {missing_count} tool(s). Run: tldr doctor --install <lang>")
+                        print(
+                            f"Missing {missing_count} tool(s). Run: tldr doctor --install <lang>"
+                        )
                     else:
                         print("All diagnostic tools installed!")
 
@@ -992,8 +1159,8 @@ Semantic Search:
                 try:
                     result = query_daemon(project_path, {"cmd": "status"})
                     print(f"Status: {result.get('status', 'unknown')}")
-                    if 'uptime' in result:
-                        uptime = int(result['uptime'])
+                    if "uptime" in result:
+                        uptime = int(result["uptime"])
                         mins, secs = divmod(uptime, 60)
                         hours, mins = divmod(mins, 60)
                         print(f"Uptime: {hours}h {mins}m {secs}s")
@@ -1011,10 +1178,9 @@ Semantic Search:
             elif args.action == "notify":
                 try:
                     file_path = Path(args.file).resolve()
-                    result = query_daemon(project_path, {
-                        "cmd": "notify",
-                        "file": str(file_path)
-                    })
+                    result = query_daemon(
+                        project_path, {"cmd": "notify", "file": str(file_path)}
+                    )
                     if result.get("status") == "ok":
                         dirty = result.get("dirty_count", 0)
                         threshold = result.get("threshold", 20)
@@ -1023,7 +1189,10 @@ Semantic Search:
                         else:
                             print(f"Tracked: {dirty}/{threshold} files")
                     else:
-                        print(f"Error: {result.get('message', 'Unknown error')}", file=sys.stderr)
+                        print(
+                            f"Error: {result.get('message', 'Unknown error')}",
+                            file=sys.stderr,
+                        )
                         sys.exit(1)
                 except (ConnectionRefusedError, FileNotFoundError):
                     # Daemon not running - silently ignore, file edits shouldn't fail

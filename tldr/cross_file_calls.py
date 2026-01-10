@@ -16,10 +16,11 @@ Key functions:
 
 import ast
 import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 from tldr.workspace import WorkspaceConfig, load_workspace_config, filter_paths
 
@@ -27,6 +28,7 @@ from tldr.workspace import WorkspaceConfig, load_workspace_config, filter_paths
 try:
     import tree_sitter
     import tree_sitter_typescript
+
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     TREE_SITTER_AVAILABLE = False
@@ -35,6 +37,7 @@ except ImportError:
 TREE_SITTER_GO_AVAILABLE = False
 try:
     import tree_sitter_go
+
     TREE_SITTER_GO_AVAILABLE = True
 except ImportError:
     pass
@@ -43,6 +46,7 @@ except ImportError:
 TREE_SITTER_RUST_AVAILABLE = False
 try:
     import tree_sitter_rust
+
     TREE_SITTER_RUST_AVAILABLE = True
 except ImportError:
     pass
@@ -51,6 +55,7 @@ except ImportError:
 TREE_SITTER_JAVA_AVAILABLE = False
 try:
     import tree_sitter_java
+
     TREE_SITTER_JAVA_AVAILABLE = True
 except ImportError:
     pass
@@ -59,6 +64,7 @@ except ImportError:
 TREE_SITTER_C_AVAILABLE = False
 try:
     import tree_sitter_c
+
     TREE_SITTER_C_AVAILABLE = True
 except ImportError:
     pass
@@ -67,6 +73,7 @@ except ImportError:
 TREE_SITTER_RUBY_AVAILABLE = False
 try:
     import tree_sitter_ruby
+
     TREE_SITTER_RUBY_AVAILABLE = True
 except ImportError:
     pass
@@ -75,6 +82,7 @@ except ImportError:
 TREE_SITTER_PHP_AVAILABLE = False
 try:
     import tree_sitter_php
+
     TREE_SITTER_PHP_AVAILABLE = True
 except ImportError:
     pass
@@ -83,6 +91,7 @@ except ImportError:
 TREE_SITTER_CPP_AVAILABLE = False
 try:
     import tree_sitter_cpp
+
     TREE_SITTER_CPP_AVAILABLE = True
 except ImportError:
     pass
@@ -91,6 +100,7 @@ except ImportError:
 TREE_SITTER_KOTLIN_AVAILABLE = False
 try:
     import tree_sitter_kotlin
+
     TREE_SITTER_KOTLIN_AVAILABLE = True
 except ImportError:
     pass
@@ -99,6 +109,7 @@ except ImportError:
 TREE_SITTER_SWIFT_AVAILABLE = False
 try:
     import tree_sitter_swift
+
     TREE_SITTER_SWIFT_AVAILABLE = True
 except ImportError:
     pass
@@ -107,6 +118,7 @@ except ImportError:
 TREE_SITTER_CSHARP_AVAILABLE = False
 try:
     import tree_sitter_c_sharp
+
     TREE_SITTER_CSHARP_AVAILABLE = True
 except ImportError:
     pass
@@ -114,6 +126,7 @@ except ImportError:
 TREE_SITTER_SCALA_AVAILABLE = False
 try:
     import tree_sitter_scala
+
     TREE_SITTER_SCALA_AVAILABLE = True
 except ImportError:
     pass
@@ -122,6 +135,7 @@ except ImportError:
 TREE_SITTER_LUA_AVAILABLE = False
 try:
     import tree_sitter_lua
+
     TREE_SITTER_LUA_AVAILABLE = True
 except ImportError:
     pass
@@ -130,6 +144,7 @@ except ImportError:
 TREE_SITTER_ELIXIR_AVAILABLE = False
 try:
     import tree_sitter_elixir
+
     TREE_SITTER_ELIXIR_AVAILABLE = True
 except ImportError:
     pass
@@ -138,6 +153,10 @@ except ImportError:
 # Creating a tree-sitter parser takes ~10-50ms. For a 100-file project,
 # caching saves 1-5 seconds of parser creation time.
 _PARSER_CACHE: dict[str, "tree_sitter.Parser"] = {}
+
+# Threshold for parallel processing. Below this, sequential is faster due to
+# process spawn overhead (~50-100ms per worker).
+MIN_FILES_FOR_PARALLEL = 15
 
 
 @dataclass
@@ -151,7 +170,9 @@ class ProjectCallGraph:
     _edges: set[tuple[str, str, str, str]] = field(default_factory=set)
     # Secondary index: src_file -> set of edges originating from that file
     # Enables O(1) edge lookup/removal instead of O(E) full scan
-    _edges_by_src_file: dict[str, set[tuple[str, str, str, str]]] = field(default_factory=dict)
+    _edges_by_src_file: dict[str, set[tuple[str, str, str, str]]] = field(
+        default_factory=dict
+    )
 
     def add_edge(self, src_file: str, src_func: str, dst_file: str, dst_func: str):
         """Add a call edge from src_file:src_func to dst_file:dst_func.
@@ -362,29 +383,29 @@ def scan_project(
     ignore_spec = load_ignore_patterns(root) if respect_ignore else None
 
     if language == "python":
-        extensions = {'.py'}
+        extensions = {".py"}
     elif language == "typescript":
-        extensions = {'.ts', '.tsx'}
+        extensions = {".ts", ".tsx"}
     elif language == "go":
-        extensions = {'.go'}
+        extensions = {".go"}
     elif language == "rust":
-        extensions = {'.rs'}
+        extensions = {".rs"}
     elif language == "java":
-        extensions = {'.java'}
+        extensions = {".java"}
     elif language == "c":
-        extensions = {'.c', '.h'}
+        extensions = {".c", ".h"}
     elif language == "ruby":
-        extensions = {'.rb'}
+        extensions = {".rb"}
     elif language == "php":
-        extensions = {'.php'}
+        extensions = {".php"}
     elif language == "kotlin":
-        extensions = {'.kt', '.kts'}
+        extensions = {".kt", ".kts"}
     elif language == "swift":
-        extensions = {'.swift'}
+        extensions = {".swift"}
     elif language == "csharp":
-        extensions = {'.cs'}
+        extensions = {".cs"}
     elif language == "scala":
-        extensions = {'.scala', '.sc'}
+        extensions = {".scala", ".sc"}
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -393,17 +414,18 @@ def scan_project(
         if respect_ignore and ignore_spec:
             rel_dir = os.path.relpath(dirpath, root)
             # Check if current directory should be ignored
-            if rel_dir != '.' and should_ignore(rel_dir + '/', root, ignore_spec):
+            if rel_dir != "." and should_ignore(rel_dir + "/", root, ignore_spec):
                 dirnames.clear()  # Don't descend into ignored directories
                 continue
             # Filter subdirectories
             dirnames[:] = [
-                d for d in dirnames
-                if not should_ignore(os.path.join(rel_dir, d) + '/', root, ignore_spec)
+                d
+                for d in dirnames
+                if not should_ignore(os.path.join(rel_dir, d) + "/", root, ignore_spec)
             ]
 
         for filename in filenames:
-            if any(filename.endswith(ext) for ext in extensions):
+            if filename.endswith(tuple(extensions)):
                 file_path = os.path.join(dirpath, filename)
                 # Check individual file against ignore patterns
                 if respect_ignore and ignore_spec:
@@ -444,12 +466,14 @@ def parse_imports(file_path: str | Path) -> list[dict]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imports.append({
-                    'module': alias.name,
-                    'names': [],
-                    'is_from': False,
-                    'alias': alias.asname,
-                })
+                imports.append(
+                    {
+                        "module": alias.name,
+                        "names": [],
+                        "is_from": False,
+                        "alias": alias.asname,
+                    }
+                )
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 names = []
@@ -458,12 +482,14 @@ def parse_imports(file_path: str | Path) -> list[dict]:
                     names.append(alias.name)
                     if alias.asname:
                         aliases[alias.asname] = alias.name
-                imports.append({
-                    'module': node.module,
-                    'names': names,
-                    'is_from': True,
-                    'aliases': aliases,
-                })
+                imports.append(
+                    {
+                        "module": node.module,
+                        "names": names,
+                        "is_from": True,
+                        "aliases": aliases,
+                    }
+                )
 
     return imports
 
@@ -515,12 +541,16 @@ def _parse_ts_import_node(node, source: bytes) -> dict | None:
     for child in node.children:
         if child.type == "string":
             # Module path - strip quotes
-            module = source[child.start_byte:child.end_byte].decode("utf-8").strip("'\"")
+            module = (
+                source[child.start_byte : child.end_byte].decode("utf-8").strip("'\"")
+            )
         elif child.type == "import_clause":
             for clause_child in child.children:
                 if clause_child.type == "identifier":
                     # Default import: import Foo from "module"
-                    default_name = source[clause_child.start_byte:clause_child.end_byte].decode("utf-8")
+                    default_name = source[
+                        clause_child.start_byte : clause_child.end_byte
+                    ].decode("utf-8")
                 elif clause_child.type == "named_imports":
                     # Named imports: import { foo, bar as baz } from "module"
                     for named in clause_child.children:
@@ -530,9 +560,13 @@ def _parse_ts_import_node(node, source: bytes) -> dict | None:
                             for spec_child in named.children:
                                 if spec_child.type == "identifier":
                                     if orig_name is None:
-                                        orig_name = source[spec_child.start_byte:spec_child.end_byte].decode("utf-8")
+                                        orig_name = source[
+                                            spec_child.start_byte : spec_child.end_byte
+                                        ].decode("utf-8")
                                     else:
-                                        alias = source[spec_child.start_byte:spec_child.end_byte].decode("utf-8")
+                                        alias = source[
+                                            spec_child.start_byte : spec_child.end_byte
+                                        ].decode("utf-8")
                             if orig_name:
                                 names.append(orig_name)
                                 if alias:
@@ -541,15 +575,17 @@ def _parse_ts_import_node(node, source: bytes) -> dict | None:
                     # Namespace import: import * as foo from "module"
                     for ns_child in clause_child.children:
                         if ns_child.type == "identifier":
-                            alias = source[ns_child.start_byte:ns_child.end_byte].decode("utf-8")
+                            alias = source[
+                                ns_child.start_byte : ns_child.end_byte
+                            ].decode("utf-8")
                             aliases[alias] = "*"
 
     if module:
         return {
-            'module': module,
-            'names': names,
-            'default': default_name,
-            'aliases': aliases,
+            "module": module,
+            "names": names,
+            "default": default_name,
+            "aliases": aliases,
         }
     return None
 
@@ -608,16 +644,20 @@ def _parse_go_import_spec(spec_node, source: bytes, imports: list):
     for child in spec_node.children:
         if child.type == "package_identifier":
             # This is the alias: import alias "path"
-            alias = source[child.start_byte:child.end_byte].decode("utf-8")
+            alias = source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "interpreted_string_literal":
             # This is the module path
-            module = source[child.start_byte:child.end_byte].decode("utf-8").strip('"')
+            module = (
+                source[child.start_byte : child.end_byte].decode("utf-8").strip('"')
+            )
 
     if module:
-        imports.append({
-            'module': module,
-            'alias': alias,
-        })
+        imports.append(
+            {
+                "module": module,
+                "alias": alias,
+            }
+        )
 
 
 def parse_rust_imports(file_path: str | Path) -> list[dict]:
@@ -659,16 +699,18 @@ def parse_rust_imports(file_path: str | Path) -> list[dict]:
             name = None
             for child in node.children:
                 if child.type == "identifier":
-                    name = source[child.start_byte:child.end_byte].decode("utf-8")
+                    name = source[child.start_byte : child.end_byte].decode("utf-8")
                 elif child.type == "declaration_list":
                     has_body = True
 
             if name and not has_body:
-                imports.append({
-                    'module': name,
-                    'names': [],
-                    'is_mod': True,
-                })
+                imports.append(
+                    {
+                        "module": name,
+                        "names": [],
+                        "is_mod": True,
+                    }
+                )
 
         for child in node.children:
             walk_tree(child, depth + 1, max_depth)
@@ -680,7 +722,7 @@ def parse_rust_imports(file_path: str | Path) -> list[dict]:
 def _parse_rust_use_node(node, source: bytes) -> dict | None:
     """Parse a single Rust use statement."""
     # Get the full use path text
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Strip "use " prefix and trailing semicolon
     text = text.replace("use ", "").rstrip(";").strip()
@@ -707,7 +749,7 @@ def _parse_rust_use_node(node, source: bytes) -> dict | None:
     elif "{" in text:
         brace_start = text.index("{")
         module = text[:brace_start].rstrip("::")
-        brace_content = text[brace_start+1:text.rindex("}")]
+        brace_content = text[brace_start + 1 : text.rindex("}")]
         names = [n.strip() for n in brace_content.split(",")]
     # Handle simple imports: use foo::bar
     elif "::" in text:
@@ -716,9 +758,9 @@ def _parse_rust_use_node(node, source: bytes) -> dict | None:
         names = [parts[1]]
 
     return {
-        'module': module,
-        'names': names,
-        'is_mod': False,
+        "module": module,
+        "names": names,
+        "is_mod": False,
     }
 
 
@@ -762,7 +804,7 @@ def parse_java_imports(file_path: str | Path) -> list[dict]:
 def _parse_java_import_node(node, source: bytes) -> dict | None:
     """Parse a single Java import statement."""
     # Get the full import text
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Check for static import
     is_static = "static " in text
@@ -780,10 +822,10 @@ def _parse_java_import_node(node, source: bytes) -> dict | None:
     module = None
     for child in node.children:
         if child.type == "scoped_identifier":
-            module = source[child.start_byte:child.end_byte].decode("utf-8")
+            module = source[child.start_byte : child.end_byte].decode("utf-8")
             break
         elif child.type == "identifier":
-            module = source[child.start_byte:child.end_byte].decode("utf-8")
+            module = source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "asterisk":
             # Handle wildcard - module should have been set by scoped_identifier
             if module:
@@ -794,9 +836,9 @@ def _parse_java_import_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'is_static': is_static,
-        'is_wildcard': is_wildcard,
+        "module": module,
+        "is_static": is_static,
+        "is_wildcard": is_wildcard,
     }
 
 
@@ -843,7 +885,7 @@ def parse_kotlin_imports(file_path: str | Path) -> list[dict]:
 def _parse_kotlin_import_node(node, source: bytes) -> dict | None:
     """Parse a single Kotlin import statement."""
     # Get the full import text
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Check for wildcard import (ends with .*)
     is_wildcard = ".*" in text or text.rstrip().endswith("*")
@@ -857,14 +899,16 @@ def _parse_kotlin_import_node(node, source: bytes) -> dict | None:
             if idx + 1 < len(node.children):
                 alias_node = node.children[idx + 1]
                 if alias_node.type == "identifier":
-                    alias = source[alias_node.start_byte:alias_node.end_byte].decode("utf-8")
+                    alias = source[alias_node.start_byte : alias_node.end_byte].decode(
+                        "utf-8"
+                    )
             break
 
     # Extract the module path from qualified_identifier
     module = None
     for child in node.children:
         if child.type == "qualified_identifier":
-            module = source[child.start_byte:child.end_byte].decode("utf-8")
+            module = source[child.start_byte : child.end_byte].decode("utf-8")
             break
 
     # Handle wildcard: if there's a * after qualified_identifier, append it
@@ -891,9 +935,9 @@ def _parse_kotlin_import_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'is_wildcard': is_wildcard,
-        'alias': alias,
+        "module": module,
+        "is_wildcard": is_wildcard,
+        "alias": alias,
     }
 
 
@@ -951,7 +995,7 @@ def _parse_scala_import_node(node, source: bytes) -> list[dict]:
     results = []
 
     # Get the full import text for fallback parsing
-    text = source[node.start_byte:node.end_byte].decode("utf-8").strip()
+    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
 
     # Remove "import " prefix
     if text.startswith("import "):
@@ -976,40 +1020,50 @@ def _parse_scala_import_node(node, source: bytes) -> list[dict]:
                 alias = parts[1].strip()
                 if orig != "_":  # Skip hiding imports like {SomeThing => _}
                     full_module = f"{base_path}.{orig}" if base_path else orig
-                    results.append({
-                        'module': full_module,
-                        'is_wildcard': False,
-                        'alias': alias if alias != "_" else None,
-                    })
+                    results.append(
+                        {
+                            "module": full_module,
+                            "is_wildcard": False,
+                            "alias": alias if alias != "_" else None,
+                        }
+                    )
             elif selector == "_":
                 # Wildcard inside braces: import foo.{_}
-                results.append({
-                    'module': base_path,
-                    'is_wildcard': True,
-                    'alias': None,
-                })
+                results.append(
+                    {
+                        "module": base_path,
+                        "is_wildcard": True,
+                        "alias": None,
+                    }
+                )
             else:
                 full_module = f"{base_path}.{selector}" if base_path else selector
-                results.append({
-                    'module': full_module,
-                    'is_wildcard': False,
-                    'alias': None,
-                })
+                results.append(
+                    {
+                        "module": full_module,
+                        "is_wildcard": False,
+                        "alias": None,
+                    }
+                )
     elif text.endswith("._"):
         # Wildcard import: import scala.collection.mutable._
         base_path = text[:-2]  # Remove ._
-        results.append({
-            'module': base_path,
-            'is_wildcard': True,
-            'alias': None,
-        })
+        results.append(
+            {
+                "module": base_path,
+                "is_wildcard": True,
+                "alias": None,
+            }
+        )
     else:
         # Simple import: import scala.collection.mutable.ListBuffer
-        results.append({
-            'module': text,
-            'is_wildcard': False,
-            'alias': None,
-        })
+        results.append(
+            {
+                "module": text,
+                "is_wildcard": False,
+                "alias": None,
+            }
+        )
 
     return results
 
@@ -1054,7 +1108,7 @@ def parse_c_imports(file_path: str | Path) -> list[dict]:
 def _parse_c_include_node(node, source: bytes) -> dict | None:
     """Parse a single C #include statement."""
     # Get the full include text
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Check for system include <...> vs local include "..."
     is_system = "<" in text
@@ -1070,16 +1124,16 @@ def _parse_c_include_node(node, source: bytes) -> dict | None:
     for child in node.children:
         if child.type == "string_literal":
             # Local include "file.h"
-            module_text = source[child.start_byte:child.end_byte].decode("utf-8")
+            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
             # Strip quotes
             module = module_text.strip('"')
             is_system = False
             break
         elif child.type == "system_lib_string":
             # System include <file.h>
-            module_text = source[child.start_byte:child.end_byte].decode("utf-8")
+            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
             # Strip angle brackets
-            module = module_text.strip('<>')
+            module = module_text.strip("<>")
             is_system = True
             break
 
@@ -1087,8 +1141,8 @@ def _parse_c_include_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'is_system': is_system,
+        "module": module,
+        "is_system": is_system,
     }
 
 
@@ -1132,7 +1186,7 @@ def parse_cpp_imports(file_path: str | Path) -> list[dict]:
 def _parse_cpp_include_node(node, source: bytes) -> dict | None:
     """Parse a single C++ #include statement."""
     # Get the full include text
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Check for system include <...> vs local include "..."
     is_system = "<" in text
@@ -1142,16 +1196,16 @@ def _parse_cpp_include_node(node, source: bytes) -> dict | None:
     for child in node.children:
         if child.type == "string_literal":
             # Local include "file.hpp"
-            module_text = source[child.start_byte:child.end_byte].decode("utf-8")
+            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
             # Strip quotes
             module = module_text.strip('"')
             is_system = False
             break
         elif child.type == "system_lib_string":
             # System include <file.h>
-            module_text = source[child.start_byte:child.end_byte].decode("utf-8")
+            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
             # Strip angle brackets
-            module = module_text.strip('<>')
+            module = module_text.strip("<>")
             is_system = True
             break
 
@@ -1159,8 +1213,8 @@ def _parse_cpp_include_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'is_system': is_system,
+        "module": module,
+        "is_system": is_system,
     }
 
 
@@ -1212,7 +1266,7 @@ def _parse_ruby_require_node(node, source: bytes) -> dict | None:
     if not method_node:
         return None
 
-    method_name = source[method_node.start_byte:method_node.end_byte].decode("utf-8")
+    method_name = source[method_node.start_byte : method_node.end_byte].decode("utf-8")
     if method_name not in ("require", "require_relative"):
         return None
 
@@ -1228,10 +1282,12 @@ def _parse_ruby_require_node(node, source: bytes) -> dict | None:
             # Get string content (skip the quotes)
             string_content = child.child_by_field_name("content")
             if string_content:
-                module = source[string_content.start_byte:string_content.end_byte].decode("utf-8")
+                module = source[
+                    string_content.start_byte : string_content.end_byte
+                ].decode("utf-8")
             else:
                 # Try to get the text directly and strip quotes
-                text = source[child.start_byte:child.end_byte].decode("utf-8")
+                text = source[child.start_byte : child.end_byte].decode("utf-8")
                 # Strip quotes: 'module' or "module"
                 module = text.strip("'\"")
             break
@@ -1240,8 +1296,8 @@ def _parse_ruby_require_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'is_relative': method_name == "require_relative",
+        "module": module,
+        "is_relative": method_name == "require_relative",
     }
 
 
@@ -1310,7 +1366,7 @@ def _parse_lua_require_node(node, source: bytes) -> dict | None:
 
     for child in node.children:
         if child.type == "identifier":
-            func_name = source[child.start_byte:child.end_byte].decode("utf-8")
+            func_name = source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "arguments":
             arguments = child
         elif child.type == "string":
@@ -1338,8 +1394,8 @@ def _parse_lua_require_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'type': func_name,
+        "module": module,
+        "type": func_name,
     }
 
 
@@ -1349,7 +1405,7 @@ def _extract_lua_string(node, source: bytes) -> str | None:
     # - "double quoted"
     # - 'single quoted'
     # - [[long brackets]]
-    text = source[node.start_byte:node.end_byte].decode("utf-8")
+    text = source[node.start_byte : node.end_byte].decode("utf-8")
 
     # Strip quotes
     if text.startswith('"') and text.endswith('"'):
@@ -1405,6 +1461,7 @@ def parse_elixir_imports(file_path: str | Path) -> list[dict]:
 def _get_elixir_parser():
     """Get or create an Elixir tree-sitter parser."""
     from tree_sitter import Language, Parser
+
     parser = Parser()
     parser.language = Language(tree_sitter_elixir.language())
     return parser
@@ -1428,7 +1485,7 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
 
     for child in node.children:
         if child.type == "identifier":
-            func_name = source[child.start_byte:child.end_byte].decode("utf-8")
+            func_name = source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "arguments":
             arguments = child
 
@@ -1446,10 +1503,10 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
         if child.is_named:
             if child.type == "alias":
                 # Module reference like Phoenix.Controller
-                module = source[child.start_byte:child.end_byte].decode("utf-8")
+                module = source[child.start_byte : child.end_byte].decode("utf-8")
             elif child.type == "dot":
                 # Qualified module name
-                module = source[child.start_byte:child.end_byte].decode("utf-8")
+                module = source[child.start_byte : child.end_byte].decode("utf-8")
             elif child.type == "keywords":
                 # Keyword arguments like "as: AliasName"
                 for kw_child in child.children:
@@ -1458,9 +1515,15 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
                         value = None
                         for pair_child in kw_child.children:
                             if pair_child.type == "keyword":
-                                key = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8").rstrip(": ")
+                                key = (
+                                    source[pair_child.start_byte : pair_child.end_byte]
+                                    .decode("utf-8")
+                                    .rstrip(": ")
+                                )
                             elif pair_child.type == "alias":
-                                value = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8")
+                                value = source[
+                                    pair_child.start_byte : pair_child.end_byte
+                                ].decode("utf-8")
                         if key == "as" and value:
                             alias_name = value
 
@@ -1468,11 +1531,11 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
         return None
 
     result = {
-        'module': module,
-        'type': func_name,
+        "module": module,
+        "type": func_name,
     }
     if alias_name:
-        result['as'] = alias_name
+        result["as"] = alias_name
 
     return result
 
@@ -1508,8 +1571,12 @@ def parse_php_imports(file_path: str | Path) -> list[dict]:
         if node.type == "namespace_use_declaration":
             _parse_php_use_node(node, source, imports)
         # require/include statements
-        elif node.type in ("include_expression", "include_once_expression",
-                           "require_expression", "require_once_expression"):
+        elif node.type in (
+            "include_expression",
+            "include_once_expression",
+            "require_expression",
+            "require_once_expression",
+        ):
             import_info = _parse_php_require_include_node(node, source)
             if import_info:
                 imports.append(import_info)
@@ -1539,7 +1606,7 @@ def _parse_php_use_node(node, source: bytes, imports: list):
         prefix = ""
         for child in node.children:
             if child.type == "namespace_name":
-                prefix = source[child.start_byte:child.end_byte].decode("utf-8")
+                prefix = source[child.start_byte : child.end_byte].decode("utf-8")
                 break
 
         # Parse each group item
@@ -1548,25 +1615,35 @@ def _parse_php_use_node(node, source: bytes, imports: list):
                 for group_child in child.children:
                     # In tree-sitter-php, grouped items are namespace_use_clause
                     if group_child.type == "namespace_use_clause":
-                        clause_text = source[group_child.start_byte:group_child.end_byte].decode("utf-8").strip()
+                        clause_text = (
+                            source[group_child.start_byte : group_child.end_byte]
+                            .decode("utf-8")
+                            .strip()
+                        )
                         # Handle alias: User as UserModel
                         name = clause_text.split(" as ")[0].strip()
                         full_module = f"{prefix}\\{name}" if prefix else name
-                        imports.append({
-                            'module': full_module,
-                            'type': 'use',
-                        })
+                        imports.append(
+                            {
+                                "module": full_module,
+                                "type": "use",
+                            }
+                        )
     else:
         # Simple imports: use App\Models\User;
         for child in node.children:
             if child.type == "namespace_use_clause":
-                clause_text = source[child.start_byte:child.end_byte].decode("utf-8").strip()
+                clause_text = (
+                    source[child.start_byte : child.end_byte].decode("utf-8").strip()
+                )
                 # Handle alias: User as UserModel
                 module = clause_text.split(" as ")[0].strip()
-                imports.append({
-                    'module': module,
-                    'type': 'use',
-                })
+                imports.append(
+                    {
+                        "module": module,
+                        "type": "use",
+                    }
+                )
 
 
 def _parse_php_require_include_node(node, source: bytes) -> dict | None:
@@ -1586,23 +1663,23 @@ def _parse_php_require_include_node(node, source: bytes) -> dict | None:
     module = None
     for child in node.children:
         if child.type in ("string", "encapsed_string"):
-            module_text = source[child.start_byte:child.end_byte].decode("utf-8")
+            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
             # Strip quotes
             module = module_text.strip("'\"")
             break
         elif child.type == "binary_expression":
             # Handle expressions like __DIR__ . '/file.php'
             # Just get the full text for now
-            module = source[child.start_byte:child.end_byte].decode("utf-8")
+            module = source[child.start_byte : child.end_byte].decode("utf-8")
             break
 
     if not module:
         # Try to get full text after the keyword
-        text = source[node.start_byte:node.end_byte].decode("utf-8")
+        text = source[node.start_byte : node.end_byte].decode("utf-8")
         # Extract path from require 'path' or require('path')
         for pattern in ["require_once", "require", "include_once", "include"]:
             if text.startswith(pattern):
-                rest = text[len(pattern):].strip()
+                rest = text[len(pattern) :].strip()
                 # Remove parentheses and quotes
                 rest = rest.strip("();'\" ")
                 if rest:
@@ -1613,8 +1690,8 @@ def _parse_php_require_include_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'type': import_type,
+        "module": module,
+        "type": import_type,
     }
 
 
@@ -1668,7 +1745,7 @@ def _parse_swift_import_node(node, source: bytes) -> dict | None:
     - @testable import MyApp
     """
     # Get the full import text
-    text = source[node.start_byte:node.end_byte].decode("utf-8").strip()
+    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
 
     # Handle @testable or other attribute imports
     # Remove leading @attribute if present
@@ -1687,11 +1764,20 @@ def _parse_swift_import_node(node, source: bytes) -> dict | None:
 
     # Check for kind specifier (struct, class, func, enum, etc.)
     kind = None
-    kind_specifiers = ["struct", "class", "enum", "protocol", "func", "var", "let", "typealias"]
+    kind_specifiers = [
+        "struct",
+        "class",
+        "enum",
+        "protocol",
+        "func",
+        "var",
+        "let",
+        "typealias",
+    ]
     for spec in kind_specifiers:
         if rest.startswith(spec + " "):
             kind = spec
-            rest = rest[len(spec):].strip()
+            rest = rest[len(spec) :].strip()
             break
 
     # The rest is the module path
@@ -1701,8 +1787,8 @@ def _parse_swift_import_node(node, source: bytes) -> dict | None:
         return None
 
     return {
-        'module': module,
-        'kind': kind,
+        "module": module,
+        "kind": kind,
     }
 
 
@@ -1757,28 +1843,28 @@ def _parse_csharp_using_node(node, source: bytes) -> dict | None:
     - global using System;
     """
     # Get the full using text
-    text = source[node.start_byte:node.end_byte].decode("utf-8").strip()
+    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
 
     result = {
-        'module': None,
-        'is_static': False,
-        'is_global': False,
-        'alias': None,
+        "module": None,
+        "is_static": False,
+        "is_global": False,
+        "alias": None,
     }
 
     # Check for global using
     if text.startswith("global"):
-        result['is_global'] = True
+        result["is_global"] = True
         text = text[6:].strip()
 
     # Check for using static
     if "static" in text.split():
-        result['is_static'] = True
+        result["is_static"] = True
 
     # Look for the qualified name in children
     for child in node.children:
         if child.type == "qualified_name":
-            result['module'] = source[child.start_byte:child.end_byte].decode("utf-8")
+            result["module"] = source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "identifier":
             # Check if this is an alias (using Alias = ...)
             # or just a simple namespace
@@ -1788,30 +1874,94 @@ def _parse_csharp_using_node(node, source: bytes) -> dict | None:
                     next_sibling = node.children[i + 1]
                     break
             if next_sibling and next_sibling.type == "=":
-                result['alias'] = source[child.start_byte:child.end_byte].decode("utf-8")
-            elif not result['module']:
+                result["alias"] = source[child.start_byte : child.end_byte].decode(
+                    "utf-8"
+                )
+            elif not result["module"]:
                 # Simple identifier without qualified name
-                result['module'] = source[child.start_byte:child.end_byte].decode("utf-8")
+                result["module"] = source[child.start_byte : child.end_byte].decode(
+                    "utf-8"
+                )
         elif child.type == "name_equals":
             # This handles: using Alias = Something
             alias_node = child.child_by_field_name("name")
             if alias_node:
-                result['alias'] = source[alias_node.start_byte:alias_node.end_byte].decode("utf-8")
+                result["alias"] = source[
+                    alias_node.start_byte : alias_node.end_byte
+                ].decode("utf-8")
 
-    if not result['module']:
+    if not result["module"]:
         return None
 
     return result
+
+
+# Threshold for parallel processing - overhead isn't worth it for small projects
+MIN_FILES_FOR_PARALLEL = 15
+
+
+def _index_single_file(args: tuple[str, str, str]) -> dict:
+    """
+    Worker function for parallel file indexing.
+
+    Must be at module level for ProcessPoolExecutor pickling.
+
+    Args:
+        args: Tuple of (src_file_path, root_path, language)
+
+    Returns:
+        Partial index dict for this single file
+    """
+    src_file, root_str, language = args
+    root = Path(root_str)
+    src_path = Path(src_file)
+
+    try:
+        rel_path = src_path.relative_to(root)
+    except ValueError:
+        return {}
+
+    # Derive module name from file path
+    module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
+    module_name = (
+        "/".join(module_parts) if language == "typescript" else ".".join(module_parts)
+    )
+    simple_module = rel_path.stem
+
+    # Create local index for this file
+    partial_index: dict = {}
+
+    if language == "python":
+        _index_python_file(
+            src_path, rel_path, module_name, simple_module, partial_index
+        )
+    elif language == "typescript":
+        _index_typescript_file(
+            src_path, rel_path, module_name, simple_module, partial_index
+        )
+    elif language == "go":
+        _index_go_file(src_path, rel_path, module_name, simple_module, partial_index)
+    elif language == "rust":
+        _index_rust_file(src_path, rel_path, module_name, simple_module, partial_index)
+    elif language == "java":
+        _index_java_file(src_path, rel_path, module_name, simple_module, partial_index)
+    elif language == "c":
+        _index_c_file(src_path, rel_path, module_name, simple_module, partial_index)
+
+    return partial_index
 
 
 def build_function_index(
     root: str | Path,
     language: str = "python",
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ) -> dict[tuple[str, str], str]:
     """
     Build an index mapping (module_name, function_name) to file paths.
+
+    Uses parallel processing via ProcessPoolExecutor when file count exceeds
+    MIN_FILES_FOR_PARALLEL threshold to improve performance on large codebases.
 
     Args:
         root: Project root directory
@@ -1823,40 +1973,68 @@ def build_function_index(
         Dict mapping (module, func_name) tuples to relative file paths
     """
     root = Path(root)
-    index = {}
+    index: dict = {}
 
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, language, workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, language, workspace_config)
+    )
 
-    for src_file in source_files:
-        src_path = Path(src_file)
-        rel_path = src_path.relative_to(root)
+    # Use parallel processing for larger projects
+    if len(source_files) > MIN_FILES_FOR_PARALLEL:
+        max_workers = min(os.cpu_count() or 4, 8)
+        root_str = str(root)
+        args_list = [(src_file, root_str, language) for src_file in source_files]
 
-        # Derive module name from file path
-        # e.g., pkg/core.py -> pkg.core, utils.ts -> utils
-        module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
-        module_name = '/'.join(module_parts) if language == "typescript" else '.'.join(module_parts)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            partial_indexes = list(executor.map(_index_single_file, args_list))
 
-        # Also track the simple module name (last component)
-        simple_module = rel_path.stem
+        # Merge all partial indexes
+        for partial in partial_indexes:
+            index.update(partial)
+    else:
+        # Sequential processing for small projects (avoids process spawn overhead)
+        for src_file in source_files:
+            src_path = Path(src_file)
+            rel_path = src_path.relative_to(root)
 
-        if language == "python":
-            _index_python_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "typescript":
-            _index_typescript_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "go":
-            _index_go_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "rust":
-            _index_rust_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "java":
-            _index_java_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "c":
-            _index_c_file(src_path, rel_path, module_name, simple_module, index)
+            # Derive module name from file path
+            # e.g., pkg/core.py -> pkg.core, utils.ts -> utils
+            module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
+            module_name = (
+                "/".join(module_parts)
+                if language == "typescript"
+                else ".".join(module_parts)
+            )
+
+            # Also track the simple module name (last component)
+            simple_module = rel_path.stem
+
+            if language == "python":
+                _index_python_file(
+                    src_path, rel_path, module_name, simple_module, index
+                )
+            elif language == "typescript":
+                _index_typescript_file(
+                    src_path, rel_path, module_name, simple_module, index
+                )
+            elif language == "go":
+                _index_go_file(src_path, rel_path, module_name, simple_module, index)
+            elif language == "rust":
+                _index_rust_file(src_path, rel_path, module_name, simple_module, index)
+            elif language == "java":
+                _index_java_file(src_path, rel_path, module_name, simple_module, index)
+            elif language == "c":
+                _index_c_file(src_path, rel_path, module_name, simple_module, index)
 
     return index
 
 
-def _index_python_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_python_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index functions and classes from a Python file."""
     try:
         source = src_path.read_text(encoding="utf-8", errors="replace")
@@ -1880,7 +2058,9 @@ def _index_python_file(src_path: Path, rel_path: Path, module_name: str, simple_
             index[f"{simple_module}.{node.name}"] = str(rel_path)
 
 
-def _index_typescript_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_typescript_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index functions and classes from a TypeScript file."""
     if not TREE_SITTER_AVAILABLE:
         return
@@ -1922,7 +2102,7 @@ def _index_typescript_file(src_path: Path, rel_path: Path, module_name: str, sim
                     has_arrow = False
                     for vc in child.children:
                         if vc.type == "identifier":
-                            name = source[vc.start_byte:vc.end_byte].decode("utf-8")
+                            name = source[vc.start_byte : vc.end_byte].decode("utf-8")
                         elif vc.type == "arrow_function":
                             has_arrow = True
                     if name and has_arrow:
@@ -1944,11 +2124,13 @@ def _get_ts_node_name(node, source: bytes) -> str | None:
     """Get the name identifier from a TypeScript AST node."""
     for child in node.children:
         if child.type in ("identifier", "property_identifier", "type_identifier"):
-            return source[child.start_byte:child.end_byte].decode("utf-8")
+            return source[child.start_byte : child.end_byte].decode("utf-8")
     return None
 
 
-def _index_go_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_go_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index functions, types, and methods from a Go file."""
     if not TREE_SITTER_GO_AVAILABLE:
         return
@@ -2004,7 +2186,7 @@ def _get_go_node_name(node, source: bytes) -> str | None:
     """Get the name identifier from a Go AST node."""
     for child in node.children:
         if child.type in ("identifier", "type_identifier", "field_identifier"):
-            return source[child.start_byte:child.end_byte].decode("utf-8")
+            return source[child.start_byte : child.end_byte].decode("utf-8")
     return None
 
 
@@ -2019,14 +2201,18 @@ def _get_go_receiver_type(node, source: bytes) -> str | None:
                         if pc.type == "pointer_type":
                             for pt in pc.children:
                                 if pt.type == "type_identifier":
-                                    return source[pt.start_byte:pt.end_byte].decode("utf-8")
+                                    return source[pt.start_byte : pt.end_byte].decode(
+                                        "utf-8"
+                                    )
                         elif pc.type == "type_identifier":
-                            return source[pc.start_byte:pc.end_byte].decode("utf-8")
+                            return source[pc.start_byte : pc.end_byte].decode("utf-8")
             break
     return None
 
 
-def _index_rust_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_rust_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index functions, structs, and impl blocks from a Rust file."""
     if not TREE_SITTER_RUST_AVAILABLE:
         return
@@ -2077,7 +2263,9 @@ def _index_rust_file(src_path: Path, rel_path: Path, module_name: str, simple_mo
             type_name = None
             for child in node.children:
                 if child.type == "type_identifier":
-                    type_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                    type_name = source[child.start_byte : child.end_byte].decode(
+                        "utf-8"
+                    )
                     break
             # Index methods within impl block
             for child in node.children:
@@ -2101,13 +2289,15 @@ def _get_rust_node_name(node, source: bytes) -> str | None:
     """Get the name identifier from a Rust AST node."""
     for child in node.children:
         if child.type == "identifier":
-            return source[child.start_byte:child.end_byte].decode("utf-8")
+            return source[child.start_byte : child.end_byte].decode("utf-8")
         elif child.type == "type_identifier":
-            return source[child.start_byte:child.end_byte].decode("utf-8")
+            return source[child.start_byte : child.end_byte].decode("utf-8")
     return None
 
 
-def _index_java_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_java_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index methods and classes from a Java file."""
     if not TREE_SITTER_JAVA_AVAILABLE:
         return
@@ -2178,11 +2368,13 @@ def _get_java_node_name(node, source: bytes) -> str | None:
     """Get the name identifier from a Java AST node."""
     for child in node.children:
         if child.type == "identifier":
-            return source[child.start_byte:child.end_byte].decode("utf-8")
+            return source[child.start_byte : child.end_byte].decode("utf-8")
     return None
 
 
-def _index_c_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+def _index_c_file(
+    src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
+):
     """Index functions from a C file."""
     if not TREE_SITTER_C_AVAILABLE:
         return
@@ -2222,14 +2414,14 @@ def _get_c_node_name(node, source: bytes) -> str | None:
         if child.type == "function_declarator":
             for dc in child.children:
                 if dc.type == "identifier":
-                    return source[dc.start_byte:dc.end_byte].decode("utf-8")
+                    return source[dc.start_byte : dc.end_byte].decode("utf-8")
         elif child.type == "pointer_declarator":
             # Pointer return type like int* func()
             for pc in child.children:
                 if pc.type == "function_declarator":
                     for dc in pc.children:
                         if dc.type == "identifier":
-                            return source[dc.start_byte:dc.end_byte].decode("utf-8")
+                            return source[dc.start_byte : dc.end_byte].decode("utf-8")
     return None
 
 
@@ -2294,7 +2486,9 @@ class CallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _extract_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a file, grouped by caller function.
 
@@ -2327,17 +2521,17 @@ def _extract_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str
             calls = []
             for call in visitor.calls:
                 if call in defined_funcs or call in defined_classes:
-                    calls.append(('intra', call))
+                    calls.append(("intra", call))
                 else:
-                    calls.append(('direct', call))
+                    calls.append(("direct", call))
 
             for obj, method in visitor.attr_calls:
-                calls.append(('attr', f"{obj}.{method}"))
+                calls.append(("attr", f"{obj}.{method}"))
 
             # Add function references (higher-order usage)
             for ref in visitor.refs:
                 if ref in defined_funcs:
-                    calls.append(('ref', ref))
+                    calls.append(("ref", ref))
 
             calls_by_func[node.name] = calls
 
@@ -2355,23 +2549,25 @@ def _extract_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str
         # Add intra-file references
         for ref in visitor.refs:
             if ref in defined_funcs:
-                module_calls.append(('ref', ref))
+                module_calls.append(("ref", ref))
 
         # Add ALL calls (both intra-file and external imports)
         for call in visitor.calls:
             if call in defined_funcs:
-                module_calls.append(('intra', call))
+                module_calls.append(("intra", call))
             else:
-                module_calls.append(('direct', call))  # Could be imported function
+                module_calls.append(("direct", call))  # Could be imported function
 
     # Add module-level calls from a synthetic "<module>" function
     if module_calls:
-        calls_by_func['<module>'] = module_calls
+        calls_by_func["<module>"] = module_calls
 
     return calls_by_func
 
 
-def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_ts_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a TypeScript file, grouped by caller function.
 
@@ -2403,7 +2599,9 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                 if child.type == "variable_declarator":
                     for vc in child.children:
                         if vc.type == "identifier":
-                            defined_names.add(source[vc.start_byte:vc.end_byte].decode("utf-8"))
+                            defined_names.add(
+                                source[vc.start_byte : vc.end_byte].decode("utf-8")
+                            )
                             break
         for child in node.children:
             collect_definitions(child)
@@ -2419,11 +2617,13 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                 # Get the callee
                 for child in node.children:
                     if child.type == "identifier":
-                        callee = source[child.start_byte:child.end_byte].decode("utf-8")
+                        callee = source[child.start_byte : child.end_byte].decode(
+                            "utf-8"
+                        )
                         if callee in defined_names:
-                            calls.append(('intra', callee))
+                            calls.append(("intra", callee))
                         else:
-                            calls.append(('direct', callee))
+                            calls.append(("direct", callee))
                         break
                     elif child.type == "member_expression":
                         # obj.method() call
@@ -2434,15 +2634,19 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                             if mc.type == "this":
                                 obj_is_this = True
                             elif mc.type == "identifier" and obj_name is None:
-                                obj_name = source[mc.start_byte:mc.end_byte].decode("utf-8")
+                                obj_name = source[mc.start_byte : mc.end_byte].decode(
+                                    "utf-8"
+                                )
                             elif mc.type == "property_identifier":
-                                method_name = source[mc.start_byte:mc.end_byte].decode("utf-8")
+                                method_name = source[
+                                    mc.start_byte : mc.end_byte
+                                ].decode("utf-8")
 
                         if obj_is_this and method_name:
                             # this.method() - treat as intra-file call to the method
-                            calls.append(('intra', method_name))
+                            calls.append(("intra", method_name))
                         elif obj_name and method_name:
-                            calls.append(('attr', f"{obj_name}.{method_name}"))
+                            calls.append(("attr", f"{obj_name}.{method_name}"))
                         break
 
             for child in node.children:
@@ -2471,7 +2675,7 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                     arrow_node = None
                     for vc in child.children:
                         if vc.type == "identifier":
-                            name = source[vc.start_byte:vc.end_byte].decode("utf-8")
+                            name = source[vc.start_byte : vc.end_byte].decode("utf-8")
                         elif vc.type == "arrow_function":
                             arrow_node = vc
                     if name and arrow_node:
@@ -2488,7 +2692,9 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                                 method_name = _get_ts_node_name(body_child, source)
                                 if method_name:
                                     full_name = f"{class_name}.{method_name}"
-                                    calls_by_func[full_name] = extract_calls_from_func(body_child, full_name)
+                                    calls_by_func[full_name] = extract_calls_from_func(
+                                        body_child, full_name
+                                    )
 
         for child in node.children:
             process_functions(child)
@@ -2497,7 +2703,9 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
     return calls_by_func
 
 
-def _extract_go_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_go_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a Go file, grouped by caller function.
 
@@ -2549,26 +2757,32 @@ def _extract_go_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
                 func_child = node.children[0] if node.children else None
                 if func_child:
                     if func_child.type == "identifier":
-                        callee = source[func_child.start_byte:func_child.end_byte].decode("utf-8")
+                        callee = source[
+                            func_child.start_byte : func_child.end_byte
+                        ].decode("utf-8")
                         if callee in defined_names:
-                            calls.append(('intra', callee))
+                            calls.append(("intra", callee))
                         else:
-                            calls.append(('direct', callee))
+                            calls.append(("direct", callee))
                     elif func_child.type == "selector_expression":
                         # pkg.Func() or obj.Method() call
                         parts = []
                         for sc in func_child.children:
                             if sc.type == "identifier":
-                                parts.append(source[sc.start_byte:sc.end_byte].decode("utf-8"))
+                                parts.append(
+                                    source[sc.start_byte : sc.end_byte].decode("utf-8")
+                                )
                             elif sc.type == "field_identifier":
-                                parts.append(source[sc.start_byte:sc.end_byte].decode("utf-8"))
+                                parts.append(
+                                    source[sc.start_byte : sc.end_byte].decode("utf-8")
+                                )
                         if len(parts) >= 2:
                             obj, method = parts[0], parts[-1]
                             # Check if method is defined locally
                             if method in defined_names:
-                                calls.append(('intra', method))
+                                calls.append(("intra", method))
                             else:
-                                calls.append(('attr', f"{obj}.{method}"))
+                                calls.append(("attr", f"{obj}.{method}"))
 
             for child in node.children:
                 visit_calls(child)
@@ -2596,7 +2810,9 @@ def _extract_go_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
     return calls_by_func
 
 
-def _extract_rust_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_rust_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a Rust file, grouped by caller function.
 
@@ -2650,35 +2866,39 @@ def _extract_rust_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
                 # Get the callee
                 for child in node.children:
                     if child.type == "identifier":
-                        callee = source[child.start_byte:child.end_byte].decode("utf-8")
+                        callee = source[child.start_byte : child.end_byte].decode(
+                            "utf-8"
+                        )
                         if callee in defined_names:
-                            calls.append(('intra', callee))
+                            calls.append(("intra", callee))
                         else:
-                            calls.append(('direct', callee))
+                            calls.append(("direct", callee))
                         break
                     elif child.type == "scoped_identifier":
                         # Path call: module::func() or Type::method()
-                        text = source[child.start_byte:child.end_byte].decode("utf-8")
+                        text = source[child.start_byte : child.end_byte].decode("utf-8")
                         # Get the last segment as the function name
                         if "::" in text:
                             parts = text.rsplit("::", 1)
                             func = parts[1]
                             if func in defined_names:
-                                calls.append(('intra', func))
+                                calls.append(("intra", func))
                             else:
-                                calls.append(('attr', text))
+                                calls.append(("attr", text))
                         break
                     elif child.type == "field_expression":
                         # Method call: obj.method()
                         method_name = None
                         for fc in child.children:
                             if fc.type == "field_identifier":
-                                method_name = source[fc.start_byte:fc.end_byte].decode("utf-8")
+                                method_name = source[
+                                    fc.start_byte : fc.end_byte
+                                ].decode("utf-8")
                         if method_name:
                             if method_name in defined_names:
-                                calls.append(('intra', method_name))
+                                calls.append(("intra", method_name))
                             else:
-                                calls.append(('attr', f"self.{method_name}"))
+                                calls.append(("attr", f"self.{method_name}"))
                         break
 
             for child in node.children:
@@ -2697,7 +2917,9 @@ def _extract_rust_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
             type_name = None
             for child in node.children:
                 if child.type == "type_identifier":
-                    type_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                    type_name = source[child.start_byte : child.end_byte].decode(
+                        "utf-8"
+                    )
                     break
 
             for child in node.children:
@@ -2706,8 +2928,14 @@ def _extract_rust_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
                         if item.type == "function_item":
                             method_name = _get_rust_node_name(item, source)
                             if method_name:
-                                full_name = f"{type_name}.{method_name}" if type_name else method_name
-                                calls_by_func[full_name] = extract_calls_from_func(item, full_name)
+                                full_name = (
+                                    f"{type_name}.{method_name}"
+                                    if type_name
+                                    else method_name
+                                )
+                                calls_by_func[full_name] = extract_calls_from_func(
+                                    item, full_name
+                                )
 
         for child in node.children:
             process_functions(child)
@@ -2716,7 +2944,9 @@ def _extract_rust_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
     return calls_by_func
 
 
-def _extract_java_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_java_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all method calls from a Java file, grouped by caller method.
 
@@ -2783,7 +3013,7 @@ def _extract_java_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
                 for child in node.children:
                     if child.type == "identifier":
                         # Could be method name or object
-                        text = source[child.start_byte:child.end_byte].decode("utf-8")
+                        text = source[child.start_byte : child.end_byte].decode("utf-8")
                         if method_name is None:
                             # First identifier could be object or direct call
                             if object_name is None:
@@ -2797,7 +3027,9 @@ def _extract_java_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
                         if child.type == "this":
                             object_name = "this"
                         else:
-                            object_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                            object_name = source[
+                                child.start_byte : child.end_byte
+                            ].decode("utf-8")
                     elif child.type == "argument_list":
                         # Skip argument list
                         pass
@@ -2805,21 +3037,23 @@ def _extract_java_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
                 # Determine call type
                 if method_name:
                     if method_name in defined_names:
-                        calls.append(('intra', method_name))
+                        calls.append(("intra", method_name))
                     elif object_name:
-                        calls.append(('attr', f"{object_name}.{method_name}"))
+                        calls.append(("attr", f"{object_name}.{method_name}"))
                     else:
-                        calls.append(('direct', method_name))
+                        calls.append(("direct", method_name))
 
             # Also handle object creation as calls (new ClassName())
             elif node.type == "object_creation_expression":
                 for child in node.children:
                     if child.type == "type_identifier":
-                        class_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                        class_name = source[child.start_byte : child.end_byte].decode(
+                            "utf-8"
+                        )
                         if class_name in defined_names:
-                            calls.append(('intra', class_name))
+                            calls.append(("intra", class_name))
                         else:
-                            calls.append(('direct', class_name))
+                            calls.append(("direct", class_name))
                         break
 
             for child in node.children:
@@ -2865,7 +3099,9 @@ def _extract_java_file_calls(file_path: Path, root: Path) -> dict[str, list[tupl
     return calls_by_func
 
 
-def _extract_c_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_c_file_calls(
+    file_path: Path, root: Path
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a C file, grouped by caller function.
 
@@ -2908,14 +3144,16 @@ def _extract_c_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[s
                 callee = None
                 for child in node.children:
                     if child.type == "identifier":
-                        callee = source[child.start_byte:child.end_byte].decode("utf-8")
+                        callee = source[child.start_byte : child.end_byte].decode(
+                            "utf-8"
+                        )
                         break
 
                 if callee:
                     if callee in defined_names:
-                        calls.append(('intra', callee))
+                        calls.append(("intra", callee))
                     else:
-                        calls.append(('direct', callee))
+                        calls.append(("direct", callee))
 
             for child in node.children:
                 visit_calls(child)
@@ -2938,9 +3176,7 @@ def _extract_c_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[s
 
 
 def build_project_call_graph(
-    root: str | Path,
-    language: str = "python",
-    use_workspace_config: bool = True
+    root: str | Path, language: str = "python", use_workspace_config: bool = True
 ) -> ProjectCallGraph:
     """
     Build a complete project-wide call graph.
@@ -2972,22 +3208,75 @@ def build_project_call_graph(
     # Scan project once and reuse file list for both index building and call graph building
     file_list = scan_project(root, language, workspace_config)
 
-    func_index = build_function_index(root, language, workspace_config, file_list=file_list)
+    func_index = build_function_index(
+        root, language, workspace_config, file_list=file_list
+    )
 
     if language == "python":
-        _build_python_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_python_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
     elif language == "typescript":
-        _build_typescript_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_typescript_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
     elif language == "go":
-        _build_go_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_go_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
     elif language == "rust":
-        _build_rust_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_rust_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
     elif language == "java":
-        _build_java_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_java_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
     elif language == "c":
-        _build_c_call_graph(root, graph, func_index, workspace_config, file_list=file_list)
+        _build_c_call_graph(
+            root, graph, func_index, workspace_config, file_list=file_list
+        )
 
     return graph
+
+
+def _process_python_file_for_callgraph(args: tuple[str, str]) -> dict:
+    """
+    Worker function for parallel call graph extraction.
+
+    Extracts imports and function calls from a single Python file.
+    Must be at module level for ProcessPoolExecutor compatibility.
+
+    Args:
+        args: Tuple of (py_file_path, root_path) as strings for pickle compatibility
+
+    Returns:
+        Dict with keys: file, rel_path, imports, calls_by_func
+    """
+    py_file, root_str = args
+    py_path = Path(py_file)
+    root = Path(root_str)
+
+    try:
+        rel_path = str(py_path.relative_to(root))
+    except ValueError:
+        # File is not under root (shouldn't happen, but be safe)
+        return {
+            "file": py_file,
+            "rel_path": py_file,
+            "imports": [],
+            "calls_by_func": {},
+        }
+
+    imports = parse_imports(py_path)
+    calls_by_func = _extract_file_calls(py_path, root)
+
+    return {
+        "file": py_file,
+        "rel_path": rel_path,
+        "imports": imports,
+        "calls_by_func": calls_by_func,
+    }
 
 
 def _build_python_call_graph(
@@ -2995,28 +3284,52 @@ def _build_python_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
-    """Build call graph for Python files."""
+    """Build call graph for Python files.
+
+    For projects with more than MIN_FILES_FOR_PARALLEL files, uses parallel
+    extraction via ProcessPoolExecutor followed by sequential graph merge.
+    """
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "python", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "python", workspace_config)
+    )
+    source_files = list(source_files)  # Materialize for len() and reuse
 
-    for py_file in source_files:
-        py_path = Path(py_file)
-        rel_path = str(py_path.relative_to(root))
+    # Phase 1: Extract imports and calls from each file
+    # For large projects, parallelize I/O-bound file reading + CPU-bound AST parsing
+    if len(source_files) >= MIN_FILES_FOR_PARALLEL:
+        max_workers = min(os.cpu_count() or 4, 8)
+        args_list = [(str(f), str(root)) for f in source_files]
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            file_results = list(
+                executor.map(_process_python_file_for_callgraph, args_list)
+            )
+    else:
+        # Sequential extraction for small projects (avoids process spawn overhead)
+        file_results = [
+            _process_python_file_for_callgraph((str(f), str(root)))
+            for f in source_files
+        ]
 
-        # Get imports for this file
-        imports = parse_imports(py_path)
+    # Phase 2: Sequential merge into graph (fast O(N) dict/set operations)
+    for result in file_results:
+        rel_path = result["rel_path"]
+        imports = result["imports"]
+        calls_by_func = result["calls_by_func"]
 
         # Build import resolution map
         import_map = {}
         module_imports = {}
 
         for imp in imports:
-            if imp['is_from']:
-                module = imp['module']
-                aliases = imp.get('aliases', {})
-                for name in imp['names']:
+            if imp["is_from"]:
+                module = imp["module"]
+                aliases = imp.get("aliases", {})
+                for name in imp["names"]:
                     alias = None
                     for alias_name, orig_name in aliases.items():
                         if orig_name == name:
@@ -3026,24 +3339,22 @@ def _build_python_call_graph(
                         import_map[alias] = (module, name)
                     import_map[name] = (module, name)
             else:
-                module = imp['module']
-                alias = imp.get('alias')
+                module = imp["module"]
+                alias = imp.get("alias")
                 if alias:
                     module_imports[alias] = module
                 else:
                     module_imports[module] = module
 
-        # Get calls from this file
-        calls_by_func = _extract_file_calls(py_path, root)
-
+        # Add edges to graph
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
-                elif call_type == 'direct':
+                elif call_type == "direct":
                     if call_target in import_map:
                         module, orig_name = import_map[call_target]
-                        key = (module.split('.')[-1], orig_name)
+                        key = (module.split(".")[-1], orig_name)
                         if key in func_index:
                             dst_file = func_index[key]
                             graph.add_edge(rel_path, caller_func, dst_file, orig_name)
@@ -3051,19 +3362,21 @@ def _build_python_call_graph(
                             key = (module, orig_name)
                             if key in func_index:
                                 dst_file = func_index[key]
-                                graph.add_edge(rel_path, caller_func, dst_file, orig_name)
-                elif call_type == 'attr':
-                    parts = call_target.split('.', 1)
+                                graph.add_edge(
+                                    rel_path, caller_func, dst_file, orig_name
+                                )
+                elif call_type == "attr":
+                    parts = call_target.split(".", 1)
                     if len(parts) == 2:
                         obj, method = parts
                         if obj in module_imports:
                             module = module_imports[obj]
-                            simple_module = module.split('.')[-1]
+                            simple_module = module.split(".")[-1]
                             key = (simple_module, method)
                             if key in func_index:
                                 dst_file = func_index[key]
                                 graph.add_edge(rel_path, caller_func, dst_file, method)
-                elif call_type == 'ref':
+                elif call_type == "ref":
                     # Function reference (higher-order usage) - intra-file only
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
@@ -3073,11 +3386,15 @@ def _build_typescript_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
     """Build call graph for TypeScript files."""
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "typescript", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "typescript", workspace_config)
+    )
 
     for ts_file in source_files:
         ts_path = Path(ts_file)
@@ -3093,38 +3410,38 @@ def _build_typescript_call_graph(
         namespace_imports = {}  # local_name -> module_path
 
         for imp in imports:
-            module = imp['module']
+            module = imp["module"]
             # Resolve relative imports
-            if module.startswith('.'):
+            if module.startswith("."):
                 # Convert relative path to file path
                 module_path = _resolve_ts_import(rel_path, module)
             else:
                 module_path = module
 
             # Named imports: import { foo, bar as baz } from "./module"
-            for name in imp.get('names', []):
+            for name in imp.get("names", []):
                 import_map[name] = (module_path, name)
 
             # Handle aliases
-            for alias, orig_name in imp.get('aliases', {}).items():
+            for alias, orig_name in imp.get("aliases", {}).items():
                 if orig_name == "*":
                     namespace_imports[alias] = module_path
                 else:
                     import_map[alias] = (module_path, orig_name)
 
             # Default import: import Foo from "./module"
-            if imp.get('default'):
-                default_imports[imp['default']] = module_path
+            if imp.get("default"):
+                default_imports[imp["default"]] = module_path
 
         # Get calls from this file
         calls_by_func = _extract_ts_file_calls(ts_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
-                elif call_type == 'direct':
+                elif call_type == "direct":
                     if call_target in import_map:
                         module_path, orig_name = import_map[call_target]
                         # Try to find in function index
@@ -3142,8 +3459,8 @@ def _build_typescript_call_graph(
                             dst_file = func_index[key]
                             graph.add_edge(rel_path, caller_func, dst_file, call_target)
 
-                elif call_type == 'attr':
-                    parts = call_target.split('.', 1)
+                elif call_type == "attr":
+                    parts = call_target.split(".", 1)
                     if len(parts) == 2:
                         obj, method = parts
                         if obj in namespace_imports:
@@ -3159,22 +3476,22 @@ def _build_typescript_call_graph(
 def _resolve_ts_import(from_file: str, import_path: str) -> str:
     """Resolve a relative TypeScript import path to a file path."""
     from_dir = str(Path(from_file).parent)
-    if from_dir == '.':
-        from_dir = ''
+    if from_dir == ".":
+        from_dir = ""
 
     # Handle ./ and ../
-    if import_path.startswith('./'):
+    if import_path.startswith("./"):
         resolved = import_path[2:]
         if from_dir:
             resolved = f"{from_dir}/{resolved}"
-    elif import_path.startswith('../'):
-        parts = from_dir.split('/') if from_dir else []
-        import_parts = import_path.split('/')
-        while import_parts and import_parts[0] == '..':
+    elif import_path.startswith("../"):
+        parts = from_dir.split("/") if from_dir else []
+        import_parts = import_path.split("/")
+        while import_parts and import_parts[0] == "..":
             import_parts.pop(0)
             if parts:
                 parts.pop()
-        resolved = '/'.join(parts + import_parts)
+        resolved = "/".join(parts + import_parts)
     else:
         resolved = import_path
 
@@ -3209,14 +3526,18 @@ def _build_go_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
     """Build call graph for Go files."""
     # Build reverse index once for O(1) lookup by function name
     name_index = _build_name_to_files_index(func_index)
 
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "go", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "go", workspace_config)
+    )
 
     for go_file in source_files:
         go_path = Path(go_file)
@@ -3230,11 +3551,11 @@ def _build_go_call_graph(
         package_imports = {}  # local_name -> package_path
 
         for imp in imports:
-            module = imp['module']
-            alias = imp.get('alias')
+            module = imp["module"]
+            alias = imp.get("alias")
 
             # Resolve relative imports (./pkg)
-            if module.startswith('./') or module.startswith('../'):
+            if module.startswith("./") or module.startswith("../"):
                 module_path = _resolve_go_import(rel_path, module)
             else:
                 module_path = module
@@ -3244,7 +3565,7 @@ def _build_go_call_graph(
                 local_name = alias
             else:
                 # Use last component of path as package name
-                local_name = module.rstrip('/').split('/')[-1]
+                local_name = module.rstrip("/").split("/")[-1]
 
             package_imports[local_name] = module_path
 
@@ -3253,11 +3574,11 @@ def _build_go_call_graph(
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
-                elif call_type == 'attr':
-                    parts = call_target.split('.', 1)
+                elif call_type == "attr":
+                    parts = call_target.split(".", 1)
                     if len(parts) == 2:
                         pkg, func_name = parts
                         if pkg in package_imports:
@@ -3266,8 +3587,10 @@ def _build_go_call_graph(
                             candidates = name_index.get(func_name, [])
                             for mod, file_path in candidates:
                                 # Check if this file is in the right package
-                                if pkg_path.lstrip('./') in file_path or mod == pkg:
-                                    graph.add_edge(rel_path, caller_func, file_path, func_name)
+                                if pkg_path.lstrip("./") in file_path or mod == pkg:
+                                    graph.add_edge(
+                                        rel_path, caller_func, file_path, func_name
+                                    )
                                     break
 
 
@@ -3275,22 +3598,22 @@ def _build_go_call_graph(
 def _resolve_go_import(from_file: str, import_path: str) -> str:
     """Resolve a relative Go import path to a directory path."""
     from_dir = str(Path(from_file).parent)
-    if from_dir == '.':
-        from_dir = ''
+    if from_dir == ".":
+        from_dir = ""
 
     # Handle ./ and ../
-    if import_path.startswith('./'):
+    if import_path.startswith("./"):
         resolved = import_path[2:]
         if from_dir:
             resolved = f"{from_dir}/{resolved}"
-    elif import_path.startswith('../'):
-        parts = from_dir.split('/') if from_dir else []
-        import_parts = import_path.split('/')
-        while import_parts and import_parts[0] == '..':
+    elif import_path.startswith("../"):
+        parts = from_dir.split("/") if from_dir else []
+        import_parts = import_path.split("/")
+        while import_parts and import_parts[0] == "..":
             import_parts.pop(0)
             if parts:
                 parts.pop()
-        resolved = '/'.join(parts + import_parts)
+        resolved = "/".join(parts + import_parts)
     else:
         resolved = import_path
 
@@ -3302,11 +3625,15 @@ def _build_rust_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
     """Build call graph for Rust files."""
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "rust", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "rust", workspace_config)
+    )
 
     for rs_file in source_files:
         rs_path = Path(rs_file)
@@ -3321,10 +3648,10 @@ def _build_rust_call_graph(
         mod_imports = {}  # mod_name -> potential file path
 
         for imp in imports:
-            module = imp['module']
-            names = imp['names']
+            module = imp["module"]
+            names = imp["names"]
 
-            if imp.get('is_mod'):
+            if imp.get("is_mod"):
                 # mod declaration: mod utils; -> maps to utils.rs or utils/mod.rs
                 mod_name = module
                 # Try to find the file
@@ -3352,10 +3679,10 @@ def _build_rust_call_graph(
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
-                elif call_type == 'direct':
+                elif call_type == "direct":
                     if call_target in import_map:
                         module_path, orig_name = import_map[call_target]
                         # Try to find in function index
@@ -3365,7 +3692,7 @@ def _build_rust_call_graph(
                             dst_file = func_index[key]
                             graph.add_edge(rel_path, caller_func, dst_file, orig_name)
 
-                elif call_type == 'attr':
+                elif call_type == "attr":
                     # Scoped call like module::func or Type::method
                     if "::" in call_target:
                         parts = call_target.split("::")
@@ -3378,12 +3705,16 @@ def _build_rust_call_graph(
                             simple_module = Path(dst_file).stem
                             key = (simple_module, func_name)
                             if key in func_index:
-                                graph.add_edge(rel_path, caller_func, func_index[key], func_name)
+                                graph.add_edge(
+                                    rel_path, caller_func, func_index[key], func_name
+                                )
                         else:
                             # Try to find in function index by simple name
                             key = (module_prefix, func_name)
                             if key in func_index:
-                                graph.add_edge(rel_path, caller_func, func_index[key], func_name)
+                                graph.add_edge(
+                                    rel_path, caller_func, func_index[key], func_name
+                                )
 
 
 @lru_cache(maxsize=1024)
@@ -3430,14 +3761,18 @@ def _build_java_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
     """Build call graph for Java files."""
     # Build reverse index once for O(1) lookup by function name
     name_index = _build_name_to_files_index(func_index)
 
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "java", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "java", workspace_config)
+    )
 
     for java_file in source_files:
         java_path = Path(java_file)
@@ -3451,18 +3786,18 @@ def _build_java_call_graph(
         import_map = {}  # simple_name -> full_module
 
         for imp in imports:
-            module = imp['module']
-            is_wildcard = imp.get('is_wildcard', False)
+            module = imp["module"]
+            is_wildcard = imp.get("is_wildcard", False)
 
             if is_wildcard:
                 # Wildcard import - can't resolve specific names easily
                 # Store the package prefix for later matching
-                package = module.rstrip('.*')
+                package = module.rstrip(".*")
                 import_map[f"*:{package}"] = package
             else:
                 # Get simple name from full import
                 # e.g., java.util.List -> List
-                simple_name = module.split('.')[-1]
+                simple_name = module.split(".")[-1]
                 import_map[simple_name] = module
 
         # Get calls from this file
@@ -3470,10 +3805,10 @@ def _build_java_call_graph(
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
-                elif call_type == 'direct':
+                elif call_type == "direct":
                     # Direct call might be to a same-package class or an imported one
                     # O(1) lookup by function name instead of O(n) scan
                     candidates = name_index.get(call_target, [])
@@ -3481,16 +3816,18 @@ def _build_java_call_graph(
                         graph.add_edge(rel_path, caller_func, file_path, call_target)
                         break
 
-                elif call_type == 'attr':
+                elif call_type == "attr":
                     # Object.method() call
-                    if '.' in call_target:
-                        parts = call_target.split('.')
+                    if "." in call_target:
+                        parts = call_target.split(".")
                         method_name = parts[-1]
 
                         # O(1) lookup by method name instead of O(n) scan
                         candidates = name_index.get(method_name, [])
                         for mod, file_path in candidates:
-                            graph.add_edge(rel_path, caller_func, file_path, method_name)
+                            graph.add_edge(
+                                rel_path, caller_func, file_path, method_name
+                            )
                             break
 
 
@@ -3499,14 +3836,18 @@ def _build_c_call_graph(
     graph: ProjectCallGraph,
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
-    file_list: Optional[list[str]] = None
+    file_list: Optional[list[str]] = None,
 ):
     """Build call graph for C files."""
     # Build reverse index once for O(1) lookup by function name
     name_index = _build_name_to_files_index(func_index)
 
     # Use provided file_list or scan project
-    source_files = file_list if file_list is not None else scan_project(root, "c", workspace_config)
+    source_files = (
+        file_list
+        if file_list is not None
+        else scan_project(root, "c", workspace_config)
+    )
 
     for c_file in source_files:
         c_path = Path(c_file)
@@ -3520,11 +3861,11 @@ def _build_c_call_graph(
         include_map = {}  # header_name -> header_path
 
         for inc in includes:
-            module = inc['module']
-            is_system = inc.get('is_system', False)
+            module = inc["module"]
+            is_system = inc.get("is_system", False)
             # Map the header file name to its path
             # e.g., "utils.h" -> "utils.h"
-            header_name = module.split('/')[-1] if '/' in module else module
+            header_name = module.split("/")[-1] if "/" in module else module
             include_map[header_name] = module
 
         # Get calls from this file
@@ -3532,11 +3873,11 @@ def _build_c_call_graph(
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
-                if call_type == 'intra':
+                if call_type == "intra":
                     # Intra-file call
                     graph.add_edge(rel_path, caller_func, rel_path, call_target)
 
-                elif call_type == 'direct':
+                elif call_type == "direct":
                     # O(1) lookup by function name instead of O(n) scan
                     candidates = name_index.get(call_target, [])
                     for mod, file_path in candidates:

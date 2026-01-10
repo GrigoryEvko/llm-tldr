@@ -39,7 +39,6 @@ Usage:
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -52,6 +51,37 @@ from tldr.cross_file_calls import (
     _extract_rust_file_calls,
 )
 
+# Performance-optimized JSON with orjson fallback
+try:
+    import orjson
+
+    def _json_dumps(obj: object) -> bytes:
+        return orjson.dumps(obj)
+
+    def _json_loads(data: bytes | str) -> object:
+        return orjson.loads(data)
+except ImportError:
+    import json
+
+    def _json_dumps(obj: object) -> bytes:
+        return json.dumps(obj, separators=(",", ":")).encode()
+
+    def _json_loads(data: bytes | str) -> object:
+        return json.loads(data if isinstance(data, str) else data.decode())
+
+
+# Performance-optimized hashing with blake3 fallback
+try:
+    import blake3
+
+    def _hash_bytes(data: bytes) -> str:
+        return blake3.blake3(data).hexdigest()
+except ImportError:
+    import hashlib
+
+    def _hash_bytes(data: bytes) -> str:
+        return hashlib.sha1(data).hexdigest()
+
 
 @dataclass(frozen=True)
 class Edge:
@@ -63,6 +93,7 @@ class Edge:
         to_file: Target file path (relative to project root)
         to_func: Target function name
     """
+
     from_file: str
     from_func: str
     to_file: str
@@ -81,6 +112,7 @@ class FileInfo:
         hash: SHA-1 hash of file content (40-char hex string)
         mtime_ns: File modification time in nanoseconds (from stat.st_mtime_ns)
     """
+
     hash: str
     mtime_ns: int
 
@@ -99,13 +131,11 @@ def compute_file_hash(file_path: str) -> str:
     """
     path = Path(file_path)
     content = path.read_bytes()
-    return hashlib.sha1(content).hexdigest()
+    return _hash_bytes(content)
 
 
 def get_file_info(
-    file_path: str,
-    prev_mtime_ns: Optional[int] = None,
-    prev_hash: Optional[str] = None
+    file_path: str, prev_mtime_ns: Optional[int] = None, prev_hash: Optional[str] = None
 ) -> Optional[FileInfo]:
     """Get file hash with mtime-based fast path.
 
@@ -133,7 +163,7 @@ def get_file_info(
 
         # Slow path: compute hash
         content = path.read_bytes()
-        content_hash = hashlib.sha1(content).hexdigest()
+        content_hash = _hash_bytes(content)
         return FileInfo(hash=content_hash, mtime_ns=current_mtime_ns)
 
     except (FileNotFoundError, IOError, OSError):
@@ -162,8 +192,7 @@ def has_file_changed(file_path: str, cached_hash: str) -> bool:
 
 
 def has_file_changed_with_mtime(
-    file_path: str,
-    cached_info: Optional[FileInfo]
+    file_path: str, cached_info: Optional[FileInfo]
 ) -> tuple[bool, Optional[FileInfo]]:
     """Check if file changed using mtime optimization.
 
@@ -186,9 +215,7 @@ def has_file_changed_with_mtime(
         return (True, new_info) if new_info else (True, None)
 
     new_info = get_file_info(
-        file_path,
-        prev_mtime_ns=cached_info.mtime_ns,
-        prev_hash=cached_info.hash
+        file_path, prev_mtime_ns=cached_info.mtime_ns, prev_hash=cached_info.hash
     )
 
     if new_info is None:
@@ -233,9 +260,7 @@ def _can_parse_file(file_path: Path, lang: str) -> bool:
 
 
 def extract_edges_from_file(
-    file_path: str,
-    lang: str = "python",
-    project_root: Optional[str] = None
+    file_path: str, lang: str = "python", project_root: Optional[str] = None
 ) -> Optional[List[Edge]]:
     """Extract call edges from a single source file.
 
@@ -292,30 +317,31 @@ def extract_edges_from_file(
         for call_type, call_target in calls:
             # Only include intra-file calls for now
             # Cross-file resolution requires the full function index
-            if call_type == 'intra':
-                edges.append(Edge(
-                    from_file=file_name,
-                    from_func=caller_func,
-                    to_file=file_name,
-                    to_func=call_target
-                ))
-            elif call_type == 'ref':
+            if call_type == "intra":
+                edges.append(
+                    Edge(
+                        from_file=file_name,
+                        from_func=caller_func,
+                        to_file=file_name,
+                        to_func=call_target,
+                    )
+                )
+            elif call_type == "ref":
                 # Function references (e.g., higher-order)
-                edges.append(Edge(
-                    from_file=file_name,
-                    from_func=caller_func,
-                    to_file=file_name,
-                    to_func=call_target
-                ))
+                edges.append(
+                    Edge(
+                        from_file=file_name,
+                        from_func=caller_func,
+                        to_file=file_name,
+                        to_func=call_target,
+                    )
+                )
 
     return edges
 
 
 def patch_call_graph(
-    graph: ProjectCallGraph,
-    edited_file: str,
-    project_root: str,
-    lang: str = "python"
+    graph: ProjectCallGraph, edited_file: str, project_root: str, lang: str = "python"
 ) -> ProjectCallGraph:
     """Incrementally update call graph for an edited file.
 
@@ -349,9 +375,7 @@ def patch_call_graph(
     # Step 1: Extract new edges FIRST (before removing old)
     # This ensures we don't lose edges if extraction fails
     new_edges = extract_edges_from_file(
-        str(edited_file),
-        lang=lang,
-        project_root=project_root
+        str(edited_file), lang=lang, project_root=project_root
     )
 
     # Step 2: Only remove old edges if extraction succeeded
@@ -379,15 +403,14 @@ def get_file_hash_cache(project_root: str) -> dict[str, str]:
     Returns:
         Dict mapping relative file paths to their SHA-1 hashes
     """
-    import json
     cache_path = Path(project_root) / ".tldr" / "cache" / "file_hashes.json"
 
     if not cache_path.exists():
         return {}
 
     try:
-        return json.loads(cache_path.read_text())
-    except (json.JSONDecodeError, IOError):
+        return _json_loads(cache_path.read_bytes())
+    except (ValueError, IOError):
         return {}
 
 
@@ -400,10 +423,9 @@ def save_file_hash_cache(project_root: str, cache: dict[str, str]) -> None:
         project_root: Project root directory
         cache: Dict mapping relative file paths to their SHA-1 hashes
     """
-    import json
     cache_path = Path(project_root) / ".tldr" / "cache" / "file_hashes.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(cache, separators=(',', ':')))
+    cache_path.write_bytes(_json_dumps(cache))
 
 
 def get_file_info_cache(project_root: str) -> dict[str, FileInfo]:
@@ -418,20 +440,19 @@ def get_file_info_cache(project_root: str) -> dict[str, FileInfo]:
     Returns:
         Dict mapping relative file paths to FileInfo objects
     """
-    import json
     cache_path = Path(project_root) / ".tldr" / "cache" / "file_info.json"
 
     if not cache_path.exists():
         return {}
 
     try:
-        raw_data = json.loads(cache_path.read_text())
+        raw_data = _json_loads(cache_path.read_bytes())
         # Convert raw dict entries to FileInfo objects
         return {
             path: FileInfo(hash=info["hash"], mtime_ns=info["mtime_ns"])
             for path, info in raw_data.items()
         }
-    except (json.JSONDecodeError, IOError, KeyError, TypeError):
+    except (ValueError, IOError, KeyError, TypeError):
         return {}
 
 
@@ -442,7 +463,6 @@ def save_file_info_cache(project_root: str, cache: dict[str, FileInfo]) -> None:
         project_root: Project root directory
         cache: Dict mapping relative file paths to FileInfo objects
     """
-    import json
     cache_path = Path(project_root) / ".tldr" / "cache" / "file_info.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -451,14 +471,14 @@ def save_file_info_cache(project_root: str, cache: dict[str, FileInfo]) -> None:
         path: {"hash": info.hash, "mtime_ns": info.mtime_ns}
         for path, info in cache.items()
     }
-    cache_path.write_text(json.dumps(raw_data, separators=(',', ':')))
+    cache_path.write_bytes(_json_dumps(raw_data))
 
 
 def patch_dirty_files(
     graph: ProjectCallGraph,
     project_root: str,
     dirty_files: list[str],
-    lang: str = "python"
+    lang: str = "python",
 ) -> ProjectCallGraph:
     """Patch the graph for all dirty files.
 

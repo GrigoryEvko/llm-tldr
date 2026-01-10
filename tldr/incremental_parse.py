@@ -9,12 +9,35 @@ Key components:
 - IncrementalParser: Main interface for incremental parsing
 """
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+# Blake3 hashing with fallback to hashlib
+try:
+    import blake3
+
+    def _hash_bytes(data: bytes) -> str:
+        """Hash bytes using blake3."""
+        return blake3.blake3(data).hexdigest()
+
+    def _hash_string(s: str) -> str:
+        """Hash string using blake3."""
+        return blake3.blake3(s.encode()).hexdigest()
+
+except ImportError:
+    import hashlib
+
+    def _hash_bytes(data: bytes) -> str:
+        """Hash bytes using SHA1 (fallback)."""
+        return hashlib.sha1(data).hexdigest()
+
+    def _hash_string(s: str) -> str:
+        """Hash string using MD5 (fallback)."""
+        return hashlib.md5(s.encode()).hexdigest()
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +51,28 @@ try:
     from tree_sitter import Language, Parser
     import tree_sitter_typescript
     import tree_sitter_javascript
+
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     pass
 
 try:
     import tree_sitter_python
+
     TREE_SITTER_PYTHON_AVAILABLE = True
 except ImportError:
     pass
 
 try:
     import tree_sitter_go
+
     TREE_SITTER_GO_AVAILABLE = True
 except ImportError:
     pass
 
 try:
     import tree_sitter_rust
+
     TREE_SITTER_RUST_AVAILABLE = True
 except ImportError:
     pass
@@ -219,7 +246,7 @@ class TreeCache:
     def _get_cache_path(self, file_path: str) -> Path:
         """Get the cache file path for a given source file."""
         # Use hash of path for cache filename
-        path_hash = hashlib.md5(file_path.encode()).hexdigest()
+        path_hash = _hash_string(file_path)
         return self._cache_dir / f"{path_hash}.cache"
 
     def store(self, file_path: str, tree: Any, source: bytes) -> None:
@@ -235,7 +262,7 @@ class TreeCache:
 
         # Store on disk (source only, trees can't be pickled)
         if self._cache_dir:
-            source_hash = hashlib.sha1(source).hexdigest()
+            source_hash = _hash_bytes(source)
             # Detect language from tree or infer from extension
             language = self._detect_language(file_path)
 
@@ -469,7 +496,7 @@ class IncrementalParser:
         # Fast hash comparison before loading full cached content
         cached_hash = self._cache.get_cached_hash(file_path)
         if cached_hash is not None:
-            new_hash = hashlib.sha1(new_content).hexdigest()
+            new_hash = _hash_bytes(new_content)
             if cached_hash == new_hash:
                 # Hash match - file unchanged, get cached tree
                 cached = self._cache.get(file_path)

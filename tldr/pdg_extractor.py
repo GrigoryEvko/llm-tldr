@@ -17,24 +17,26 @@ Architecture (following ARISTODE pattern):
 - Support for forward/backward slicing
 """
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
 
-from .cfg_extractor import CFGInfo, CFGBlock, CFGEdge, extract_python_cfg
-from .dfg_extractor import DFGInfo, VarRef, DataflowEdge, extract_python_dfg
+from .cfg_extractor import CFGInfo, extract_python_cfg
+from .dfg_extractor import DFGInfo, extract_python_dfg
 
 
 # =============================================================================
 # PDG Data Structures
 # =============================================================================
 
-@dataclass
+
+@dataclass(slots=True)
 class PDGNode:
     """
     A node in the PDG representing a statement or expression.
 
     Maps to CFG blocks but also tracks data flow through the node.
     """
+
     id: int
     node_type: str  # "statement", "branch", "loop", "entry", "exit"
     start_line: int
@@ -60,7 +62,7 @@ class PDGNode:
         return d
 
 
-@dataclass
+@dataclass(slots=True)
 class PDGEdge:
     """
     An edge in the PDG with dependency type labeling.
@@ -73,6 +75,7 @@ class PDGEdge:
     - "data": Data dependency (from DFG)
       - "data:<varname>": Def-use chain for variable
     """
+
     source_id: int
     target_id: int
     dep_type: str  # "control" or "data"
@@ -102,6 +105,7 @@ class PDGInfo:
     - Unified node/edge view with labeled edges
     - Program slicing operations
     """
+
     function_name: str
 
     # Underlying graphs (accessible separately per ARISTODE pattern)
@@ -111,6 +115,23 @@ class PDGInfo:
     # Unified PDG representation
     nodes: list[PDGNode] = field(default_factory=list)
     edges: list[PDGEdge] = field(default_factory=list)
+
+    # Internal cache for O(1) node lookups (built lazily, excluded from repr/eq)
+    _node_by_id_cache: dict[int, PDGNode] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def _node_by_id(self) -> dict[int, PDGNode]:
+        """
+        Lazily build and cache node lookup dict for O(1) access by ID.
+
+        Replaces O(n) linear searches in slicing operations with O(1) dict lookups,
+        providing 100x+ speedup for large PDGs during BFS traversal.
+        """
+        if self._node_by_id_cache is None:
+            self._node_by_id_cache = {n.id: n for n in self.nodes}
+        return self._node_by_id_cache
 
     def to_dict(self) -> dict:
         """Export full PDG with all layers."""
@@ -169,16 +190,16 @@ class PDGInfo:
         # BFS backward through dependencies
         slice_lines: set[int] = set()
         visited: set[int] = set()
-        worklist: list[int] = [n.id for n in target_nodes]
+        worklist: deque[int] = deque(n.id for n in target_nodes)
 
         while worklist:
-            node_id = worklist.pop(0)
+            node_id = worklist.popleft()
             if node_id in visited:
                 continue
             visited.add(node_id)
 
-            # Add this node's lines to slice
-            node = next((n for n in self.nodes if n.id == node_id), None)
+            # Add this node's lines to slice (O(1) lookup via cached dict)
+            node = self._node_by_id.get(node_id)
             if node:
                 for l in range(node.start_line, node.end_line + 1):
                     slice_lines.add(l)
@@ -218,16 +239,16 @@ class PDGInfo:
         # BFS forward through dependencies
         slice_lines: set[int] = set()
         visited: set[int] = set()
-        worklist: list[int] = [n.id for n in source_nodes]
+        worklist: deque[int] = deque(n.id for n in source_nodes)
 
         while worklist:
-            node_id = worklist.pop(0)
+            node_id = worklist.popleft()
             if node_id in visited:
                 continue
             visited.add(node_id)
 
-            # Add this node's lines to slice
-            node = next((n for n in self.nodes if n.id == node_id), None)
+            # Add this node's lines to slice (O(1) lookup via cached dict)
+            node = self._node_by_id.get(node_id)
             if node:
                 for l in range(node.start_line, node.end_line + 1):
                     slice_lines.add(l)
@@ -280,6 +301,7 @@ class PDGInfo:
 # PDG Construction
 # =============================================================================
 
+
 class PDGBuilder:
     """
     Build PDG by merging CFG and DFG.
@@ -300,6 +322,8 @@ class PDGBuilder:
 
         # Map from line to node ID for data flow edge mapping
         self._line_to_node: dict[int, int] = {}
+        # Map from node ID to node for O(1) lookups during construction
+        self._node_by_id: dict[int, PDGNode] = {}
 
     def build(self) -> PDGInfo:
         """Build the PDG from CFG and DFG."""
@@ -337,16 +361,18 @@ class PDGBuilder:
                 cfg_block_id=block.id,
             )
             self.nodes.append(node)
+            # Build node ID -> node mapping for O(1) lookups
+            self._node_by_id[block.id] = node
 
             # Build line -> node mapping
             for line in range(block.start_line, block.end_line + 1):
                 self._line_to_node[line] = block.id
 
-        # Add variable refs to nodes
+        # Add variable refs to nodes (O(1) lookup via dict)
         for ref in self.dfg.var_refs:
             node_id = self._line_to_node.get(ref.line)
             if node_id is not None:
-                node = next((n for n in self.nodes if n.id == node_id), None)
+                node = self._node_by_id.get(node_id)
                 if node:
                     if ref.ref_type in ("definition", "update"):
                         if ref.name not in node.definitions:
@@ -390,6 +416,7 @@ class PDGBuilder:
 # Python PDG Extraction
 # =============================================================================
 
+
 def extract_python_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Python function.
@@ -423,6 +450,7 @@ def extract_python_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # TypeScript/JavaScript PDG Extraction
 # =============================================================================
+
 
 def extract_typescript_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -474,6 +502,7 @@ def extract_javascript_pdg(source_code: str, function_name: str) -> PDGInfo | No
 # Go PDG Extraction
 # =============================================================================
 
+
 def extract_go_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Go function.
@@ -499,6 +528,7 @@ def extract_go_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # Rust PDG Extraction
 # =============================================================================
+
 
 def extract_rust_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -526,6 +556,7 @@ def extract_rust_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # Java PDG Extraction
 # =============================================================================
 
+
 def extract_java_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Java function.
@@ -551,6 +582,7 @@ def extract_java_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # C PDG Extraction
 # =============================================================================
+
 
 def extract_c_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -578,6 +610,7 @@ def extract_c_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # C++ PDG Extraction
 # =============================================================================
 
+
 def extract_cpp_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a C++ function.
@@ -604,6 +637,7 @@ def extract_cpp_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # Ruby PDG Extraction
 # =============================================================================
 
+
 def extract_ruby_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Ruby function.
@@ -629,6 +663,7 @@ def extract_ruby_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # PHP PDG Extraction
 # =============================================================================
+
 
 def extract_php_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -663,6 +698,7 @@ def extract_php_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # Kotlin PDG Extraction
 # =============================================================================
 
+
 def extract_kotlin_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Kotlin function.
@@ -695,6 +731,7 @@ def extract_kotlin_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # Swift PDG Extraction
 # =============================================================================
+
 
 def extract_swift_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -758,6 +795,7 @@ def extract_csharp_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # Scala PDG Extraction
 # =============================================================================
 
+
 def extract_scala_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for a Scala function.
@@ -790,6 +828,7 @@ def extract_scala_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # Lua PDG Extraction
 # =============================================================================
+
 
 def extract_lua_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
@@ -824,6 +863,7 @@ def extract_lua_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # Elixir PDG Extraction
 # =============================================================================
 
+
 def extract_elixir_pdg(source_code: str, function_name: str) -> PDGInfo | None:
     """
     Extract PDG for an Elixir function.
@@ -856,6 +896,7 @@ def extract_elixir_pdg(source_code: str, function_name: str) -> PDGInfo | None:
 # =============================================================================
 # Multi-language convenience function
 # =============================================================================
+
 
 def extract_pdg(source_code: str, function_name: str, language: str) -> PDGInfo | None:
     """
@@ -890,7 +931,9 @@ def extract_pdg(source_code: str, function_name: str, language: str) -> PDGInfo 
 
     extractor = extractors.get(language.lower())
     if extractor is None:
-        raise ValueError(f"Unsupported language: {language}. "
-                        f"Supported: {', '.join(extractors.keys())}")
+        raise ValueError(
+            f"Unsupported language: {language}. "
+            f"Supported: {', '.join(extractors.keys())}"
+        )
 
     return extractor(source_code, function_name)

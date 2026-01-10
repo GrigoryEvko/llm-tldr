@@ -15,10 +15,12 @@ Usage:
 """
 
 import functools
+import os
+import re
 from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .ast_extractor import (
     CallGraphInfo,  # Re-exported for API consumers
@@ -151,20 +153,10 @@ from .dfg_extractor import (
     extract_typescript_dfg,
 )
 from .hybrid_extractor import (
-    HybridExtractor,
-    extract_directory,  # Re-exported for API
+    HybridExtractor,  # Re-exported for API
 )
 from .pdg_extractor import (
-    PDGInfo,
-    extract_c_pdg,
-    extract_cpp_pdg,
-    extract_csharp_pdg,
-    extract_go_pdg,
     extract_pdg,
-    extract_python_pdg,
-    extract_ruby_pdg,
-    extract_rust_pdg,
-    extract_typescript_pdg,
 )
 
 # Explicit exports for public API
@@ -206,6 +198,7 @@ class PathTraversalError(ValueError):
     This is a security error indicating an attempted path traversal attack
     (e.g., using ../../../etc/passwd to escape the project directory).
     """
+
     pass
 
 
@@ -396,7 +389,7 @@ def _get_project_mtime(project: Path, extensions: set[str]) -> float:
                 # Skip hidden directories
                 try:
                     rel = f.relative_to(project)
-                    if any(p.startswith('.') for p in rel.parts):
+                    if any(p.startswith(".") for p in rel.parts):
                         continue
                 except ValueError:
                     continue
@@ -446,6 +439,7 @@ def _get_cached_call_graph(
 @dataclass
 class FunctionContext:
     """Context for a single function."""
+
     name: str
     file: str
     line: int
@@ -459,16 +453,14 @@ class FunctionContext:
 @dataclass
 class RelevantContext:
     """The full context returned by get_relevant_context."""
+
     entry_point: str
     depth: int
     functions: list[FunctionContext] = field(default_factory=list)
 
     def to_llm_string(self) -> str:
         """Format for LLM injection."""
-        lines = [
-            f"## Code Context: {self.entry_point} (depth={self.depth})",
-            ""
-        ]
+        lines = [f"## Code Context: {self.entry_point} (depth={self.depth})", ""]
 
         for i, func in enumerate(self.functions):
             # Indentation based on call depth
@@ -481,19 +473,23 @@ class RelevantContext:
 
             # Docstring (truncated)
             if func.docstring:
-                doc = func.docstring.split('\n')[0][:80]
+                doc = func.docstring.split("\n")[0][:80]
                 lines.append(f"{indent}   # {doc}")
 
             # Complexity
             if func.blocks is not None:
-                complexity_marker = "🔥" if func.cyclomatic and func.cyclomatic > 10 else ""
-                lines.append(f"{indent}   ⚡ complexity: {func.cyclomatic or '?'} ({func.blocks} blocks) {complexity_marker}")
+                complexity_marker = (
+                    "🔥" if func.cyclomatic and func.cyclomatic > 10 else ""
+                )
+                lines.append(
+                    f"{indent}   ⚡ complexity: {func.cyclomatic or '?'} ({func.blocks} blocks) {complexity_marker}"
+                )
 
             # Calls
             if func.calls:
                 calls_str = ", ".join(func.calls[:5])
                 if len(func.calls) > 5:
-                    calls_str += f" (+{len(func.calls)-5} more)"
+                    calls_str += f" (+{len(func.calls) - 5} more)"
                 lines.append(f"{indent}   → calls: {calls_str}")
 
             lines.append("")
@@ -501,14 +497,17 @@ class RelevantContext:
         # Footer with stats
         result = "\n".join(lines)
         token_estimate = len(result) // 4
-        return result + f"\n---\n📊 {len(self.functions)} functions | ~{token_estimate} tokens"
+        return (
+            result
+            + f"\n---\n📊 {len(self.functions)} functions | ~{token_estimate} tokens"
+        )
 
 
 def _get_module_exports(
     project: Path,
     module_path: str,
     language: str = "python",
-    include_docstrings: bool = True
+    include_docstrings: bool = True,
 ) -> "RelevantContext":
     """Get all exports from a module path.
 
@@ -521,12 +520,7 @@ def _get_module_exports(
     Returns:
         RelevantContext with all functions/classes from the module
     """
-    ext_map = {
-        "python": ".py",
-        "typescript": ".ts",
-        "go": ".go",
-        "rust": ".rs"
-    }
+    ext_map = {"python": ".py", "typescript": ".ts", "go": ".go", "rust": ".rs"}
     ext = ext_map.get(language, ".py")
 
     # Try to find the module file
@@ -539,7 +533,9 @@ def _get_module_exports(
         if init_file.exists():
             module_file = init_file
         else:
-            raise ValueError(f"Module not found: {module_path} (tried {module_file} and {init_file})")
+            raise ValueError(
+                f"Module not found: {module_path} (tried {module_file} and {init_file})"
+            )
 
     # Extract all functions and classes from the module
     extractor = HybridExtractor()
@@ -586,11 +582,7 @@ def _get_module_exports(
             )
             functions.append(method_ctx)
 
-    return RelevantContext(
-        entry_point=module_path,
-        depth=0,
-        functions=functions
-    )
+    return RelevantContext(entry_point=module_path, depth=0, functions=functions)
 
 
 # =============================================================================
@@ -630,7 +622,7 @@ def _cached_scan_project_files(project: str, language: str) -> tuple[str, ...]:
         # Skip hidden directories
         try:
             rel = f.relative_to(project_path)
-            if any(part.startswith('.') for part in rel.parts):
+            if any(part.startswith(".") for part in rel.parts):
                 continue
         except ValueError:
             continue
@@ -644,7 +636,7 @@ def get_relevant_context(
     entry_point: str,
     depth: int = 2,
     language: str = "python",
-    include_docstrings: bool = True
+    include_docstrings: bool = True,
 ) -> RelevantContext:
     """
     Get token-efficient context for an LLM starting from an entry point.
@@ -671,7 +663,7 @@ def get_relevant_context(
         "python": ".py",
         "typescript": ".ts",
         "go": ".go",
-        "rust": ".rs"
+        "rust": ".rs",
     }.get(language, ".py")
 
     # Search for module file matching entry_point (using cached scan)
@@ -688,15 +680,17 @@ def get_relevant_context(
         if module_file:
             # Found a module file - return its exports as module query
             rel_path = module_file.relative_to(project)
-            module_path = str(rel_path.with_suffix(''))  # Remove extension
-            return _get_module_exports(project, module_path, language, include_docstrings)
+            module_path = str(rel_path.with_suffix(""))  # Remove extension
+            return _get_module_exports(
+                project, module_path, language, include_docstrings
+            )
 
     # Extension map for language (needed for caching and file scanning)
     ext_map = {
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
         "go": {".go"},
-        "rust": {".rs"}
+        "rust": {".rs"},
     }
     extensions = ext_map.get(language, {".py"})
 
@@ -876,9 +870,11 @@ def get_relevant_context(
                     line=func_info.line_number,
                     signature=func_info.signature(),
                     docstring=func_info.docstring if include_docstrings else None,
-                    calls=adjacency.get(func_info.name, []),  # Use unqualified for adjacency lookup
+                    calls=adjacency.get(
+                        func_info.name, []
+                    ),  # Use unqualified for adjacency lookup
                     blocks=blocks,
-                    cyclomatic=cyclomatic
+                    cyclomatic=cyclomatic,
                 )
                 result_functions.append(ctx)
 
@@ -893,7 +889,7 @@ def get_relevant_context(
                 file="?",
                 line=0,
                 signature=f"def {func_name}(...)",
-                calls=adjacency.get(func_name, [])
+                calls=adjacency.get(func_name, []),
             )
             result_functions.append(ctx)
 
@@ -903,16 +899,12 @@ def get_relevant_context(
                     queue.append((callee, current_depth + 1))
 
     return RelevantContext(
-        entry_point=entry_point,
-        depth=depth,
-        functions=result_functions
+        entry_point=entry_point, depth=depth, functions=result_functions
     )
 
 
 def get_dfg_context(
-    source_or_path: str,
-    function_name: str,
-    language: str = "python"
+    source_or_path: str, function_name: str, language: str = "python"
 ) -> dict:
     """
     Get data flow analysis for a function.
@@ -962,12 +954,7 @@ def get_dfg_context(
         return dfg_info.to_dict()
     except Exception:
         # Return empty DFG on extraction failure
-        return {
-            "function": function_name,
-            "refs": [],
-            "edges": [],
-            "variables": []
-        }
+        return {"function": function_name, "refs": [], "edges": [], "variables": []}
 
 
 # =============================================================================
@@ -976,9 +963,7 @@ def get_dfg_context(
 
 
 def get_cfg_context(
-    source_or_path: str,
-    function_name: str,
-    language: str = "python"
+    source_or_path: str, function_name: str, language: str = "python"
 ) -> dict:
     """
     Get control flow graph context for a function.
@@ -1047,9 +1032,7 @@ def get_cfg_context(
 
 
 def get_cfg_blocks(
-    source_or_path: str,
-    function_name: str,
-    language: str = "python"
+    source_or_path: str, function_name: str, language: str = "python"
 ) -> list[dict]:
     """
     Get CFG basic blocks for a function.
@@ -1076,9 +1059,7 @@ def get_cfg_blocks(
 
 
 def get_cfg_edges(
-    source_or_path: str,
-    function_name: str,
-    language: str = "python"
+    source_or_path: str, function_name: str, language: str = "python"
 ) -> list[dict]:
     """
     Get CFG control flow edges for a function.
@@ -1104,10 +1085,7 @@ def get_cfg_edges(
 
 
 def query(
-    project: str | Path,
-    query: str,
-    depth: int = 2,
-    language: str = "python"
+    project: str | Path, query: str, depth: int = 2, language: str = "python"
 ) -> str:
     """
     Convenience function that returns LLM-ready string directly.
@@ -1129,10 +1107,9 @@ def query(
 # PDG API Functions (Layer 5)
 # =============================================================================
 
+
 def get_pdg_context(
-    source_or_path: str,
-    function_name: str,
-    language: str = "python"
+    source_or_path: str, function_name: str, language: str = "python"
 ) -> dict | None:
     """
     Get program dependence graph context for a function.
@@ -1182,7 +1159,7 @@ def get_slice(
     line: int,
     direction: str = "backward",
     variable: str | None = None,
-    language: str = "python"
+    language: str = "python",
 ) -> set[int]:
     """
     Get program slice - lines affecting or affected by a given line.
@@ -1527,13 +1504,25 @@ def search(
     # Security: Validate path containment
     _validate_path_containment(str(root))
 
-    import re
-
     # Directories to skip (common junk)
     SKIP_DIRS = {
-        "node_modules", "__pycache__", ".git", ".svn", ".hg",
-        "dist", "build", ".next", ".nuxt", "coverage", ".tox",
-        "venv", ".venv", "env", ".env", "vendor", ".cache",
+        "node_modules",
+        "__pycache__",
+        ".git",
+        ".svn",
+        ".hg",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        "coverage",
+        ".tox",
+        "venv",
+        ".venv",
+        "env",
+        ".env",
+        "vendor",
+        ".cache",
     }
 
     results = []
@@ -1648,6 +1637,27 @@ class Selection:
         return len(self._selected)
 
 
+# Parallelization threshold for get_code_structure
+MIN_FILES_FOR_PARALLEL = 15
+
+
+def _extract_file_for_structure(file_path: str) -> tuple[str, dict | None]:
+    """
+    Extract file info for parallel processing in get_code_structure.
+
+    Args:
+        file_path: Absolute path to file
+
+    Returns:
+        Tuple of (file_path, info_dict) or (file_path, None) on error
+    """
+    try:
+        info = _extract_file_impl(file_path)
+        return (file_path, info.to_dict())
+    except Exception:
+        return (file_path, None)
+
+
 def get_code_structure(
     root: str | Path,
     language: str = "python",
@@ -1703,11 +1713,10 @@ def get_code_structure(
 
     extensions = ext_map.get(language, {".py"})
 
-    result = {"root": str(root), "language": language, "files": []}
-
-    count = 0
+    # Collect files to process (apply filtering before extraction)
+    files_to_process: list[str] = []
     for file_path in root.rglob("*"):
-        if count >= max_results:
+        if len(files_to_process) >= max_results:
             break
 
         if not file_path.is_file():
@@ -1724,21 +1733,35 @@ def get_code_structure(
         except ValueError:
             continue
 
-        try:
-            info = _extract_file_impl(str(file_path))
-            info_dict = info.to_dict()
+        files_to_process.append(str(file_path))
 
+    # Extract file info - parallel for large sets, sequential for small
+    if len(files_to_process) > MIN_FILES_FOR_PARALLEL:
+        max_workers = min(os.cpu_count() or 4, 8)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            extraction_results = list(
+                executor.map(_extract_file_for_structure, files_to_process)
+            )
+    else:
+        extraction_results = [_extract_file_for_structure(f) for f in files_to_process]
+
+    # Build result from extraction results
+    result = {"root": str(root), "language": language, "files": []}
+    for file_path, info_dict in extraction_results:
+        if info_dict is None:
+            continue
+
+        try:
+            rel_path = Path(file_path).relative_to(root)
             file_entry = {
-                "path": str(file_path.relative_to(root)),
+                "path": str(rel_path),
                 "functions": [f["name"] for f in info_dict.get("functions", [])],
                 "classes": [c["name"] for c in info_dict.get("classes", [])],
                 "imports": info_dict.get("imports", []),
             }
-
             result["files"].append(file_entry)
-            count += 1
         except Exception:
-            # Skip files that can't be parsed
+            # Skip files with path resolution issues
             pass
 
     return result
@@ -1749,8 +1772,12 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python -m tldr.api <project_path> <entry_point> [depth] [language]")
-        print("Example: python -m tldr.api /path/to/project build_project_call_graph 2 python")
+        print(
+            "Usage: python -m tldr.api <project_path> <entry_point> [depth] [language]"
+        )
+        print(
+            "Example: python -m tldr.api /path/to/project build_project_call_graph 2 python"
+        )
         sys.exit(1)
 
     project_path = sys.argv[1]

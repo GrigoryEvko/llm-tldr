@@ -10,7 +10,6 @@ Usage:
 
 import fcntl
 import functools
-import hashlib
 import json
 import socket
 import subprocess
@@ -19,6 +18,21 @@ import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+# blake3 for fast hashing with fallback to md5
+try:
+    import blake3
+
+    def _hash_path(path: str) -> str:
+        """Hash a path string using blake3 (fast, cryptographic)."""
+        return blake3.blake3(str(Path(path).resolve()).encode()).hexdigest()[:8]
+except ImportError:
+    import hashlib
+
+    def _hash_path(path: str) -> str:
+        """Hash a path string using md5 (fallback when blake3 unavailable)."""
+        return hashlib.md5(str(Path(path).resolve()).encode()).hexdigest()[:8]
+
 
 mcp = FastMCP("tldr-code")
 
@@ -37,21 +51,22 @@ def mcp_error_handler(func):
         except RuntimeError as e:
             return {"status": "error", "message": str(e)}
         except Exception as e:
-            return {"status": "error", "message": f"Unexpected error: {type(e).__name__}: {e}"}
+            return {
+                "status": "error",
+                "message": f"Unexpected error: {type(e).__name__}: {e}",
+            }
 
     return wrapper
 
 
 def _get_socket_path(project: str) -> Path:
     """Compute socket path matching daemon.py logic."""
-    hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
-    return Path(f"/tmp/tldr-{hash_val}.sock")
+    return Path(f"/tmp/tldr-{_hash_path(project)}.sock")
 
 
 def _get_lock_path(project: str) -> Path:
     """Get lock file path for daemon startup synchronization."""
-    hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
-    return Path(f"/tmp/tldr-{hash_val}.lock")
+    return Path(f"/tmp/tldr-{_hash_path(project)}.lock")
 
 
 def _ping_daemon(project: str) -> bool:
@@ -96,7 +111,15 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
             # Start daemon
             try:
                 subprocess.Popen(
-                    [sys.executable, "-m", "tldr.cli", "daemon", "start", "--project", project],
+                    [
+                        sys.executable,
+                        "-m",
+                        "tldr.cli",
+                        "daemon",
+                        "start",
+                        "--project",
+                        project,
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -244,9 +267,7 @@ def extract(file: str) -> dict:
 
 @mcp.tool()
 @mcp_error_handler
-def context(
-    project: str, entry: str, depth: int = 2, language: str = "python"
-) -> str:
+def context(project: str, entry: str, depth: int = 2, language: str = "python") -> str:
     """Get token-efficient LLM context starting from an entry point.
 
     Follows call graph to specified depth, returning signatures and complexity

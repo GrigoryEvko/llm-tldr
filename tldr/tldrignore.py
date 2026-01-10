@@ -145,14 +145,17 @@ def ensure_tldrignore(project_dir: str | Path) -> tuple[bool, str]:
     # Create with default template
     tldrignore_path.write_text(DEFAULT_TEMPLATE)
 
-    return True, f"""Created .tldrignore with sensible defaults:
+    return (
+        True,
+        """Created .tldrignore with sensible defaults:
   - node_modules/, .venv/, __pycache__/
   - dist/, build/, *.egg-info/
   - Binary files (*.so, *.dll, *.whl)
   - Security files (.env, *.pem, *.key)
 
 Review .tldrignore before indexing large codebases.
-Edit to exclude vendor code, test fixtures, etc."""
+Edit to exclude vendor code, test fixtures, etc.""",
+    )
 
 
 def should_ignore(
