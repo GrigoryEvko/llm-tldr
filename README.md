@@ -35,6 +35,42 @@ TLDR builds 5 analysis layers, each answering different questions:
 
 The daemon keeps indexes in memory for **100ms queries** instead of 30-second CLI spawns.
 
+### The Semantic Layer: Search by Behavior
+
+The real power comes from combining all 5 layers into **searchable embeddings**.
+
+Every function gets indexed with:
+- Signature + docstring (L1)
+- What it calls + who calls it (L2)
+- Complexity metrics (L3)
+- Data flow patterns (L4)
+- Dependencies (L5)
+- First ~10 lines of actual code
+
+This gets encoded into **1024-dimensional vectors** using `bge-large-en-v1.5`. The result: search by *what code does*, not just what it says.
+
+```bash
+# "validate JWT" finds verify_access_token() even without that exact text
+tldr semantic "validate JWT tokens and check expiration" .
+```
+
+**Why this works:** Traditional search finds `authentication` in variable names and comments. Semantic search understands that `verify_access_token()` *performs* JWT validation because the call graph and data flow reveal its purpose.
+
+### Setting Up Semantic Search
+
+```bash
+# 1. Install embedding dependencies
+pip install sentence-transformers faiss-cpu
+
+# 2. Build the semantic index (one-time, ~2 min for typical project)
+tldr warm /path/to/project
+
+# 3. Search by behavior
+tldr semantic "database connection pooling" .
+```
+
+The index is cached in `.tldr/cache/semantic.faiss`. Rebuilds automatically when code changes.
+
 ---
 
 ## The Workflow
