@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from tldr.dedup import ContentHashedIndex
 from tldr.salsa import SalsaDB, salsa_query
+from tldr.stats import SessionStats, StatsStore, count_tokens, get_default_store
 
 # Idle timeout: 30 minutes
 IDLE_TIMEOUT = 30 * 60
@@ -194,6 +195,10 @@ class TLDRDaemon:
         self._reindex_in_progress: bool = False
         self._semantic_config = self._load_semantic_config()
 
+        # P7 Features: Per-session token stats tracking
+        self._session_stats: dict[str, SessionStats] = {}
+        self._stats_store: StatsStore = get_default_store()
+
     def _compute_socket_path(self) -> Path:
         """Compute deterministic socket path from project path."""
         hash_val = hashlib.md5(str(self.project).encode()).hexdigest()[:8]
@@ -305,6 +310,12 @@ class TLDRDaemon:
         """Handle ping command."""
         return {"status": "ok"}
 
+    def _get_session_stats(self, session_id: str) -> SessionStats:
+        """Get or create session stats for a session ID."""
+        if session_id not in self._session_stats:
+            self._session_stats[session_id] = SessionStats(session_id=session_id)
+        return self._session_stats[session_id]
+
     def _handle_status(self, command: dict) -> dict:
         """Handle status command with P5 cache statistics."""
         uptime = time.time() - self._start_time
@@ -317,6 +328,22 @@ class TLDRDaemon:
         if self.dedup_index:
             dedup_stats = self.dedup_index.stats()
 
+        # Get session stats if session ID provided
+        session_id = command.get("session")
+        session_stats = None
+        if session_id:
+            stats = self._session_stats.get(session_id)
+            if stats:
+                session_stats = stats.to_dict()
+
+        # Get all sessions summary
+        all_sessions_stats = {
+            "active_sessions": len(self._session_stats),
+            "total_raw_tokens": sum(s.raw_tokens for s in self._session_stats.values()),
+            "total_tldr_tokens": sum(s.tldr_tokens for s in self._session_stats.values()),
+            "total_requests": sum(s.requests for s in self._session_stats.values()),
+        }
+
         return {
             "status": self._status,
             "uptime": uptime,
@@ -324,12 +351,26 @@ class TLDRDaemon:
             "project": str(self.project),
             "salsa_stats": salsa_stats,
             "dedup_stats": dedup_stats,
+            "session_stats": session_stats,
+            "all_sessions": all_sessions_stats,
         }
 
     def _handle_shutdown(self, command: dict) -> dict:
-        """Handle shutdown command."""
+        """Handle shutdown command with stats persistence."""
+        # Persist all session stats before shutdown
+        self._persist_all_stats()
         self._shutdown_requested = True
         return {"status": "shutting_down"}
+
+    def _persist_all_stats(self) -> None:
+        """Persist all session stats to JSONL store."""
+        for session_id, stats in self._session_stats.items():
+            if stats.requests > 0:  # Only persist if there were actual requests
+                try:
+                    self._stats_store.append(stats)
+                    logger.info(f"Persisted stats for session {session_id}: {stats.requests} requests, {stats.savings_percent:.1f}% savings")
+                except Exception as e:
+                    logger.error(f"Failed to persist stats for session {session_id}: {e}")
 
     def _handle_search(self, command: dict) -> dict:
         """Handle search command with SalsaDB caching."""
@@ -352,14 +393,34 @@ class TLDRDaemon:
             return {"status": "error", "message": str(e)}
 
     def _handle_extract(self, command: dict) -> dict:
-        """Handle extract command with SalsaDB caching."""
+        """Handle extract command with SalsaDB caching and token tracking."""
         file_path = command.get("file")
         if not file_path:
             return {"status": "error", "message": "Missing required parameter: file"}
 
         try:
+            # Track tokens if session ID provided
+            session_id = command.get("session")
+            raw_tokens = 0
+
+            if session_id:
+                # Count raw file tokens (what vanilla Claude would use)
+                try:
+                    raw_content = Path(file_path).read_text()
+                    raw_tokens = count_tokens(raw_content)
+                except Exception:
+                    pass  # File might not exist or be binary
+
             # Use SalsaDB for cached extraction
-            return self.salsa_db.query(cached_extract, self.salsa_db, file_path)
+            result = self.salsa_db.query(cached_extract, self.salsa_db, file_path)
+
+            # Track token savings if session ID provided
+            if session_id and raw_tokens > 0:
+                tldr_tokens = count_tokens(json.dumps(result))
+                stats = self._get_session_stats(session_id)
+                stats.record_request(raw_tokens=raw_tokens, tldr_tokens=tldr_tokens)
+
+            return result
         except Exception as e:
             logger.exception("Extract failed")
             return {"status": "error", "message": str(e)}
