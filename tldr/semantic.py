@@ -195,12 +195,16 @@ def get_model(model_name: Optional[str] = None):
 
         _model = SentenceTransformer(hf_name, device=device)
 
-        # Cast to bf16 for faster inference (supported on modern CPUs and GPUs)
-        _model = _model.to(torch.bfloat16)
+        # Best-effort dtype optimization (don't fail model load)
+        try:
+            _model = _model.to(torch.bfloat16)
+        except Exception:
+            pass  # Fall back to fp32 if bf16 unsupported
 
         # Apply torch.compile() for optimized execution (PyTorch 2.0+)
         try:
-            _model = torch.compile(_model)
+            if hasattr(torch, "compile"):
+                _model = torch.compile(_model)
         except Exception:
             pass  # Silently fall back if compile unavailable
 
@@ -520,8 +524,8 @@ def extract_units_from_project(
     files = structure.get("files", [])
     max_workers = int(os.environ.get("TLDR_MAX_WORKERS", os.cpu_count() or 4))
 
-    # Use parallel processing if we have multiple files
-    if len(files) > 1 and max_workers > 1:
+    # Use parallel processing if we have enough files to justify overhead
+    if len(files) >= MIN_FILES_FOR_PARALLEL and max_workers > 1:
         try:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -1045,9 +1049,9 @@ def _process_file_for_extraction(
         # Build lookup dicts from extracted info
         for func in module_info.functions:
             # Extract code preview (first 10 lines from function start)
-            start_line = func.line_number
-            end_line = min(start_line + 10, len(lines))
-            code_preview = '\n'.join(lines[start_line - 1:end_line])
+            start_idx = max(0, func.line_number - 1)
+            end_idx = min(start_idx + 10, len(lines))
+            code_preview = '\n'.join(lines[start_idx:end_idx])
 
             ast_info["functions"][func.name] = {
                 "line": func.line_number,
@@ -1062,9 +1066,9 @@ def _process_file_for_extraction(
             # Process methods within each class
             for method in cls.methods:
                 method_key = f"{cls.name}.{method.name}"
-                start_line = method.line_number
-                end_line = min(start_line + 10, len(lines))
-                code_preview = '\n'.join(lines[start_line - 1:end_line])
+                start_idx = max(0, method.line_number - 1)
+                end_idx = min(start_idx + 10, len(lines))
+                code_preview = '\n'.join(lines[start_idx:end_idx])
 
                 ast_info["methods"][method_key] = {
                     "line": method.line_number,
@@ -1262,20 +1266,20 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
 
 def build_semantic_index(
     project_path: str,
-    lang: str = "python",
+    lang: str = "all",
     model: Optional[str] = None,
     show_progress: bool = True,
     respect_ignore: bool = True,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
 
-    Creates:
-    - .tldr/cache/semantic/index.faiss - Vector index
-    - .tldr/cache/semantic/metadata.json - Unit metadata
+    Creates a unified index at .tldr/cache/semantic/:
+    - index.faiss - Vector index
+    - metadata.json - Unit metadata with language info
 
     Args:
         project_path: Path to project root.
-        lang: Programming language.
+        lang: Language to index - "all" (default) auto-detects and indexes all.
         model: Model name from SUPPORTED_MODELS or HuggingFace name.
         show_progress: Show progress spinner (default: True).
         respect_ignore: If True, respect .tldrignore patterns (default True).
@@ -1301,43 +1305,48 @@ def build_semantic_index(
     else:
         hf_name = model_key
 
-    # Use language-specific paths to avoid one language's index overwriting another
-    # e.g., .tldr/cache/semantic/python/, .tldr/cache/semantic/typescript/
-    cache_dir = project / ".tldr" / "cache" / "semantic" / lang
+    # Unified cache directory - no language suffix
+    # All languages stored together in single index
+    cache_dir = project / ".tldr" / "cache" / "semantic"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract all units (respecting .tldrignore)
+    indexed_languages: List[str] = []
     if console:
         with console.status("[bold green]Extracting code units...") as status:
             if lang == "all":
-                # Optimization: detect which languages are actually present
+                # Auto-detect which languages are present
                 status.update("[bold green]Scanning project languages...")
-                target_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
-                if not target_languages:
+                indexed_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
+                if not indexed_languages:
                     console.print("[yellow]No supported languages detected in project[/yellow]")
                     return 0
-                if console:
-                    console.print(f"[dim]Detected languages: {', '.join(target_languages)}[/dim]")
+                console.print(f"[dim]Detected languages: {', '.join(indexed_languages)}[/dim]")
 
                 units = []
-                for lang_name in target_languages:
+                for lang_name in indexed_languages:
                     status.update(f"[bold green]Extracting {lang_name} code units...")
                     units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
             else:
+                indexed_languages = [lang]
                 units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
         if lang == "all":
-            target_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
-            if not target_languages:
+            indexed_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
+            if not indexed_languages:
                 return 0
             units = []
-            for lang_name in target_languages:
+            for lang_name in indexed_languages:
                 units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
         else:
+            indexed_languages = [lang]
             units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
 
     if not units:
+        logger.warning(
+            "No indexable code units found. Check project contains supported source files."
+        )
         return 0
 
     # Build all texts first for batch encoding
@@ -1373,21 +1382,23 @@ def build_semantic_index(
     temp_index = cache_dir / "index.faiss.tmp"
     temp_metadata = cache_dir / "metadata.json.tmp"
 
-    # Prepare metadata
+    # Prepare metadata with version for future migrations
     metadata = {
+        "version": 2,  # v2 = unified index format
         "units": [u.to_dict() for u in units],
         "model": hf_name,
         "dimension": dimension,
         "count": len(units),
+        "languages": indexed_languages,
     }
 
     # Write to temp files first
     faiss.write_index(index, str(temp_index))
-    temp_metadata.write_text(json.dumps(metadata, indent=2))
+    temp_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    # Atomic rename (POSIX guarantees rename atomicity on same filesystem)
-    temp_index.rename(index_file)
-    temp_metadata.rename(metadata_file)
+    # Atomic replace (os.replace works cross-platform, unlike Path.rename on Windows)
+    os.replace(temp_index, index_file)
+    os.replace(temp_metadata, metadata_file)
 
     if console:
         console.print(f"[bold green]✓[/] Indexed {len(units)} code units")
@@ -1401,9 +1412,11 @@ def semantic_search(
     k: int = 5,
     expand_graph: bool = False,
     model: Optional[str] = None,
-    lang: str = "python",
+    lang: Optional[str] = None,  # Ignored - searches unified index
 ) -> List[dict]:
     """Search for code units semantically.
+
+    Searches the unified index containing all languages.
 
     Args:
         project_path: Path to project root.
@@ -1412,39 +1425,75 @@ def semantic_search(
         expand_graph: If True, include callers/callees in results.
         model: Model to use for query embedding. If None, uses
                the model from the index metadata.
-        lang: Language of the index to search (must match index language).
+        lang: Deprecated - ignored. Searches unified index with all languages.
 
     Returns:
-        List of result dictionaries with name, file, line, score, etc.
+        List of result dictionaries with name, file, line, score, language, etc.
     """
     import faiss
+    import warnings
 
-    # Handle empty query
-    if not query or not query.strip():
-        return []
+    # Validate inputs
+    if query is None:
+        raise TypeError("query cannot be None")
+    if not query.strip():
+        raise ValueError("query cannot be empty")
+    if k <= 0:
+        raise ValueError("k must be positive")
+
+    # Deprecation warning for lang parameter
+    if lang is not None:
+        warnings.warn(
+            "lang parameter is deprecated. Unified index searches all languages.",
+            DeprecationWarning,
+            stacklevel=2
+        )
 
     project = Path(project_path).resolve()
-    # Use language-specific path matching build_semantic_index
-    cache_dir = project / ".tldr" / "cache" / "semantic" / lang
+    # Unified cache directory - same as build_semantic_index
+    cache_dir = project / ".tldr" / "cache" / "semantic"
 
     index_file = cache_dir / "index.faiss"
     metadata_file = cache_dir / "metadata.json"
 
-    # Check index exists
+    # Check index exists - with migration hint for old lang-specific indexes
     if not index_file.exists():
+        # Check for old language-specific indexes
+        for old_lang in ALL_LANGUAGES:
+            old_index = cache_dir / old_lang / "index.faiss"
+            if old_index.exists():
+                raise FileNotFoundError(
+                    f"Found old index at {old_index}. "
+                    f"Run 'tldr semantic index .' to migrate to unified index."
+                )
         raise FileNotFoundError(
-            f"Semantic index not found at {index_file}. Run build_semantic_index first."
+            f"Semantic index not found. Run: tldr semantic index {project}"
         )
 
     if not metadata_file.exists():
         raise FileNotFoundError(
-            f"Metadata not found at {metadata_file}. Run build_semantic_index first."
+            f"Metadata not found at {metadata_file}. Run: tldr semantic index ."
         )
 
     # Load index and metadata
-    index = faiss.read_index(str(index_file))
+    try:
+        index = faiss.read_index(str(index_file))
+    except RuntimeError as e:
+        if "not recognized" in str(e):
+            raise ValueError(
+                f"Corrupted index at {index_file}. Rebuild: tldr semantic index ."
+            ) from e
+        raise
     metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
     units = metadata["units"]
+
+    # Validate dimension matches
+    expected_dim = metadata.get("dimension")
+    if expected_dim and index.d != expected_dim:
+        raise ValueError(
+            f"Index dimension ({index.d}) != metadata ({expected_dim}). "
+            "Rebuild: tldr semantic index ."
+        )
 
     # Use model from metadata if not specified (ensures matching embeddings)
     index_model = metadata.get("model")
@@ -1472,6 +1521,7 @@ def semantic_search(
             "qualified_name": unit["qualified_name"],
             "file": unit["file"],
             "line": unit["line"],
+            "language": unit.get("language", "unknown"),
             "unit_type": unit["unit_type"],
             "signature": unit["signature"],
             "docstring": unit.get("docstring", ""),

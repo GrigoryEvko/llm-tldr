@@ -25,10 +25,11 @@ import hashlib
 def _hash_path(path: str) -> str:
     """Hash a path for socket naming - must match daemon implementation.
 
-    Uses SHA-256 with 16-char prefix, matching tldr/daemon/core.py
-    and tldr/daemon/startup.py socket path computation.
+    Uses SHA-256 with 16-char prefix, matching tldr/daemon/startup.py
+    socket path computation: str(Path(project_path).resolve())
     """
-    return hashlib.sha256(Path(path).resolve().as_posix().encode()).hexdigest()[:16]
+    # Match daemon's exact pattern: resolve then str() (no as_posix())
+    return hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:16]
 
 
 mcp = FastMCP("tldr-code")

@@ -629,16 +629,16 @@ Semantic Search:
     index_p = semantic_sub.add_parser(
         "index",
         help="Build semantic index for project",
-        description="Build the semantic search index for a project.\nFirst run downloads embedding model (1.3GB default, 80MB for MiniLM).",
-        epilog="Examples:\n  tldr semantic index .\n  tldr semantic index src/ --lang typescript\n  tldr semantic index . --model all-MiniLM-L6-v2",
+        description="Build unified semantic index for a project (auto-detects all languages).\nFirst run downloads embedding model (1.3GB default, 80MB for MiniLM).",
+        epilog="Examples:\n  tldr semantic index .                    # Index all languages\n  tldr semantic index . --lang python      # Index only Python\n  tldr semantic index . --model all-MiniLM-L6-v2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     index_p.add_argument("path", nargs="?", default=".", help="Project root")
     index_p.add_argument(
         "--lang",
-        default="python",
+        default="all",
         choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
-        help="Language (use 'all' for multi-language)",
+        help="Language to index (default: all = auto-detect)",
     )
     index_p.add_argument(
         "--model",
@@ -650,7 +650,7 @@ Semantic Search:
     search_p = semantic_sub.add_parser(
         "search",
         help="Search semantically",
-        description="Search code using natural language queries.\nRequires prior indexing with 'tldr semantic index'.",
+        description="Search code using natural language queries.\nSearches unified index (all languages). Requires: tldr semantic index .",
         epilog="Examples:\n  tldr semantic search 'authentication logic' .\n  tldr semantic search 'database connection' src/ --k 10",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -659,12 +659,6 @@ Semantic Search:
     search_p.add_argument("--k", type=int, default=5, help="Number of results")
     search_p.add_argument(
         "--expand", action="store_true", help="Include call graph expansion"
-    )
-    search_p.add_argument(
-        "--lang",
-        default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
-        help="Language of the index to search (must match indexed language)",
     )
     search_p.add_argument(
         "--model",
@@ -975,9 +969,9 @@ Semantic Search:
             # Filter edges if a subdirectory was specified
             edges = graph.edges
             if target_path != project_root:
-                # Get relative path prefix for filtering
+                # Get relative path prefix for filtering (use as_posix for cross-platform)
                 try:
-                    rel_prefix = str(target_path.relative_to(project_root))
+                    rel_prefix = target_path.relative_to(project_root).as_posix()
                     # Filter to edges where from_file or to_file is in the subdirectory
                     edges = [
                         e for e in edges
@@ -1254,7 +1248,6 @@ Semantic Search:
                     k=args.k,
                     expand_graph=args.expand,
                     model=args.model,
-                    lang=args.lang,
                 )
                 print(json.dumps(results, indent=2))
 
