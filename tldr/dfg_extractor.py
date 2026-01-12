@@ -618,15 +618,22 @@ def extract_python_dfg_with_cfg(code: str, function_name: str) -> DFGInfo:
 
 # Tree-sitter imports (optional)
 TREE_SITTER_AVAILABLE = False
+TREE_SITTER_JS_AVAILABLE = False
 TREE_SITTER_GO_AVAILABLE = False
 TREE_SITTER_RUST_AVAILABLE = False
 
 try:
     from tree_sitter import Language, Parser
     import tree_sitter_typescript
-    import tree_sitter_javascript  # noqa: F401 - imported for availability detection
 
     TREE_SITTER_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    import tree_sitter_javascript  # noqa: F401 - optional for JavaScript files
+
+    TREE_SITTER_JS_AVAILABLE = True
 except ImportError:
     pass
 
@@ -1545,7 +1552,14 @@ def _find_ruby_function_by_name(root, name: str, source: bytes):
 
 
 def _find_function_by_name(root, name: str, source: bytes):
-    """Find a function node by name in tree-sitter tree."""
+    """Find a function node by name in tree-sitter tree.
+
+    Handles multiple patterns:
+    - function_declaration: name is a direct field
+    - arrow_function/function_expression: name is in parent variable_declarator
+    - Go/Rust: identifier is a direct child
+    - Swift/Kotlin: simple_identifier is a direct child
+    """
     FUNCTION_TYPES = {
         "function_declaration",
         "function_definition",
@@ -1553,19 +1567,47 @@ def _find_function_by_name(root, name: str, source: bytes):
         "method_definition",
         "method_declaration",  # Java
         "arrow_function",
+        "function_expression",  # const foo = function() {}
         "method",  # Ruby: def method_name ... end
     }
 
+    def get_node_text(node) -> str:
+        """Get source text for a node."""
+        return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
     def search(node):
         if node.type in FUNCTION_TYPES:
-            # Try to find the function name
+            # Method 1: Try to find the function name via "name" field
             name_node = node.child_by_field_name("name")
             if name_node:
-                func_name = source[name_node.start_byte : name_node.end_byte].decode(
-                    "utf-8", errors="replace"
-                )
+                func_name = get_node_text(name_node)
                 if func_name == name:
                     return node
+
+            # Method 2: For arrow_function/function_expression, check parent
+            # Pattern: variable_declarator { name: identifier, value: arrow_function }
+            if node.type in ("arrow_function", "function_expression"):
+                parent = node.parent
+                if parent and parent.type == "variable_declarator":
+                    var_name_node = parent.child_by_field_name("name")
+                    if var_name_node:
+                        var_name = get_node_text(var_name_node)
+                        if var_name == name:
+                            return node
+
+            # Method 3: Check for direct identifier child (Go, Rust, etc.)
+            for child in node.children:
+                if child.type == "identifier":
+                    func_name = get_node_text(child)
+                    if func_name == name:
+                        return node
+
+            # Method 4: Check for simple_identifier child (Swift, Kotlin)
+            for child in node.children:
+                if child.type == "simple_identifier":
+                    func_name = get_node_text(child)
+                    if func_name == name:
+                        return node
 
         for child in node.children:
             result = search(child)

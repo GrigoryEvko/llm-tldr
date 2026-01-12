@@ -5,9 +5,136 @@ These functions wrap the TLDR API with automatic caching via SalsaDB.
 Results are memoized and automatically invalidated when source files change.
 """
 
+import re
 from pathlib import Path
 
 from tldr.salsa import SalsaDB, salsa_query
+
+
+# File extensions to strip when normalizing module paths
+_SOURCE_EXTENSIONS = frozenset({
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".kts", ".scala", ".rb", ".php",
+    ".swift", ".cs", ".lua", ".ex", ".exs", ".c", ".h",
+    ".cpp", ".cc", ".cxx", ".hpp",
+})
+
+# Common path prefixes that represent aliases or source directories
+_PATH_PREFIXES = re.compile(r"^(@/|~/|\./|\.{2,}/|src/|lib/|app/|packages/)")
+
+
+def normalize_module_name(module: str) -> str:
+    """Normalize a module name or file path for comparison.
+
+    Strips common prefixes (@/, ./, src/, etc.) and file extensions,
+    converting to a canonical form for matching.
+
+    Args:
+        module: Module name or file path (e.g., "@/utils/async", "src/utils/async.ts")
+
+    Returns:
+        Normalized module name (e.g., "utils/async")
+
+    Examples:
+        >>> normalize_module_name("@/utils/async")
+        'utils/async'
+        >>> normalize_module_name("src/utils/async.ts")
+        'utils/async'
+        >>> normalize_module_name("./components/Button")
+        'components/Button'
+    """
+    if not module:
+        return ""
+
+    result = module
+
+    # Strip common path prefixes (may need multiple passes for nested prefixes)
+    prev = None
+    while prev != result:
+        prev = result
+        result = _PATH_PREFIXES.sub("", result)
+
+    # Strip file extension if present
+    path = Path(result)
+    if path.suffix.lower() in _SOURCE_EXTENSIONS:
+        result = str(path.with_suffix(""))
+
+    # Handle index files (utils/index -> utils)
+    if result.endswith("/index"):
+        result = result[:-6]
+
+    return result
+
+
+def module_matches(search_pattern: str, import_module: str, imported_names: list[str] | None = None) -> bool:
+    """Check if a search pattern matches an import module or imported names.
+
+    Supports both exact matches and normalized path matching, allowing
+    file paths like "src/utils/async" to match imports like "@/utils/async".
+
+    Args:
+        search_pattern: Module name or file path to search for
+        import_module: The module string from an import statement
+        imported_names: Optional list of imported names (from X import a, b)
+
+    Returns:
+        True if the search pattern matches the import
+
+    Examples:
+        >>> module_matches("@/utils/async", "@/utils/async", [])
+        True
+        >>> module_matches("src/utils/async", "@/utils/async", [])
+        True
+        >>> module_matches("utils/async", "@/utils/async", [])
+        True
+        >>> module_matches("async", "@/utils/async", ["async"])
+        True
+    """
+    if not search_pattern:
+        return False
+
+    # Quick substring check (original behavior for exact matches)
+    if search_pattern in import_module:
+        return True
+
+    if imported_names and search_pattern in imported_names:
+        return True
+
+    # Normalize both for path-agnostic matching
+    normalized_pattern = normalize_module_name(search_pattern)
+    normalized_import = normalize_module_name(import_module)
+
+    if not normalized_pattern:
+        return False
+
+    # Check if normalized forms match (exact or suffix)
+    if normalized_pattern == normalized_import:
+        return True
+
+    # Allow suffix matching: "utils/async" matches "some/path/utils/async"
+    if normalized_import.endswith("/" + normalized_pattern):
+        return True
+
+    # Allow prefix matching for submodule queries
+    if normalized_import.startswith(normalized_pattern + "/"):
+        return True
+
+    # Check if the pattern matches the final segment (basename match)
+    # e.g., "async" matches "utils/async"
+    if "/" not in normalized_pattern and normalized_import.endswith("/" + normalized_pattern):
+        return True
+
+    # Handle bare name matching the final segment
+    if "/" not in normalized_pattern and normalized_import == normalized_pattern:
+        return True
+
+    # For simple names without slashes, check if it matches the last component
+    if "/" not in normalized_pattern:
+        import_parts = normalized_import.split("/")
+        if import_parts and import_parts[-1] == normalized_pattern:
+            return True
+
+    return False
 
 
 @salsa_query
@@ -104,7 +231,11 @@ def cached_imports(db: SalsaDB, file_path: str, language: str) -> dict:
 
 @salsa_query
 def cached_importers(db: SalsaDB, project: str, module: str, language: str) -> dict:
-    """Cached reverse import lookup - memoized by SalsaDB."""
+    """Cached reverse import lookup - memoized by SalsaDB.
+
+    Supports both module aliases (e.g., "@/utils/async") and file paths
+    (e.g., "src/utils/async") through normalized matching.
+    """
     from tldr.api import get_imports, scan_project_files
 
     files = scan_project_files(project, language=language)
@@ -117,7 +248,7 @@ def cached_importers(db: SalsaDB, project: str, module: str, language: str) -> d
             for imp in imports:
                 mod = imp.get("module", "")
                 names = imp.get("names", [])
-                if module in mod or module in names:
+                if module_matches(module, mod, names):
                     importers.append({
                         "file": str(Path(file_path).relative_to(project_path)),
                         "import": imp,

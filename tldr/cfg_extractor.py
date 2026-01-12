@@ -14,18 +14,33 @@ import ast
 from dataclasses import dataclass, field
 
 # Tree-sitter imports (optional)
-TREE_SITTER_AVAILABLE = False
-TREE_SITTER_GO_AVAILABLE = False
-TREE_SITTER_RUST_AVAILABLE = False
-
+# Separate availability checks so TypeScript can work without JavaScript and vice versa
+TREE_SITTER_BASE_AVAILABLE = False
 try:
     from tree_sitter import Language, Parser  # noqa: F401
-    import tree_sitter_typescript  # noqa: F401
-    import tree_sitter_javascript  # noqa: F401
-
-    TREE_SITTER_AVAILABLE = True
+    TREE_SITTER_BASE_AVAILABLE = True
 except ImportError:
     pass
+
+TREE_SITTER_TS_AVAILABLE = False
+try:
+    import tree_sitter_typescript  # noqa: F401
+    TREE_SITTER_TS_AVAILABLE = TREE_SITTER_BASE_AVAILABLE
+except ImportError:
+    pass
+
+TREE_SITTER_JS_AVAILABLE = False
+try:
+    import tree_sitter_javascript  # noqa: F401
+    TREE_SITTER_JS_AVAILABLE = TREE_SITTER_BASE_AVAILABLE
+except ImportError:
+    pass
+
+# Legacy flag for backwards compatibility - True if TypeScript is available
+TREE_SITTER_AVAILABLE = TREE_SITTER_TS_AVAILABLE
+
+TREE_SITTER_GO_AVAILABLE = False
+TREE_SITTER_RUST_AVAILABLE = False
 
 try:
     import tree_sitter_go  # noqa: F401
@@ -1513,7 +1528,15 @@ def _get_ts_parser(language: str):
 
 
 def _find_function_node(tree, function_name: str, language: str):
-    """Find function node in tree-sitter tree by name."""
+    """Find function node in tree-sitter tree by name.
+
+    Handles multiple patterns:
+    - function declarations: function name() {}
+    - arrow functions in variables: const name = () => {}
+    - function expressions: const name = function() {}
+    - named function expressions: const alias = function name() {}
+    - class methods: class C { method() {} }
+    """
     func_types = {
         "function_declaration",
         "function_definition",
@@ -1525,9 +1548,9 @@ def _find_function_node(tree, function_name: str, language: str):
         "method",  # Ruby: def method_name ... end
     }
 
-    def find_in_node(node):
+    def find_in_node(node, parent=None):
         if node.type in func_types:
-            # Try to get function name
+            # Try to get function name from the node itself
             name_node = node.child_by_field_name("name")
             if name_node:
                 name = (
@@ -1537,6 +1560,27 @@ def _find_function_node(tree, function_name: str, language: str):
                 )
                 if name == function_name:
                     return node
+
+            # For TypeScript/JavaScript: arrow functions and function expressions
+            # assigned to variables: const name = () => {} or const name = function() {}
+            # The function name is in the parent variable_declarator's identifier child
+            if language in ("typescript", "javascript") and node.type in (
+                "arrow_function",
+                "function_expression",
+            ):
+                if parent and parent.type == "variable_declarator":
+                    # Get the identifier from the variable_declarator
+                    for sibling in parent.children:
+                        if sibling.type == "identifier":
+                            var_name = (
+                                sibling.text.decode("utf-8")
+                                if hasattr(sibling, "text")
+                                else str(sibling)
+                            )
+                            if var_name == function_name:
+                                return node
+                            break
+
             # For C/C++, the function name is in declarator.declarator (function_declarator -> identifier)
             # Also handles pointer_declarator wrapping function_declarator (e.g., char* get_day())
             # For C++ class methods, the name is a field_identifier instead of identifier
@@ -1584,12 +1628,12 @@ def _find_function_node(tree, function_name: str, language: str):
                         return node
 
         for child in node.children:
-            result = find_in_node(child)
+            result = find_in_node(child, parent=node)
             if result:
                 return result
         return None
 
-    return find_in_node(tree.root_node)
+    return find_in_node(tree.root_node, parent=None)
 
 
 def extract_typescript_cfg(source: str, function_name: str) -> CFGInfo:

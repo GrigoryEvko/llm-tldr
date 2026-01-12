@@ -215,6 +215,10 @@ def _mark_dirty_impl(
                         tmp_file.write(_json_dumps(data))
                         tmp_file.flush()
                         os.fsync(tmp_file.fileno())  # Ensure data hits disk
+                    # On Windows, must close destination file before replace
+                    # (Windows doesn't allow replacing a file with open handle)
+                    _unlock_file(f)
+                    f.close()
                     # Atomic rename (POSIX guarantees atomicity on same filesystem)
                     os.replace(tmp_path, dirty_path)
                 except Exception:
@@ -225,7 +229,9 @@ def _mark_dirty_impl(
                         pass
                     raise
         finally:
-            _unlock_file(f)
+            # Only unlock if file wasn't already closed (avoids double-unlock)
+            if not f.closed:
+                _unlock_file(f)
 
 
 def mark_dirty(project_path: Union[str, Path], edited_file: str) -> None:

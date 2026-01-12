@@ -35,13 +35,63 @@ class FunctionInfo:
     is_async: bool = False
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
+    language: str = "python"
 
     def signature(self) -> str:
-        """Return full signature string."""
+        """Return full signature string using language-appropriate syntax."""
         async_prefix = "async " if self.is_async else ""
         params_str = ", ".join(self.params)
-        ret = f" -> {self.return_type}" if self.return_type else ""
-        return f"{async_prefix}def {self.name}({params_str}){ret}"
+
+        # Language-specific signature formatting
+        if self.language in ("typescript", "javascript", "tsx", "jsx"):
+            # TypeScript/JavaScript: function name(params): ReturnType
+            ret = f": {self.return_type}" if self.return_type else ""
+            return f"{async_prefix}function {self.name}({params_str}){ret}"
+        elif self.language == "go":
+            # Go: func name(params) ReturnType
+            ret = f" {self.return_type}" if self.return_type else ""
+            return f"func {self.name}({params_str}){ret}"
+        elif self.language == "rust":
+            # Rust: fn name(params) -> ReturnType
+            ret = f" -> {self.return_type}" if self.return_type else ""
+            return f"{async_prefix}fn {self.name}({params_str}){ret}"
+        elif self.language == "java":
+            # Java: ReturnType name(params)
+            ret = self.return_type if self.return_type else "void"
+            return f"{ret} {self.name}({params_str})"
+        elif self.language in ("c", "cpp"):
+            # C/C++: ReturnType name(params)
+            ret = self.return_type if self.return_type else "void"
+            return f"{ret} {self.name}({params_str})"
+        elif self.language == "ruby":
+            # Ruby: def name(params)
+            return f"def {self.name}({params_str})"
+        elif self.language == "kotlin":
+            # Kotlin: fun name(params): ReturnType
+            ret = f": {self.return_type}" if self.return_type else ""
+            return f"fun {self.name}({params_str}){ret}"
+        elif self.language == "swift":
+            # Swift: func name(params) -> ReturnType
+            ret = f" -> {self.return_type}" if self.return_type else ""
+            return f"func {self.name}({params_str}){ret}"
+        elif self.language == "csharp":
+            # C#: ReturnType name(params)
+            ret = self.return_type if self.return_type else "void"
+            return f"{ret} {self.name}({params_str})"
+        elif self.language == "scala":
+            # Scala: def name(params): ReturnType
+            ret = f": {self.return_type}" if self.return_type else ""
+            return f"def {self.name}({params_str}){ret}"
+        elif self.language == "lua":
+            # Lua: function name(params)
+            return f"function {self.name}({params_str})"
+        elif self.language == "elixir":
+            # Elixir: def name(params)
+            return f"def {self.name}({params_str})"
+        else:
+            # Python (default): def name(params) -> ReturnType
+            ret = f" -> {self.return_type}" if self.return_type else ""
+            return f"{async_prefix}def {self.name}({params_str}){ret}"
 
 
 @dataclass
@@ -54,11 +104,30 @@ class ClassInfo:
     methods: list[FunctionInfo] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
+    language: str = "python"
 
     def signature(self) -> str:
-        """Return class definition signature."""
-        bases_str = ", ".join(self.bases) if self.bases else ""
-        return f"class {self.name}({bases_str})" if bases_str else f"class {self.name}"
+        """Return class definition signature using language-appropriate syntax."""
+        if self.language in ("typescript", "javascript", "tsx", "jsx"):
+            # TypeScript/JavaScript: class Name extends Base implements Interface
+            parts = [f"class {self.name}"]
+            extends = [b for b in self.bases if not b.startswith("implements ")]
+            implements = [b.replace("implements ", "") for b in self.bases if b.startswith("implements ")]
+            if extends:
+                parts.append(f"extends {', '.join(extends)}")
+            if implements:
+                parts.append(f"implements {', '.join(implements)}")
+            return " ".join(parts)
+        elif self.language == "go":
+            # Go: type Name struct (Go doesn't have class inheritance)
+            return f"type {self.name} struct"
+        elif self.language == "rust":
+            # Rust: struct Name or impl Trait for Name
+            return f"struct {self.name}"
+        else:
+            # Python (default): class Name(Base1, Base2)
+            bases_str = ", ".join(self.bases) if self.bases else ""
+            return f"class {self.name}({bases_str})" if bases_str else f"class {self.name}"
 
 
 @dataclass

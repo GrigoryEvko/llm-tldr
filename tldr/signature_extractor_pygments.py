@@ -13,7 +13,7 @@ class SignatureExtractor:
         Extracts function signatures from the provided code.
         """
         # Parse command line options
-        show_linenos = False
+        show_linenos = True
         full_document = False
 
         # Check if file exists

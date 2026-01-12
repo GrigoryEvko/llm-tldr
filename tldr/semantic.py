@@ -21,7 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
 
@@ -183,10 +183,180 @@ def get_model(model_name: Optional[str] = None):
                 )
 
         from sentence_transformers import SentenceTransformer
+        import torch
 
-        _model = SentenceTransformer(hf_name)
+        # Auto-select best device
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+        _model = SentenceTransformer(hf_name, device=device)
+
+        # Cast to bf16 for faster inference (supported on modern CPUs and GPUs)
+        _model = _model.to(torch.bfloat16)
+
+        # Apply torch.compile() for optimized execution (PyTorch 2.0+)
+        try:
+            _model = torch.compile(_model)
+        except Exception:
+            pass  # Silently fall back if compile unavailable
+
         _model_name = hf_name
         return _model
+
+
+def _parse_identifier_to_words(name: str) -> str:
+    """Parse camelCase/snake_case/PascalCase identifier to space-separated words.
+
+    Converts code identifiers into natural language for better semantic search.
+
+    Examples:
+        getUserData -> get user data
+        get_user_data -> get user data
+        XMLParser -> xml parser
+        _private_method -> private method
+        HTMLElement -> html element
+
+    Args:
+        name: The identifier to parse.
+
+    Returns:
+        Space-separated lowercase words.
+    """
+    import re
+
+    # Remove leading/trailing underscores
+    name = name.strip("_")
+    if not name:
+        return ""
+
+    # Handle snake_case: replace underscores with spaces
+    name = name.replace("_", " ")
+
+    # Use regex for camelCase/PascalCase splitting
+    # This handles acronyms correctly: XMLParser -> XML Parser -> xml parser
+    # Pattern: split before uppercase that follows lowercase, or before uppercase followed by lowercase
+    words = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)  # camelCase
+    words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", words)  # ACRONYMWord
+
+    # Clean up multiple spaces and lowercase
+    words = " ".join(words.split()).lower()
+
+    return words
+
+
+def _extract_inline_comments(code: str) -> List[str]:
+    """Extract inline comments from code preview.
+
+    Parses # comments and extracts their text for semantic embedding.
+    Comments often contain valuable natural language describing intent.
+
+    Args:
+        code: The code string to parse.
+
+    Returns:
+        List of comment strings (without # prefix).
+    """
+    import re
+
+    comments = []
+    for line in code.split("\n"):
+        # Match # comments (but not in strings - simple heuristic)
+        # Skip shebang lines
+        match = re.search(r'(?<!["\'#])\s*#\s*(.+?)$', line)
+        if match:
+            comment = match.group(1).strip()
+            # Filter out noise comments
+            if len(comment) > 3 and not comment.startswith("!"):
+                comments.append(comment)
+
+    return comments
+
+
+def _generate_semantic_description(unit: "EmbeddingUnit") -> str:
+    """Generate natural language description when docstring is missing.
+
+    Creates a semantic description from code structure for functions
+    that lack docstrings, improving embedding quality.
+
+    Args:
+        unit: The EmbeddingUnit to describe.
+
+    Returns:
+        Generated natural language description.
+    """
+    parts = []
+
+    # Parse function name into natural language
+    name_words = _parse_identifier_to_words(unit.name)
+    if name_words:
+        # Create a sentence from the name
+        if unit.unit_type == "method":
+            parts.append(f"Method that {name_words}")
+        elif unit.unit_type == "class":
+            parts.append(f"Class for {name_words}")
+        else:
+            parts.append(f"Function that {name_words}")
+
+    # Extract parameter semantics from signature
+    if unit.signature:
+        import re
+
+        # Extract parameter names from signature
+        param_match = re.search(r"\((.*?)\)", unit.signature)
+        if param_match:
+            params_str = param_match.group(1)
+            if params_str and params_str not in ("self", "cls"):
+                # Parse parameter names
+                param_names = []
+                for param in params_str.split(","):
+                    param = param.strip()
+                    if not param or param in ("self", "cls"):
+                        continue
+                    # Extract name before : or =
+                    name = param.split(":")[0].split("=")[0].strip()
+                    if name and name not in ("self", "cls"):
+                        param_names.append(_parse_identifier_to_words(name))
+
+                if param_names:
+                    parts.append(f"Takes {', '.join(param_names[:5])} as input")
+
+    # Describe complexity in natural language
+    if unit.cfg_summary:
+        import re
+
+        complexity_match = re.search(r"complexity:(\d+)", unit.cfg_summary)
+        if complexity_match:
+            complexity = int(complexity_match.group(1))
+            if complexity == 1:
+                parts.append("Simple linear logic")
+            elif complexity <= 3:
+                parts.append("Contains conditional logic")
+            elif complexity <= 7:
+                parts.append("Moderate complexity with multiple branches")
+            else:
+                parts.append("Complex control flow with many decision points")
+
+    # Describe data handling
+    if unit.dfg_summary:
+        import re
+
+        vars_match = re.search(r"vars:(\d+)", unit.dfg_summary)
+        if vars_match:
+            var_count = int(vars_match.group(1))
+            if var_count > 10:
+                parts.append("Processes multiple data variables")
+
+    # Extract inline comments for additional context
+    if unit.code_preview:
+        comments = _extract_inline_comments(unit.code_preview)
+        if comments:
+            parts.append("Notes: " + "; ".join(comments[:3]))
+
+    return ". ".join(parts) if parts else ""
 
 
 def build_embedding_text(unit: EmbeddingUnit) -> str:
@@ -194,6 +364,7 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
 
     Creates a single text string containing information from all
     analysis layers, suitable for embedding with a language model.
+    Prioritizes natural language over code syntax for better semantic search.
 
     Args:
         unit: The EmbeddingUnit containing code analysis.
@@ -203,39 +374,54 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     """
     parts = []
 
-    # L1: Signature + docstring
-    if unit.signature:
-        parts.append(f"Signature: {unit.signature}")
+    # Primary: Natural language description (most important for semantic search)
+    # Use docstring if available, otherwise generate description
     if unit.docstring:
         parts.append(f"Description: {unit.docstring}")
+    else:
+        # Generate semantic description from code structure
+        generated = _generate_semantic_description(unit)
+        if generated:
+            parts.append(f"Description: {generated}")
 
-    # L2: Call graph (forward - callees)
+    # Parse function name as natural language (helps match semantic queries)
+    name_words = _parse_identifier_to_words(unit.name)
+    if name_words and name_words != unit.name.lower():
+        parts.append(f"Purpose: {name_words}")
+
+    # L1: Signature (contains type hints which have semantic value)
+    if unit.signature:
+        parts.append(f"Signature: {unit.signature}")
+
+    # L2: Call graph with natural language framing
     if unit.calls:
-        calls_str = ", ".join(unit.calls[:5])  # Top 5
-        parts.append(f"Calls: {calls_str}")
+        calls_words = [_parse_identifier_to_words(c) for c in unit.calls[:5]]
+        calls_str = ", ".join(filter(None, calls_words))
+        if calls_str:
+            parts.append(f"Uses: {calls_str}")
 
-    # L2: Call graph (backward - callers)
     if unit.called_by:
-        callers_str = ", ".join(unit.called_by[:5])  # Top 5
-        parts.append(f"Called by: {callers_str}")
+        callers_words = [_parse_identifier_to_words(c) for c in unit.called_by[:5]]
+        callers_str = ", ".join(filter(None, callers_words))
+        if callers_str:
+            parts.append(f"Used by: {callers_str}")
 
-    # L3: Control flow summary
-    if unit.cfg_summary:
-        parts.append(f"Control flow: {unit.cfg_summary}")
-
-    # L4: Data flow summary
-    if unit.dfg_summary:
-        parts.append(f"Data flow: {unit.dfg_summary}")
-
-    # L5: Dependencies
+    # L5: Dependencies (module names can have semantic meaning)
     if unit.dependencies:
         parts.append(f"Dependencies: {unit.dependencies}")
 
-    # Code preview (first 10 lines of function body)
+    # Code preview (last - code syntax is less useful for semantic matching)
     if unit.code_preview:
-        parts.append(f"Code:\n{unit.code_preview}")
+        # Include comments from code which are natural language
+        comments = _extract_inline_comments(unit.code_preview)
+        if comments:
+            parts.append(f"Code comments: {'; '.join(comments[:5])}")
 
-    # Add name and type for context
+        # Include code but truncated (syntax is less useful than semantics)
+        code_lines = unit.code_preview.split("\n")[:8]  # First 8 lines
+        parts.append(f"Code:\n{chr(10).join(code_lines)}")
+
+    # Add name and type for context (at start for clarity)
     type_str = unit.unit_type if unit.unit_type else "function"
     parts.insert(0, f"{type_str.capitalize()}: {unit.name}")
 
@@ -267,138 +453,6 @@ def compute_embedding(text: str, model_name: Optional[str] = None):
 MIN_FILES_FOR_PARALLEL = 15
 
 
-def _extract_units_from_file(
-    args: Tuple[Dict[str, Any], str, str, Dict[str, List[str]], Dict[str, List[str]]],
-) -> List[EmbeddingUnit]:
-    """Worker function for parallel unit extraction from a single file.
-
-    Processes one file and returns all EmbeddingUnit objects found.
-    Designed to be called via ProcessPoolExecutor.map().
-
-    Args:
-        args: Tuple of (file_info, project_path, lang, calls_map, called_by_map)
-            - file_info: Dict with 'path', 'functions', 'classes' keys
-            - project_path: String path to project root
-            - lang: Programming language
-            - calls_map: Dict mapping function names to their callees
-            - called_by_map: Dict mapping function names to their callers
-
-    Returns:
-        List of EmbeddingUnit objects extracted from the file.
-    """
-    file_info, project_path_str, lang, calls_map, called_by_map = args
-    project = Path(project_path_str)
-    units: List[EmbeddingUnit] = []
-
-    file_path = file_info.get("path", "")
-    full_path = project / file_path
-
-    # Parse AST once per file - extracts line numbers, code preview, signature, and docstring
-    ast_info, file_content, _ = _parse_file_ast(full_path, lang)
-
-    # Get imports for dependencies (L5)
-    dependencies = _get_file_dependencies(full_path, lang)
-
-    # Process functions
-    for func_name in file_info.get("functions", []):
-        func_data = ast_info.get("functions", {}).get(func_name, {})
-        signature = func_data.get("signature")
-        docstring = func_data.get("docstring")
-        line = func_data.get("line", 1)
-
-        # Get CFG summary (L3) - pass pre-read content to avoid file I/O
-        cfg_summary = _get_cfg_summary(full_path, func_name, lang, file_content)
-
-        # Get DFG summary (L4) - pass pre-read content to avoid file I/O
-        dfg_summary = _get_dfg_summary(full_path, func_name, lang, file_content)
-
-        code_preview = func_data.get("code_preview", "")
-
-        unit = EmbeddingUnit(
-            name=func_name,
-            qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
-            file=file_path,
-            line=line,
-            language=lang,
-            unit_type="function",
-            signature=signature or f"def {func_name}(...)",
-            docstring=docstring or "",
-            calls=calls_map.get(func_name, [])[:5],
-            called_by=called_by_map.get(func_name, [])[:5],
-            cfg_summary=cfg_summary,
-            dfg_summary=dfg_summary,
-            dependencies=dependencies,
-            code_preview=code_preview,
-        )
-        units.append(unit)
-
-    # Process classes
-    for class_info in file_info.get("classes", []):
-        if isinstance(class_info, dict):
-            class_name = class_info.get("name", "")
-            methods = class_info.get("methods", [])
-        else:
-            class_name = class_info
-            methods = []
-
-        class_data = ast_info.get("classes", {}).get(class_name, {})
-        class_line = class_data.get("line", 1)
-        class_docstring = class_data.get("docstring") or ""
-
-        # Add class itself
-        unit = EmbeddingUnit(
-            name=class_name,
-            qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
-            file=file_path,
-            line=class_line,
-            language=lang,
-            unit_type="class",
-            signature=f"class {class_name}",
-            docstring=class_docstring,
-            calls=[],
-            called_by=[],
-            cfg_summary="",
-            dfg_summary="",
-            dependencies=dependencies,
-            code_preview="",
-        )
-        units.append(unit)
-
-        # Add methods
-        for method in methods:
-            method_qualified = f"{class_name}.{method}"
-            method_data = ast_info.get("methods", {}).get(f"{class_name}.{method}", {})
-            method_line = method_data.get("line", 1)
-            method_preview = method_data.get("code_preview", "")
-            method_signature = (
-                method_data.get("signature") or f"def {method}(self, ...)"
-            )
-            method_docstring = method_data.get("docstring") or ""
-
-            cfg_summary = _get_cfg_summary(full_path, method, lang, file_content)
-            dfg_summary = _get_dfg_summary(full_path, method, lang, file_content)
-
-            unit = EmbeddingUnit(
-                name=method,
-                qualified_name=f"{file_path.replace('/', '.')}.{method_qualified}",
-                file=file_path,
-                line=method_line,
-                language=lang,
-                unit_type="method",
-                signature=method_signature,
-                docstring=method_docstring,
-                calls=calls_map.get(method, [])[:5],
-                called_by=called_by_map.get(method, [])[:5],
-                cfg_summary=cfg_summary,
-                dfg_summary=dfg_summary,
-                dependencies=dependencies,
-                code_preview=method_preview,
-            )
-            units.append(unit)
-
-    return units
-
-
 def extract_units_from_project(
     project_path: str, lang: str = "python", respect_ignore: bool = True
 ) -> List[EmbeddingUnit]:
@@ -425,7 +479,8 @@ def extract_units_from_project(
     units = []
 
     # Get code structure (L1)
-    structure = get_code_structure(str(project), language=lang)
+    # Use max_results=0 for unlimited files - the default of 100 would truncate large projects
+    structure = get_code_structure(str(project), language=lang, max_results=0)
 
     # Filter ignored files
     if respect_ignore:
@@ -971,75 +1026,55 @@ def _process_file_for_extraction(
 
     try:
         # Read file content ONCE
-        content = full_path.read_text()
+        content = full_path.read_text(encoding="utf-8", errors="replace")
         lines = content.split('\n')
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
         return units
 
-    # Parse AST once for all function info
+    # Use tree-sitter based extraction for ALL languages (not just Python)
+    # This provides consistent line numbers, signatures, and docstrings
     ast_info = {"functions": {}, "classes": {}, "methods": {}}
     all_signatures = {}
     all_docstrings = {}
 
-    if lang == "python":
-        try:
-            import ast
-            tree = ast.parse(content)
+    try:
+        from tldr.ast_extractor import extract_file
+        module_info = extract_file(str(full_path))
 
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # Check if this is a method (inside a class)
-                    parent_class = None
-                    for potential_parent in ast.walk(tree):
-                        if isinstance(potential_parent, ast.ClassDef):
-                            for item in potential_parent.body:
-                                if item is node:
-                                    parent_class = potential_parent.name
-                                    break
+        # Build lookup dicts from extracted info
+        for func in module_info.functions:
+            # Extract code preview (first 10 lines from function start)
+            start_line = func.line_number
+            end_line = min(start_line + 10, len(lines))
+            code_preview = '\n'.join(lines[start_line - 1:end_line])
 
-                    # Extract code preview (first 10 lines of body)
-                    start_line = node.lineno
-                    end_line = getattr(node, 'end_lineno', start_line + 10)
-                    body_lines = lines[start_line - 1:min(end_line, start_line + 10) - 1]
-                    code_preview = '\n'.join(body_lines[:10])
+            ast_info["functions"][func.name] = {
+                "line": func.line_number,
+                "code_preview": code_preview,
+            }
+            all_signatures[func.name] = func.signature()
+            all_docstrings[func.name] = func.docstring or ""
 
-                    # Build signature
-                    args = []
-                    for arg in node.args.args:
-                        arg_str = arg.arg
-                        if arg.annotation:
-                            arg_str += f": {ast.unparse(arg.annotation)}"
-                        args.append(arg_str)
-                    returns = ""
-                    if node.returns:
-                        returns = f" -> {ast.unparse(node.returns)}"
-                    signature = f"def {node.name}({', '.join(args)}){returns}"
+        for cls in module_info.classes:
+            ast_info["classes"][cls.name] = {"line": cls.line_number}
 
-                    # Get docstring
-                    docstring = ast.get_docstring(node) or ""
+            # Process methods within each class
+            for method in cls.methods:
+                method_key = f"{cls.name}.{method.name}"
+                start_line = method.line_number
+                end_line = min(start_line + 10, len(lines))
+                code_preview = '\n'.join(lines[start_line - 1:end_line])
 
-                    if parent_class:
-                        key = f"{parent_class}.{node.name}"
-                        ast_info["methods"][key] = {
-                            "line": node.lineno,
-                            "code_preview": code_preview
-                        }
-                        all_signatures[key] = signature
-                        all_docstrings[key] = docstring
-                    else:
-                        ast_info["functions"][node.name] = {
-                            "line": node.lineno,
-                            "code_preview": code_preview
-                        }
-                        all_signatures[node.name] = signature
-                        all_docstrings[node.name] = docstring
+                ast_info["methods"][method_key] = {
+                    "line": method.line_number,
+                    "code_preview": code_preview,
+                }
+                all_signatures[method_key] = method.signature()
+                all_docstrings[method_key] = method.docstring or ""
 
-                elif isinstance(node, ast.ClassDef):
-                    ast_info["classes"][node.name] = {"line": node.lineno}
-
-        except Exception as e:
-            logger.debug(f"AST parse failed for {file_path}: {e}")
+    except Exception as e:
+        logger.debug(f"AST extraction failed for {file_path}: {e}")
 
     # Get dependencies (imports) - single call
     dependencies = ""
@@ -1266,7 +1301,9 @@ def build_semantic_index(
     else:
         hf_name = model_key
 
-    cache_dir = project / ".tldr" / "cache" / "semantic"
+    # Use language-specific paths to avoid one language's index overwriting another
+    # e.g., .tldr/cache/semantic/python/, .tldr/cache/semantic/typescript/
+    cache_dir = project / ".tldr" / "cache" / "semantic" / lang
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract all units (respecting .tldrignore)
@@ -1364,6 +1401,7 @@ def semantic_search(
     k: int = 5,
     expand_graph: bool = False,
     model: Optional[str] = None,
+    lang: str = "python",
 ) -> List[dict]:
     """Search for code units semantically.
 
@@ -1374,6 +1412,7 @@ def semantic_search(
         expand_graph: If True, include callers/callees in results.
         model: Model to use for query embedding. If None, uses
                the model from the index metadata.
+        lang: Language of the index to search (must match index language).
 
     Returns:
         List of result dictionaries with name, file, line, score, etc.
@@ -1385,7 +1424,8 @@ def semantic_search(
         return []
 
     project = Path(project_path).resolve()
-    cache_dir = project / ".tldr" / "cache" / "semantic"
+    # Use language-specific path matching build_semantic_index
+    cache_dir = project / ".tldr" / "cache" / "semantic" / lang
 
     index_file = cache_dir / "index.faiss"
     metadata_file = cache_dir / "metadata.json"
@@ -1434,6 +1474,8 @@ def semantic_search(
             "line": unit["line"],
             "unit_type": unit["unit_type"],
             "signature": unit["signature"],
+            "docstring": unit.get("docstring", ""),
+            "code_preview": unit.get("code_preview", ""),
             "score": float(score),
         }
 

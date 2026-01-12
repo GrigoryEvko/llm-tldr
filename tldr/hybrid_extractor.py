@@ -58,17 +58,33 @@ class ParseError(Exception):
 
 
 # Check tree-sitter availability
-TREE_SITTER_AVAILABLE = False
-TREE_SITTER_GO_AVAILABLE = False
-TREE_SITTER_RUST_AVAILABLE = False
+# Separate availability checks so TypeScript can work without JavaScript and vice versa
+TREE_SITTER_BASE_AVAILABLE = False
 try:
     from tree_sitter import Language, Parser
-    import tree_sitter_typescript
-    import tree_sitter_javascript
-
-    TREE_SITTER_AVAILABLE = True
+    TREE_SITTER_BASE_AVAILABLE = True
 except ImportError:
     pass
+
+TREE_SITTER_TS_AVAILABLE = False
+try:
+    import tree_sitter_typescript
+    TREE_SITTER_TS_AVAILABLE = TREE_SITTER_BASE_AVAILABLE
+except ImportError:
+    pass
+
+TREE_SITTER_JS_AVAILABLE = False
+try:
+    import tree_sitter_javascript
+    TREE_SITTER_JS_AVAILABLE = TREE_SITTER_BASE_AVAILABLE
+except ImportError:
+    pass
+
+# Legacy flag for backwards compatibility - True if TypeScript is available
+TREE_SITTER_AVAILABLE = TREE_SITTER_TS_AVAILABLE
+
+TREE_SITTER_GO_AVAILABLE = False
+TREE_SITTER_RUST_AVAILABLE = False
 
 try:
     import tree_sitter_go
@@ -249,11 +265,17 @@ class HybridExtractor:
 
         # JS/TS - use tree-sitter if available
         if suffix in self.TREE_SITTER_EXTENSIONS:
-            if TREE_SITTER_AVAILABLE:
+            # TypeScript extensions need tree_sitter_typescript, JS needs tree_sitter_javascript
+            ts_extensions = {".ts", ".tsx"}
+            is_typescript = suffix in ts_extensions
+            can_use_tree_sitter = (
+                TREE_SITTER_TS_AVAILABLE if is_typescript else TREE_SITTER_JS_AVAILABLE
+            )
+            if can_use_tree_sitter:
                 result = self._try_tree_sitter(
                     lambda fp: self._extract_tree_sitter(fp, suffix),
                     file_path,
-                    "typescript",
+                    "typescript" if is_typescript else "javascript",
                 )
                 if result:
                     return result
@@ -263,7 +285,7 @@ class HybridExtractor:
 
         # Go - use tree-sitter-go if available
         if suffix in self.GO_EXTENSIONS:
-            if TREE_SITTER_GO_AVAILABLE and TREE_SITTER_AVAILABLE:
+            if TREE_SITTER_GO_AVAILABLE and TREE_SITTER_BASE_AVAILABLE:
                 result = self._try_tree_sitter(self._extract_go, file_path, "go")
                 if result:
                     return result
@@ -273,7 +295,7 @@ class HybridExtractor:
 
         # Rust - use tree-sitter-rust if available
         if suffix in self.RUST_EXTENSIONS:
-            if TREE_SITTER_RUST_AVAILABLE and TREE_SITTER_AVAILABLE:
+            if TREE_SITTER_RUST_AVAILABLE and TREE_SITTER_BASE_AVAILABLE:
                 result = self._try_tree_sitter(self._extract_rust, file_path, "rust")
                 if result:
                     return result
@@ -283,7 +305,7 @@ class HybridExtractor:
 
         # Java - use tree-sitter-java if available
         if suffix in self.JAVA_EXTENSIONS:
-            if TREE_SITTER_JAVA_AVAILABLE and TREE_SITTER_AVAILABLE:
+            if TREE_SITTER_JAVA_AVAILABLE and TREE_SITTER_BASE_AVAILABLE:
                 result = self._try_tree_sitter(self._extract_java, file_path, "java")
                 if result:
                     return result
@@ -390,6 +412,40 @@ class HybridExtractor:
         # Fallback to Pygments
         return self._extract_pygments(file_path)
 
+    # Keywords to strip from function names (JS/TS modifiers and keywords)
+    _FUNCTION_NAME_KEYWORDS = frozenset({
+        "export", "default", "async", "function", "const", "let", "var",
+        "static", "public", "private", "protected", "readonly", "abstract",
+        "override", "declare", "get", "set",
+    })
+
+    def _extract_function_name_from_sig(self, sig: str) -> str:
+        """Extract the actual function identifier from a signature string.
+
+        Handles signatures like:
+        - 'export async createToolResult ()' -> 'createToolResult'
+        - 'async function readInputPrompt ()' -> 'readInputPrompt'
+        - 'export const arrowFunc (async ())' -> 'arrowFunc'
+        - 'static async method ()' -> 'method'
+
+        Strips JS/TS keywords (export, async, function, const, etc.) and
+        returns just the identifier.
+        """
+        # Get the part before the first '('
+        name_part = sig.split("(")[0].strip() if "(" in sig else sig.strip()
+        if not name_part:
+            return ""
+
+        # Split by whitespace and filter out keywords
+        tokens = name_part.split()
+        for token in reversed(tokens):
+            # The last non-keyword token is the identifier
+            if token not in self._FUNCTION_NAME_KEYWORDS:
+                return token
+
+        # If all tokens are keywords, return the last one (shouldn't happen)
+        return tokens[-1] if tokens else ""
+
     def _extract_pygments(self, file_path: Path) -> ModuleInfo:
         """Extract using Pygments (signatures only)."""
         try:
@@ -402,19 +458,25 @@ class HybridExtractor:
         # Convert to ModuleInfo format
         # Pygments doesn't give us enough info to distinguish classes from functions
         # so we put everything in functions
-        functions = [
-            FunctionInfo(
-                name=sig.split("(")[0].strip() if "(" in sig else sig,
-                params=self._extract_params_from_sig(sig),
-                return_type=None,
-                docstring=None,
-            )
-            for sig in signatures
-        ]
+        detected_lang = self._detect_language(file_path)
+        functions = []
+        for sig, line_number in signatures:
+            name = self._extract_function_name_from_sig(sig)
+            if name:  # Skip empty names
+                functions.append(
+                    FunctionInfo(
+                        name=name,
+                        params=self._extract_params_from_sig(sig),
+                        return_type=None,
+                        docstring=None,
+                        language=detected_lang,
+                        line_number=line_number,
+                    )
+                )
 
         return ModuleInfo(
             file_path=str(file_path),
-            language=self._detect_language(file_path),
+            language=detected_lang,
             docstring=None,
             functions=functions,
         )
@@ -549,20 +611,9 @@ class HybridExtractor:
 
             # Imports
             if node_type == "import_statement":
-                text = self._safe_decode(
-                    source[child.start_byte : child.end_byte]
-                ).rstrip(";")
-                # Strip "import " prefix since statement() will add it back
-                if text.startswith("import "):
-                    text = text[7:]
-                module_info.imports.append(
-                    ImportInfo(
-                        module=text,
-                        names=[],
-                        is_from=False,
-                        line_number=child.start_point[0] + 1,
-                    )
-                )
+                import_info = self._extract_ts_import(child, source)
+                if import_info:
+                    module_info.imports.append(import_info)
                 prev_comment = None
 
             # Functions
@@ -610,6 +661,102 @@ class HybridExtractor:
                 prev_comment = None
             else:
                 prev_comment = None
+
+    def _extract_ts_import(self, node, source: bytes) -> ImportInfo | None:
+        """
+        Extract TypeScript/JavaScript import statement properly.
+
+        Handles:
+        - import { a, b } from 'module'   -> module='module', names=['a', 'b'], is_from=True
+        - import name from 'module'       -> module='module', names=['name'], is_from=True
+        - import * as name from 'module'  -> module='module', names=['* as name'], is_from=True
+        - import 'module'                 -> module='module', names=[], is_from=False
+        - import type { T } from 'module' -> module='module', names=['T'], is_from=True
+        """
+        module_path = None
+        names: list[str] = []
+        is_from = False
+
+        for child in node.children:
+            if child.type == "string":
+                # Extract module path from string node
+                for string_child in child.children:
+                    if string_child.type == "string_fragment":
+                        module_path = self._safe_decode(
+                            source[string_child.start_byte : string_child.end_byte]
+                        )
+                        break
+                # Fallback: strip quotes from the string if no string_fragment
+                if module_path is None:
+                    text = self._safe_decode(
+                        source[child.start_byte : child.end_byte]
+                    )
+                    module_path = text.strip("\"'")
+
+            elif child.type == "import_clause":
+                is_from = True
+                names = self._extract_ts_import_names(child, source)
+
+        if module_path is None:
+            return None
+
+        return ImportInfo(
+            module=module_path,
+            names=names,
+            is_from=is_from,
+            line_number=node.start_point[0] + 1,
+        )
+
+    def _extract_ts_import_names(self, node, source: bytes) -> list[str]:
+        """
+        Extract imported names from an import_clause node.
+
+        Handles:
+        - named_imports: { a, b, c as d }
+        - identifier: default import
+        - namespace_import: * as name
+        """
+        names: list[str] = []
+
+        for child in node.children:
+            if child.type == "identifier":
+                # Default import: import name from 'module'
+                names.append(
+                    self._safe_decode(source[child.start_byte : child.end_byte])
+                )
+
+            elif child.type == "named_imports":
+                # Named imports: import { a, b, c as d } from 'module'
+                for spec in child.children:
+                    if spec.type == "import_specifier":
+                        # Get the local name (or original name if no alias)
+                        spec_name = None
+                        for spec_child in spec.children:
+                            if spec_child.type == "identifier":
+                                # First identifier is the imported name
+                                if spec_name is None:
+                                    spec_name = self._safe_decode(
+                                        source[spec_child.start_byte : spec_child.end_byte]
+                                    )
+                                else:
+                                    # Second identifier is the alias (as name)
+                                    spec_name = self._safe_decode(
+                                        source[spec_child.start_byte : spec_child.end_byte]
+                                    )
+                        if spec_name:
+                            names.append(spec_name)
+
+            elif child.type == "namespace_import":
+                # Namespace import: import * as name from 'module'
+                for ns_child in child.children:
+                    if ns_child.type == "identifier":
+                        ns_name = self._safe_decode(
+                            source[ns_child.start_byte : ns_child.end_byte]
+                        )
+                        names.append(f"* as {ns_name}")
+                        break
+
+        return names
 
     def _extract_ts_calls(
         self,
@@ -694,6 +841,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            language="typescript",
         )
 
     def _extract_ts_class(
@@ -737,10 +885,9 @@ class HybridExtractor:
                             prev_comment = self._parse_jsdoc(comment_text)
                         continue
 
-                    if body_child.type in (
-                        "method_definition",
-                        "public_field_definition",
-                    ):
+                    # Only extract actual methods, not property fields
+                    # public_field_definition is a property, not a method
+                    if body_child.type == "method_definition":
                         method = self._extract_ts_function(body_child, source)
                         if method:
                             method.is_method = True
@@ -770,6 +917,7 @@ class HybridExtractor:
             docstring=class_docstring,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            language="typescript",
         )
 
     # === Go Extraction ===
@@ -980,6 +1128,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="go",
         )
 
     def _extract_go_method(self, node, source: bytes) -> FunctionInfo | None:
@@ -1023,6 +1172,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            language="go",
         )
 
     def _extract_go_params(self, node, source: bytes) -> list[str]:
@@ -1095,6 +1245,7 @@ class HybridExtractor:
                                             docstring=None,
                                             is_method=True,
                                             line_number=iface_child.start_point[0] + 1,
+                                            language="go",
                                         )
                                     )
 
@@ -1107,6 +1258,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            language="go",
         )
 
     # === Rust Extraction ===
@@ -1266,6 +1418,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            language="rust",
         )
 
     def _extract_rust_params(self, node, source: bytes) -> list[str]:
@@ -1298,6 +1451,7 @@ class HybridExtractor:
             docstring=None,
             methods=[],
             line_number=node.start_point[0] + 1,
+            language="rust",
         )
 
     def _extract_rust_trait(self, node, source: bytes) -> ClassInfo | None:
@@ -1325,6 +1479,7 @@ class HybridExtractor:
                                 docstring=None,
                                 is_method=True,
                                 line_number=item.start_point[0] + 1,
+                                language="rust",
                             )
                         )
 
@@ -1337,6 +1492,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            language="rust",
         )
 
     def _extract_rust_impl(
@@ -1581,6 +1737,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            language="java",
         )
 
     def _extract_java_interface(self, node, source: bytes) -> ClassInfo | None:
@@ -1616,6 +1773,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            language="java",
         )
 
     def _extract_java_method(self, node, source: bytes) -> FunctionInfo | None:
@@ -1652,6 +1810,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            language="java",
         )
 
     def _extract_java_constructor(
@@ -1674,6 +1833,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            language="java",
         )
 
     def _extract_java_params(self, node, source: bytes) -> list[str]:
@@ -1876,6 +2036,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            language="c",
         )
 
     def _extract_c_params(self, node, source: bytes) -> list[str]:
@@ -2080,6 +2241,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            language="cpp",
         )
 
     def _extract_cpp_params(self, node, source: bytes) -> list[str]:
@@ -2235,6 +2397,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            language="ruby",
         )
 
     def _extract_ruby_params(self, node, source: bytes) -> list[str]:
@@ -2294,6 +2457,7 @@ class HybridExtractor:
             bases=[superclass] if superclass else [],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="ruby",
         )
 
     def _extract_ruby_require(self, node, source: bytes) -> ImportInfo | None:
@@ -2484,6 +2648,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="kotlin",
         )
 
     def _extract_kotlin_params(self, node, source: bytes) -> list[str]:
@@ -2529,6 +2694,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="kotlin",
         )
 
     def _extract_kotlin_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2719,6 +2885,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="swift",
         )
 
     def _extract_swift_class(
@@ -2751,6 +2918,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="swift",
         )
 
     def _extract_swift_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2875,6 +3043,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="csharp",
         )
 
     def _extract_csharp_params(self, node, source: bytes) -> list[str]:
@@ -2914,6 +3083,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="csharp",
         )
 
     def _extract_csharp_import(self, node, source: bytes) -> ImportInfo | None:
@@ -3059,6 +3229,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="scala",
         )
 
     def _extract_scala_params(self, node, source: bytes) -> list[str]:
@@ -3107,6 +3278,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="scala",
         )
 
     def _extract_scala_import(self, node, source: bytes) -> ImportInfo | None:
@@ -3277,6 +3449,7 @@ class HybridExtractor:
             return_type=None,  # Lua is dynamically typed
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="lua",
         )
 
     def _extract_lua_params(self, node, source: bytes) -> list[str]:
@@ -3468,18 +3641,43 @@ class HybridExtractor:
             return_type=None,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="elixir",
         )
 
-    def _parse_signatures(self, text: str) -> list[str]:
-        """Parse Pygments signature output."""
+    def _parse_signatures(self, text: str) -> list[tuple[str, int]]:
+        """Parse Pygments signature output.
+
+        Returns list of (signature, line_number) tuples.
+        Parses format like 'hello () (line 1)' -> ('hello ()', 1)
+        """
+        import re
+
         if not text or not text.strip():
             return []
-        lines = text.strip().split("\n")
-        return [
-            line.strip().lstrip("- ").lstrip("* ")
-            for line in lines
-            if line.strip() and not line.startswith("#") and not line.startswith("```")
-        ]
+
+        # Pattern to match '(line N)' at the end
+        line_pattern = re.compile(r"\s*\(line\s+(\d+)\)\s*$")
+
+        results = []
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("```"):
+                continue
+
+            # Remove list markers
+            line = line.lstrip("- ").lstrip("* ")
+
+            # Extract line number if present
+            line_number = 0
+            match = line_pattern.search(line)
+            if match:
+                line_number = int(match.group(1))
+                line = line[: match.start()].strip()
+
+            if line:
+                results.append((line, line_number))
+
+        return results
 
     def _extract_params_from_sig(self, sig: str) -> list[str]:
         """Extract params from signature string."""

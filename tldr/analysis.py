@@ -99,10 +99,7 @@ def impact_analysis(
     edges = call_graph.edges
     reverse = build_reverse_graph(edges)
 
-    # Find target function(s)
-    targets = []
-
-    # Check all callees
+    # Find target function(s) as callees (functions being called)
     all_callees = set()
     for from_file, from_func, to_file, to_func in edges:
         callee = FunctionRef(file=to_file, name=to_func)
@@ -113,6 +110,30 @@ def impact_analysis(
     targets = list(all_callees)
 
     if not targets:
+        # Function not found as callee - check if it exists as a caller
+        # (function calls others but is never called itself = entry point)
+        callers_only = set()
+        for from_file, from_func, to_file, to_func in edges:
+            if from_func == target_func:
+                if target_file is None or target_file in from_file:
+                    callers_only.add(FunctionRef(file=from_file, name=from_func))
+
+        if callers_only:
+            # Function exists in graph but has no callers - return entry point info
+            return {
+                "targets": {
+                    str(ref): {
+                        "function": ref.name,
+                        "file": ref.file,
+                        "caller_count": 0,
+                        "callers": [],
+                        "truncated": False,
+                        "note": "Entry point - never called by other code in graph",
+                    }
+                    for ref in callers_only
+                },
+                "total_targets": len(callers_only),
+            }
         return {"error": f"Function '{target_func}' not found in call graph"}
 
     results = {}

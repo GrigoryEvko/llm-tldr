@@ -19,19 +19,16 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-# blake3 for fast hashing with fallback to md5
-try:
-    import blake3
+import hashlib
 
-    def _hash_path(path: str) -> str:
-        """Hash a path string using blake3 (fast, cryptographic)."""
-        return blake3.blake3(str(Path(path).resolve()).encode()).hexdigest()[:8]
-except ImportError:
-    import hashlib
 
-    def _hash_path(path: str) -> str:
-        """Hash a path string using md5 (fallback when blake3 unavailable)."""
-        return hashlib.md5(str(Path(path).resolve()).encode()).hexdigest()[:8]
+def _hash_path(path: str) -> str:
+    """Hash a path for socket naming - must match daemon implementation.
+
+    Uses SHA-256 with 16-char prefix, matching tldr/daemon/core.py
+    and tldr/daemon/startup.py socket path computation.
+    """
+    return hashlib.sha256(Path(path).resolve().as_posix().encode()).hexdigest()[:16]
 
 
 mcp = FastMCP("tldr-code")

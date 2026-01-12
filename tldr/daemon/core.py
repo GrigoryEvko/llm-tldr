@@ -146,7 +146,7 @@ class TLDRDaemon:
             raise ValueError(
                 f"Path traversal denied: {file_path} resolves to {resolved} "
                 f"which is outside project {project_resolved}"
-            )
+            ) from None
 
         return resolved
 

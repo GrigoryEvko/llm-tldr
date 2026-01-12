@@ -88,6 +88,109 @@ def detect_language_from_extension(file_path: str) -> str:
     return EXTENSION_TO_LANGUAGE.get(ext, "python")
 
 
+def _find_project_root(start_path: str | Path) -> Path:
+    """Find the project root by looking for marker directories.
+
+    Walks up the directory tree from start_path looking for .tldr/ or .git/
+    markers that indicate the project root. This allows subdirectory paths
+    to work correctly with cached call graphs.
+
+    Args:
+        start_path: Starting directory to search from
+
+    Returns:
+        Project root Path. Returns the resolved start_path if no markers found.
+    """
+    current = Path(start_path).resolve()
+
+    # If start_path is a file, start from its parent directory
+    if current.is_file():
+        current = current.parent
+
+    # First pass: look for .git/ (definitive project root marker)
+    # .git/ is preferred over .tldr/ since .git/ definitively marks
+    # the repository root, while .tldr/ caches can exist in subdirectories.
+    search = current
+    while search != search.parent:  # Stop at filesystem root
+        if (search / ".git").is_dir():
+            return search
+        search = search.parent
+
+    # Second pass: fall back to .tldr/ if no .git/ found
+    search = current
+    while search != search.parent:
+        if (search / ".tldr").is_dir():
+            return search
+        search = search.parent
+
+    # No markers found - return the original resolved path
+    return Path(start_path).resolve()
+
+
+def _detect_project_language(path: str) -> str:
+    """Auto-detect dominant language for a project.
+
+    Detection priority:
+    1. Check .tldr/cache/call_graph.json for cached "languages" field
+    2. Scan project files and count by extension
+
+    Args:
+        path: Project root directory
+
+    Returns:
+        Detected language name (defaults to 'python' if detection fails)
+    """
+    project = Path(path).resolve()
+
+    # Priority 1: Check cached call graph for language info
+    cache_file = project / ".tldr" / "cache" / "call_graph.json"
+    if cache_file.exists():
+        try:
+            cache_data = json.loads(cache_file.read_text())
+            languages = cache_data.get("languages", [])
+            if languages:
+                # Return first language from cache (primary language used for indexing)
+                return languages[0]
+        except (json.JSONDecodeError, OSError):
+            pass  # Cache invalid or unreadable, fall through to scanning
+
+    # Priority 2: Scan project files and count by extension
+    extension_counts: dict[str, int] = {}
+
+    # Prefer src/lib directories if they exist, otherwise scan project root
+    scan_dir = project
+    if (project / "src").is_dir():
+        scan_dir = project / "src"
+    elif (project / "lib").is_dir():
+        scan_dir = project / "lib"
+
+    try:
+        # Scan files (limit depth to avoid slow scanning of large node_modules etc)
+        for item in scan_dir.rglob("*"):
+            # Skip hidden directories and common vendor directories
+            parts = item.relative_to(scan_dir).parts
+            if any(
+                p.startswith(".") or p in ("node_modules", "__pycache__", "vendor", "dist", "build")
+                for p in parts
+            ):
+                continue
+
+            if item.is_file():
+                ext = item.suffix.lower()
+                if ext in EXTENSION_TO_LANGUAGE:
+                    lang = EXTENSION_TO_LANGUAGE[ext]
+                    extension_counts[lang] = extension_counts.get(lang, 0) + 1
+    except OSError:
+        pass
+
+    if extension_counts:
+        # Return language with most files
+        return max(extension_counts, key=lambda k: extension_counts[k])
+
+    # Default fallback
+    return "python"
+
+
 def _show_first_run_tip():
     """Show a one-time tip about Swift support on first run."""
     marker = Path.home() / ".tldr_first_run"
@@ -178,7 +281,13 @@ Semantic Search:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # tldr tree [path]
-    tree_p = subparsers.add_parser("tree", help="Show file tree")
+    tree_p = subparsers.add_parser(
+        "tree",
+        help="Show file tree",
+        description="Display the file tree structure of a directory in JSON format.",
+        epilog="Example: tldr tree src/ --ext .py .ts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     tree_p.add_argument("path", nargs="?", default=".", help="Directory to scan")
     tree_p.add_argument(
         "--ext", nargs="+", help="Filter by extensions (e.g., --ext .py .ts)"
@@ -188,7 +297,13 @@ Semantic Search:
     )
 
     # tldr structure [path]
-    struct_p = subparsers.add_parser("structure", help="Show code structure (codemaps)")
+    struct_p = subparsers.add_parser(
+        "structure",
+        help="Show code structure (codemaps)",
+        description="Extract functions, classes, and methods from source files.",
+        epilog="Example: tldr structure src/ --lang python --max 100",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     struct_p.add_argument("path", nargs="?", default=".", help="Directory to analyze")
     struct_p.add_argument(
         "--lang",
@@ -218,7 +333,13 @@ Semantic Search:
     )
 
     # tldr search <pattern> [path]
-    search_p = subparsers.add_parser("search", help="Search files for pattern")
+    search_p = subparsers.add_parser(
+        "search",
+        help="Search files for pattern",
+        description="Search files for a regex pattern with optional context lines.",
+        epilog="Example: tldr search 'def process' src/ --ext .py -C 2",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     search_p.add_argument("pattern", help="Regex pattern to search")
     search_p.add_argument("path", nargs="?", default=".", help="Directory to search")
     search_p.add_argument("--ext", nargs="+", help="Filter by extensions")
@@ -236,7 +357,13 @@ Semantic Search:
     )
 
     # tldr extract <file> [--class X] [--function Y] [--method Class.method]
-    extract_p = subparsers.add_parser("extract", help="Extract full file info")
+    extract_p = subparsers.add_parser(
+        "extract",
+        help="Extract full file info",
+        description="Extract complete AST info from a file: functions, classes, methods, docstrings.",
+        epilog="Examples:\n  tldr extract src/main.py\n  tldr extract src/api.py --class UserController\n  tldr extract src/api.py --method UserController.get_user",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     extract_p.add_argument("file", help="File to analyze")
     extract_p.add_argument(
         "--class", dest="filter_class", help="Filter to specific class"
@@ -251,7 +378,13 @@ Semantic Search:
     )
 
     # tldr context <entry>
-    ctx_p = subparsers.add_parser("context", help="Get relevant context for LLM")
+    ctx_p = subparsers.add_parser(
+        "context",
+        help="Get relevant context for LLM",
+        description="Build LLM-ready context by following the call graph from an entry point.",
+        epilog="Examples:\n  tldr context main --project . --depth 3\n  tldr context UserController.get_user --project src/",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ctx_p.add_argument("entry", help="Entry point (function_name or Class.method)")
     ctx_p.add_argument("--project", default=".", help="Project root directory")
     ctx_p.add_argument("--depth", type=int, default=2, help="Call depth (default: 2)")
@@ -280,7 +413,13 @@ Semantic Search:
     )
 
     # tldr cfg <file> <function>
-    cfg_p = subparsers.add_parser("cfg", help="Control flow graph")
+    cfg_p = subparsers.add_parser(
+        "cfg",
+        help="Control flow graph",
+        description="Generate a control flow graph (CFG) for a function, showing branches and loops.",
+        epilog="Example: tldr cfg src/processor.py process_data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     cfg_p.add_argument("file", help="Source file")
     cfg_p.add_argument("function", help="Function name")
     cfg_p.add_argument(
@@ -290,7 +429,13 @@ Semantic Search:
     )
 
     # tldr dfg <file> <function>
-    dfg_p = subparsers.add_parser("dfg", help="Data flow graph")
+    dfg_p = subparsers.add_parser(
+        "dfg",
+        help="Data flow graph",
+        description="Generate a data flow graph (DFG) for a function, showing variable dependencies.",
+        epilog="Example: tldr dfg src/processor.py process_data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     dfg_p.add_argument("file", help="Source file")
     dfg_p.add_argument("function", help="Function name")
     dfg_p.add_argument(
@@ -300,7 +445,13 @@ Semantic Search:
     )
 
     # tldr slice <file> <function> <line>
-    slice_p = subparsers.add_parser("slice", help="Program slice")
+    slice_p = subparsers.add_parser(
+        "slice",
+        help="Program slice",
+        description="Compute a program slice: find all lines that affect (backward) or are affected by (forward) a given line.",
+        epilog="Examples:\n  tldr slice src/main.py process 42              # What affects line 42?\n  tldr slice src/main.py process 42 --direction forward  # What does line 42 affect?",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     slice_p.add_argument("file", help="Source file")
     slice_p.add_argument("function", help="Function name")
     slice_p.add_argument("line", type=int, help="Line number to slice from")
@@ -318,38 +469,62 @@ Semantic Search:
     )
 
     # tldr calls <path>
-    calls_p = subparsers.add_parser("calls", help="Build cross-file call graph")
+    calls_p = subparsers.add_parser(
+        "calls",
+        help="Build cross-file call graph",
+        description="Build a project-wide call graph showing which functions call which.",
+        epilog="Example: tldr calls src/ --lang python",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     calls_p.add_argument("path", nargs="?", default=".", help="Project root")
-    calls_p.add_argument("--lang", default="python", help="Language")
+    calls_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
 
     # tldr impact <func> [path]
     impact_p = subparsers.add_parser(
-        "impact", help="Find all callers of a function (reverse call graph)"
+        "impact",
+        help="Find all callers of a function (reverse call graph)",
+        description="Analyze impact: find all functions that call a given function (transitively).\nUseful before refactoring to understand what will be affected.",
+        epilog="Examples:\n  tldr impact process_data src/ --depth 5\n  tldr impact get_user . --file api",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     impact_p.add_argument("func", help="Function name to find callers of")
     impact_p.add_argument("path", nargs="?", default=".", help="Project root")
     impact_p.add_argument("--depth", type=int, default=3, help="Max depth (default: 3)")
     impact_p.add_argument("--file", help="Filter by file containing this string")
-    impact_p.add_argument("--lang", default="python", help="Language")
+    impact_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
 
     # tldr dead [path]
-    dead_p = subparsers.add_parser("dead", help="Find unreachable (dead) code")
+    dead_p = subparsers.add_parser(
+        "dead",
+        help="Find unreachable (dead) code",
+        description="Find functions that are never called (dead code).\nExcludes common entry points like main, test_*, cli, etc.",
+        epilog="Examples:\n  tldr dead src/\n  tldr dead . --entry cli main",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     dead_p.add_argument("path", nargs="?", default=".", help="Project root")
     dead_p.add_argument(
         "--entry", nargs="*", default=[], help="Additional entry point patterns"
     )
-    dead_p.add_argument("--lang", default="python", help="Language")
+    dead_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
 
     # tldr arch [path]
     arch_p = subparsers.add_parser(
-        "arch", help="Detect architectural layers from call patterns"
+        "arch",
+        help="Detect architectural layers from call patterns",
+        description="Detect architectural layers (entry, middle, leaf) from call patterns.\nIdentifies circular dependencies.",
+        epilog="Example: tldr arch src/",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     arch_p.add_argument("path", nargs="?", default=".", help="Project root")
-    arch_p.add_argument("--lang", default="python", help="Language")
+    arch_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
 
     # tldr imports <file>
     imports_p = subparsers.add_parser(
-        "imports", help="Parse imports from a source file"
+        "imports",
+        help="Parse imports from a source file",
+        description="Parse all import statements from a source file.\nReturns JSON with module names, imported names, and aliases.",
+        epilog="Example: tldr imports src/main.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     imports_p.add_argument("file", help="Source file to analyze")
     imports_p.add_argument(
@@ -360,40 +535,54 @@ Semantic Search:
 
     # tldr importers <module> [path]
     importers_p = subparsers.add_parser(
-        "importers", help="Find all files that import a module (reverse import lookup)"
+        "importers",
+        help="Find all files that import a module (reverse import lookup)",
+        description="Find all files that import a given module.\nComplements 'tldr impact' which tracks function calls.",
+        epilog="Examples:\n  tldr importers json src/\n  tldr importers UserController .",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     importers_p.add_argument("module", help="Module name to search for importers")
     importers_p.add_argument("path", nargs="?", default=".", help="Project root")
-    importers_p.add_argument("--lang", default="python", help="Language")
+    importers_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
 
     # tldr change-impact [files...]
-    impact_p = subparsers.add_parser(
-        "change-impact", help="Find tests affected by changed files"
+    change_impact_p = subparsers.add_parser(
+        "change-impact",
+        help="Find tests affected by changed files",
+        description="Find which tests to run based on changed files.\nUses call graph + import analysis to find affected tests.",
+        epilog="Examples:\n  tldr change-impact                    # Auto-detect changes\n  tldr change-impact src/api.py         # Explicit files\n  tldr change-impact --git               # Use git diff\n  tldr change-impact --run               # Actually run affected tests",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    impact_p.add_argument(
+    change_impact_p.add_argument(
         "files",
         nargs="*",
         help="Files to analyze (default: auto-detect from session/git)",
     )
-    impact_p.add_argument(
+    change_impact_p.add_argument(
         "--session", action="store_true", help="Use session-modified files (dirty_flag)"
     )
-    impact_p.add_argument(
+    change_impact_p.add_argument(
         "--git", action="store_true", help="Use git diff to find changed files"
     )
-    impact_p.add_argument(
+    change_impact_p.add_argument(
         "--git-base", default="HEAD~1", help="Git ref to diff against (default: HEAD~1)"
     )
-    impact_p.add_argument("--lang", default="python", help="Language")
-    impact_p.add_argument(
+    change_impact_p.add_argument("--lang", default=None, help="Language (auto-detected if not specified)")
+    change_impact_p.add_argument(
         "--depth", type=int, default=5, help="Max call graph depth (default: 5)"
     )
-    impact_p.add_argument(
+    change_impact_p.add_argument(
         "--run", action="store_true", help="Actually run the affected tests"
     )
 
     # tldr diagnostics <file|path>
-    diag_p = subparsers.add_parser("diagnostics", help="Get type and lint diagnostics")
+    diag_p = subparsers.add_parser(
+        "diagnostics",
+        help="Get type and lint diagnostics",
+        description="Run type checker (pyright) and linter (ruff) on code.\nReturns structured errors. Use before tests to catch type errors early.",
+        epilog="Examples:\n  tldr diagnostics src/main.py\n  tldr diagnostics . --project --format text\n  tldr diagnostics src/ --no-lint",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     diag_p.add_argument("target", help="File or project directory to check")
     diag_p.add_argument(
         "--project",
@@ -410,7 +599,11 @@ Semantic Search:
 
     # tldr warm <path>
     warm_p = subparsers.add_parser(
-        "warm", help="Pre-build call graph cache for faster queries"
+        "warm",
+        help="Pre-build call graph cache for faster queries",
+        description="Pre-build the call graph cache to speed up subsequent queries.\nRun this once per project before using impact/dead/calls.",
+        epilog="Examples:\n  tldr warm . --lang python\n  tldr warm src/ --lang all --background",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     warm_p.add_argument("path", help="Project root directory")
     warm_p.add_argument(
@@ -425,12 +618,21 @@ Semantic Search:
 
     # tldr semantic index <path> / tldr semantic search <query>
     semantic_p = subparsers.add_parser(
-        "semantic", help="Semantic code search using embeddings"
+        "semantic",
+        help="Semantic code search using embeddings",
+        description="Semantic code search using embeddings.\nRequires: tldr semantic index . (first run downloads 1.3GB model)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     semantic_sub = semantic_p.add_subparsers(dest="action", required=True)
 
     # tldr semantic index [path]
-    index_p = semantic_sub.add_parser("index", help="Build semantic index for project")
+    index_p = semantic_sub.add_parser(
+        "index",
+        help="Build semantic index for project",
+        description="Build the semantic search index for a project.\nFirst run downloads embedding model (1.3GB default, 80MB for MiniLM).",
+        epilog="Examples:\n  tldr semantic index .\n  tldr semantic index src/ --lang typescript\n  tldr semantic index . --model all-MiniLM-L6-v2",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     index_p.add_argument("path", nargs="?", default=".", help="Project root")
     index_p.add_argument(
         "--lang",
@@ -444,15 +646,26 @@ Semantic Search:
         help="Embedding model: bge-large-en-v1.5 (1.3GB, default) or all-MiniLM-L6-v2 (80MB)",
     )
 
-    # tldr semantic search <query>
-    search_p = semantic_sub.add_parser("search", help="Search semantically")
+    # tldr semantic search <query> [path]
+    search_p = semantic_sub.add_parser(
+        "search",
+        help="Search semantically",
+        description="Search code using natural language queries.\nRequires prior indexing with 'tldr semantic index'.",
+        epilog="Examples:\n  tldr semantic search 'authentication logic' .\n  tldr semantic search 'database connection' src/ --k 10",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     search_p.add_argument("query", help="Natural language query")
-    search_p.add_argument("--path", default=".", help="Project root")
+    search_p.add_argument("path", nargs="?", default=".", help="Project root")
     search_p.add_argument("--k", type=int, default=5, help="Number of results")
     search_p.add_argument(
         "--expand", action="store_true", help="Include call graph expansion"
     )
-    search_p.add_argument("--lang", default="python", help="Language")
+    search_p.add_argument(
+        "--lang",
+        default="python",
+        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
+        help="Language of the index to search (must match indexed language)",
+    )
     search_p.add_argument(
         "--model",
         default=None,
@@ -460,12 +673,22 @@ Semantic Search:
     )
 
     # tldr daemon start/stop/status/query
-    daemon_p = subparsers.add_parser("daemon", help="Daemon management subcommands")
+    daemon_p = subparsers.add_parser(
+        "daemon",
+        help="Daemon management subcommands",
+        description="Manage the TLDR daemon for faster repeated queries.\nDaemon runs in background, auto-shuts down after 30 min idle.",
+        epilog="Subcommands:\n  start   Start daemon for current project\n  stop    Stop daemon gracefully\n  status  Check if daemon is running\n  query   Send raw command to daemon\n  notify  Notify daemon of file change",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     daemon_sub = daemon_p.add_subparsers(dest="action", required=True)
 
     # tldr daemon start [--project PATH]
     daemon_start_p = daemon_sub.add_parser(
-        "start", help="Start daemon for project (background)"
+        "start",
+        help="Start daemon for project (background)",
+        description="Start the TLDR daemon for faster repeated queries.",
+        epilog="Example: tldr daemon start -p /path/to/project",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     daemon_start_p.add_argument(
         "--project", "-p", default=".", help="Project path (default: current directory)"
@@ -505,7 +728,11 @@ Semantic Search:
 
     # tldr doctor [--install LANG]
     doctor_p = subparsers.add_parser(
-        "doctor", help="Check and install diagnostic tools (type checkers, linters)"
+        "doctor",
+        help="Check and install diagnostic tools (type checkers, linters)",
+        description="Check which diagnostic tools (type checkers, linters) are installed.\nCan auto-install missing tools for supported languages.",
+        epilog="Examples:\n  tldr doctor                 # Check all tools\n  tldr doctor --json          # Output as JSON\n  tldr doctor --install python  # Install Python tools",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     doctor_p.add_argument(
         "--install",
@@ -734,8 +961,32 @@ Semantic Search:
             print(json.dumps(result, indent=2))
 
         elif args.command == "calls":
-            # Check for cached graph and dirty files for incremental update
-            graph = _get_or_build_graph(args.path, args.lang, build_project_call_graph)
+            # Find project root for consistent cache handling
+            # This allows `tldr calls src/` to work the same as `tldr calls .`
+            project_root = _find_project_root(args.path)
+            target_path = Path(args.path).resolve()
+
+            # Auto-detect language from project root
+            lang = args.lang or _detect_project_language(str(project_root))
+
+            # Use project root for cache lookup and graph building
+            graph = _get_or_build_graph(str(project_root), lang, build_project_call_graph)
+
+            # Filter edges if a subdirectory was specified
+            edges = graph.edges
+            if target_path != project_root:
+                # Get relative path prefix for filtering
+                try:
+                    rel_prefix = str(target_path.relative_to(project_root))
+                    # Filter to edges where from_file or to_file is in the subdirectory
+                    edges = [
+                        e for e in edges
+                        if e[0].startswith(rel_prefix) or e[2].startswith(rel_prefix)
+                    ]
+                except ValueError:
+                    # target_path is not under project_root - use all edges
+                    pass
+
             result = {
                 "edges": [
                     {
@@ -744,32 +995,38 @@ Semantic Search:
                         "to_file": e[2],
                         "to_func": e[3],
                     }
-                    for e in graph.edges
+                    for e in edges
                 ],
-                "count": len(graph.edges),
+                "count": len(edges),
             }
             print(json.dumps(result, indent=2))
 
         elif args.command == "impact":
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.path)
             result = analyze_impact(
                 args.path,
                 args.func,
                 max_depth=args.depth,
                 target_file=args.file,
-                language=args.lang,
+                language=lang,
             )
             print(json.dumps(result, indent=2))
 
         elif args.command == "dead":
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.path)
             result = analyze_dead_code(
                 args.path,
                 entry_points=args.entry if args.entry else None,
-                language=args.lang,
+                language=lang,
             )
             print(json.dumps(result, indent=2))
 
         elif args.command == "arch":
-            result = analyze_architecture(args.path, language=args.lang)
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.path)
+            result = analyze_architecture(args.path, language=lang)
             print(json.dumps(result, indent=2))
 
         elif args.command == "imports":
@@ -783,25 +1040,30 @@ Semantic Search:
 
         elif args.command == "importers":
             # Find all files that import the given module
+            from .daemon.cached_queries import module_matches
+
             project = Path(args.path).resolve()
             if not project.exists():
                 print(f"Error: Path not found: {args.path}", file=sys.stderr)
                 sys.exit(1)
 
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.path)
+
             # Scan all source files and check their imports
             respect_ignore = not getattr(args, "no_ignore", False)
             files = scan_project_files(
-                str(project), language=args.lang, respect_ignore=respect_ignore
+                str(project), language=lang, respect_ignore=respect_ignore
             )
             importers = []
             for file_path in files:
                 try:
-                    imports = get_imports(file_path, language=args.lang)
+                    imports = get_imports(file_path, language=lang)
                     for imp in imports:
-                        module = imp.get("module", "")
+                        mod = imp.get("module", "")
                         names = imp.get("names", [])
-                        # Check if module matches or if any imported name matches
-                        if args.module in module or args.module in names:
+                        # Check using normalized matching (supports both aliases and file paths)
+                        if module_matches(args.module, mod, names):
                             importers.append(
                                 {
                                     "file": str(Path(file_path).relative_to(project)),
@@ -817,13 +1079,16 @@ Semantic Search:
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
 
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(".")
+
             result = analyze_change_impact(
                 project_path=".",
                 files=args.files if args.files else None,
                 use_session=args.session,
                 use_git=args.git,
                 git_base=args.git_base,
-                language=args.lang,
+                language=lang,
                 max_depth=args.depth,
             )
 
@@ -965,6 +1230,14 @@ Semantic Search:
             from .semantic import build_semantic_index, semantic_search
 
             if args.action == "index":
+                project_path = Path(args.path).resolve()
+                if not project_path.exists():
+                    print(f"Error: Path not found: {args.path}", file=sys.stderr)
+                    sys.exit(1)
+                if not project_path.is_dir():
+                    print(f"Error: Not a directory: {args.path}", file=sys.stderr)
+                    sys.exit(1)
+
                 respect_ignore = not getattr(args, "no_ignore", False)
                 count = build_semantic_index(
                     args.path,
@@ -981,6 +1254,7 @@ Semantic Search:
                     k=args.k,
                     expand_graph=args.expand,
                     model=args.model,
+                    lang=args.lang,
                 )
                 print(json.dumps(results, indent=2))
 

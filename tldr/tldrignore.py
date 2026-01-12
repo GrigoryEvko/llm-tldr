@@ -137,6 +137,10 @@ def ensure_tldrignore(project_dir: str | Path) -> tuple[bool, str]:
         Tuple of (created: bool, message: str)
     """
     project_path = Path(project_dir)
+
+    if not project_path.exists():
+        return False, f"Project directory does not exist: {project_path}"
+
     tldrignore_path = project_path / ".tldrignore"
 
     if tldrignore_path.exists():

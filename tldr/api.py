@@ -747,13 +747,14 @@ def get_relevant_context(
             pass  # Skip files that fail to parse
 
     # Build suffix index for O(1) unqualified name lookup (avoids O(n) scan per lookup)
+    # Only index qualified names (module.func) - unqualified names are handled
+    # by the fallback in resolve_func_name to avoid duplicate entries
     suffix_index: dict[str, list[str]] = defaultdict(list)
     for qualified_name in signatures:
         if "." in qualified_name:
             _, short_name = qualified_name.rsplit(".", 1)
             suffix_index[short_name].append(qualified_name)
-        else:
-            suffix_index[qualified_name].append(qualified_name)
+        # Don't add unqualified names - they're already accessible via fallback
 
     # CFG extractor based on language
     cfg_extractors = {
@@ -1717,7 +1718,8 @@ def get_code_structure(
     # Collect files to process (apply filtering before extraction)
     files_to_process: list[str] = []
     for file_path in root.rglob("*"):
-        if len(files_to_process) >= max_results:
+        # max_results=0 means unlimited; only check limit if max_results > 0
+        if max_results > 0 and len(files_to_process) >= max_results:
             break
 
         if not file_path.is_file():
@@ -1757,7 +1759,13 @@ def get_code_structure(
             file_entry = {
                 "path": str(rel_path),
                 "functions": [f["name"] for f in info_dict.get("functions", [])],
-                "classes": [c["name"] for c in info_dict.get("classes", [])],
+                "classes": [
+                    {
+                        "name": c["name"],
+                        "methods": [m["name"] for m in c.get("methods", [])],
+                    }
+                    for c in info_dict.get("classes", [])
+                ],
                 "imports": info_dict.get("imports", []),
             }
             result["files"].append(file_entry)
