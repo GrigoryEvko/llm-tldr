@@ -13,14 +13,19 @@ and FAISS for fast vector similarity search.
 """
 
 import json
+import logging
 import os
 import sys
 import threading
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
+
+logger = logging.getLogger("tldr.semantic")
+
+ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir"]
 
 # Lazy imports for heavy dependencies
 _model = None
@@ -456,28 +461,56 @@ def extract_units_from_project(
         calls_map = {}
         called_by_map = {}
 
-    # Process each file in structure
+    # Process files in parallel for better performance
     files = structure.get("files", [])
-    project_str = str(project)
+    max_workers = int(os.environ.get("TLDR_MAX_WORKERS", os.cpu_count() or 4))
 
-    if len(files) >= MIN_FILES_FOR_PARALLEL:
-        # Parallel processing for large projects
-        # Each worker processes one file independently
-        max_workers = min(os.cpu_count() or 4, 8)
-        args_list = [(f, project_str, lang, calls_map, called_by_map) for f in files]
+    # Use parallel processing if we have multiple files
+    if len(files) > 1 and max_workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_file_for_extraction,
+                        file_info,
+                        str(project),
+                        lang,
+                        calls_map,
+                        called_by_map,
+                    ): file_info
+                    for file_info in files
+                }
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(_extract_units_from_file, args_list))
+                for future in as_completed(futures):
+                    file_info = futures[future]
+                    try:
+                        file_units = future.result(timeout=60)  # 60s per file timeout
+                        units.extend(file_units)
+                    except Exception as e:
+                        logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
+                        # Continue with other files
 
-        # Flatten results from all workers
-        for batch in results:
-            units.extend(batch)
+        except Exception as e:
+            # Fallback to sequential if parallel fails
+            logger.warning(f"Parallel extraction failed: {e}, falling back to sequential")
+            for file_info in files:
+                try:
+                    file_units = _process_file_for_extraction(
+                        file_info, str(project), lang, calls_map, called_by_map
+                    )
+                    units.extend(file_units)
+                except Exception as fe:
+                    logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {fe}")
     else:
-        # Sequential processing for small projects (avoids process spawn overhead)
+        # Sequential processing for single file or when parallel is disabled
         for file_info in files:
-            args = (file_info, project_str, lang, calls_map, called_by_map)
-            file_units = _extract_units_from_file(args)
-            units.extend(file_units)
+            try:
+                file_units = _process_file_for_extraction(
+                    file_info, str(project), lang, calls_map, called_by_map
+                )
+                units.extend(file_units)
+            except Exception as e:
+                logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
 
     return units
 
@@ -855,6 +888,7 @@ def _get_function_signature(
 
                     return f"def {func_name}({', '.join(args)}){returns}"
 
+
         # For other languages, return simple signature
         return f"function {func_name}(...)"
 
@@ -905,6 +939,222 @@ def _get_function_docstring(
         return None
 
 
+def _process_file_for_extraction(
+    file_info: Dict[str, Any],
+    project_path: str,
+    lang: str,
+    calls_map: Dict[str, List[str]],
+    called_by_map: Dict[str, List[str]],
+) -> List[EmbeddingUnit]:
+    """Process a single file and extract all units. Top-level for pickling.
+
+    This function reads the file ONCE and extracts all information in a single pass,
+    avoiding the O(n*m) file read issue where n=files and m=functions.
+
+    Args:
+        file_info: Dict with 'path', 'functions', 'classes' from get_code_structure.
+        project_path: Absolute path to project root.
+        lang: Programming language.
+        calls_map: Map of function name -> list of called functions.
+        called_by_map: Map of function name -> list of calling functions.
+
+    Returns:
+        List of EmbeddingUnit objects for this file.
+    """
+    units = []
+    project = Path(project_path)
+    file_path = file_info.get("path", "")
+    full_path = project / file_path
+
+    if not full_path.exists():
+        return units
+
+    try:
+        # Read file content ONCE
+        content = full_path.read_text()
+        lines = content.split('\n')
+    except Exception as e:
+        logger.warning(f"Failed to read {file_path}: {e}")
+        return units
+
+    # Parse AST once for all function info
+    ast_info = {"functions": {}, "classes": {}, "methods": {}}
+    all_signatures = {}
+    all_docstrings = {}
+
+    if lang == "python":
+        try:
+            import ast
+            tree = ast.parse(content)
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # Check if this is a method (inside a class)
+                    parent_class = None
+                    for potential_parent in ast.walk(tree):
+                        if isinstance(potential_parent, ast.ClassDef):
+                            for item in potential_parent.body:
+                                if item is node:
+                                    parent_class = potential_parent.name
+                                    break
+
+                    # Extract code preview (first 10 lines of body)
+                    start_line = node.lineno
+                    end_line = getattr(node, 'end_lineno', start_line + 10)
+                    body_lines = lines[start_line - 1:min(end_line, start_line + 10) - 1]
+                    code_preview = '\n'.join(body_lines[:10])
+
+                    # Build signature
+                    args = []
+                    for arg in node.args.args:
+                        arg_str = arg.arg
+                        if arg.annotation:
+                            arg_str += f": {ast.unparse(arg.annotation)}"
+                        args.append(arg_str)
+                    returns = ""
+                    if node.returns:
+                        returns = f" -> {ast.unparse(node.returns)}"
+                    signature = f"def {node.name}({', '.join(args)}){returns}"
+
+                    # Get docstring
+                    docstring = ast.get_docstring(node) or ""
+
+                    if parent_class:
+                        key = f"{parent_class}.{node.name}"
+                        ast_info["methods"][key] = {
+                            "line": node.lineno,
+                            "code_preview": code_preview
+                        }
+                        all_signatures[key] = signature
+                        all_docstrings[key] = docstring
+                    else:
+                        ast_info["functions"][node.name] = {
+                            "line": node.lineno,
+                            "code_preview": code_preview
+                        }
+                        all_signatures[node.name] = signature
+                        all_docstrings[node.name] = docstring
+
+                elif isinstance(node, ast.ClassDef):
+                    ast_info["classes"][node.name] = {"line": node.lineno}
+
+        except Exception as e:
+            logger.debug(f"AST parse failed for {file_path}: {e}")
+
+    # Get dependencies (imports) - single call
+    dependencies = ""
+    try:
+        from tldr.api import get_imports
+        imports = get_imports(str(full_path), language=lang)
+        modules = [imp.get("module", "") for imp in imports[:5] if imp.get("module")]
+        dependencies = ", ".join(modules)
+    except Exception:
+        pass
+
+    # Pre-compute CFG/DFG for all functions at once
+    cfg_cache = {}
+    dfg_cache = {}
+
+    if lang == "python":
+        # Get all function names we need to process
+        all_func_names = list(file_info.get("functions", []))
+        for class_info in file_info.get("classes", []):
+            if isinstance(class_info, dict):
+                all_func_names.extend(class_info.get("methods", []))
+
+        for func_name in all_func_names:
+            try:
+                from tldr.cfg_extractor import extract_python_cfg
+                cfg = extract_python_cfg(content, func_name)
+                cfg_cache[func_name] = f"complexity:{cfg.cyclomatic_complexity}, blocks:{len(cfg.blocks)}"
+            except Exception:
+                cfg_cache[func_name] = ""
+
+            try:
+                from tldr.dfg_extractor import extract_python_dfg
+                dfg = extract_python_dfg(content, func_name)
+                var_names = set(ref.name for ref in dfg.var_refs)
+                dfg_cache[func_name] = f"vars:{len(var_names)}, def-use chains:{len(dfg.dataflow_edges)}"
+            except Exception:
+                dfg_cache[func_name] = ""
+
+    # Process functions
+    for func_name in file_info.get("functions", []):
+        func_info = ast_info.get("functions", {}).get(func_name, {})
+        unit = EmbeddingUnit(
+            name=func_name,
+            qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
+            file=file_path,
+            line=func_info.get("line", 1),
+            language=lang,
+            unit_type="function",
+            signature=all_signatures.get(func_name, f"def {func_name}(...)"),
+            docstring=all_docstrings.get(func_name, ""),
+            calls=calls_map.get(func_name, [])[:5],
+            called_by=called_by_map.get(func_name, [])[:5],
+            cfg_summary=cfg_cache.get(func_name, ""),
+            dfg_summary=dfg_cache.get(func_name, ""),
+            dependencies=dependencies,
+            code_preview=func_info.get("code_preview", ""),
+        )
+        units.append(unit)
+
+    # Process classes
+    for class_info in file_info.get("classes", []):
+        if isinstance(class_info, dict):
+            class_name = class_info.get("name", "")
+            methods = class_info.get("methods", [])
+        else:
+            class_name = class_info
+            methods = []
+
+        class_line = ast_info.get("classes", {}).get(class_name, {}).get("line", 1)
+
+        # Add class itself
+        unit = EmbeddingUnit(
+            name=class_name,
+            qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
+            file=file_path,
+            line=class_line,
+            language=lang,
+            unit_type="class",
+            signature=f"class {class_name}",
+            docstring="",
+            calls=[],
+            called_by=[],
+            cfg_summary="",
+            dfg_summary="",
+            dependencies=dependencies,
+            code_preview="",
+        )
+        units.append(unit)
+
+        # Add methods
+        for method in methods:
+            method_key = f"{class_name}.{method}"
+            method_info = ast_info.get("methods", {}).get(method_key, {})
+
+            unit = EmbeddingUnit(
+                name=method,
+                qualified_name=f"{file_path.replace('/', '.')}.{method_key}",
+                file=file_path,
+                line=method_info.get("line", 1),
+                language=lang,
+                unit_type="method",
+                signature=all_signatures.get(method_key, f"def {method}(self, ...)"),
+                docstring=all_docstrings.get(method_key, ""),
+                calls=calls_map.get(method, [])[:5],
+                called_by=called_by_map.get(method, [])[:5],
+                cfg_summary=cfg_cache.get(method, ""),
+                dfg_summary=dfg_cache.get(method, ""),
+                dependencies=dependencies,
+                code_preview=method_info.get("code_preview", ""),
+            )
+            units.append(unit)
+
+    return units
+
+
 def _get_progress_console():
     """Get rich Console if available and TTY, else None."""
     if not sys.stdout.isatty():
@@ -917,6 +1167,62 @@ def _get_progress_console():
         return Console()
     except ImportError:
         return None
+
+
+def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -> List[str]:
+    """Scan project files to detect present languages."""
+    from tldr.tldrignore import load_ignore_patterns, should_ignore
+    
+    # Extension map (copied from cli.py to avoid circular import)
+    EXTENSION_TO_LANGUAGE = {
+        '.java': 'java',
+        '.py': 'python',
+        '.ts': 'typescript',
+        '.tsx': 'typescript',
+        '.js': 'javascript',
+        '.jsx': 'javascript',
+        '.go': 'go',
+        '.rs': 'rust',
+        '.c': 'c',
+        '.h': 'c',
+        '.cpp': 'cpp',
+        '.hpp': 'cpp',
+        '.cc': 'cpp',
+        '.cxx': 'cpp',
+        '.hh': 'cpp',
+        '.rb': 'ruby',
+        '.php': 'php',
+        '.swift': 'swift',
+        '.cs': 'csharp',
+        '.kt': 'kotlin',
+        '.kts': 'kotlin',
+        '.scala': 'scala',
+        '.sc': 'scala',
+        '.lua': 'lua',
+        '.ex': 'elixir',
+        '.exs': 'elixir',
+    }
+    
+    found_languages = set()
+    spec = load_ignore_patterns(project_path) if respect_ignore else None
+    
+    for root, dirs, files in os.walk(project_path):
+        # Prune common heavy dirs immediately for speed
+        dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '.tldr', 'venv', '__pycache__', '.idea', '.vscode'}]
+        
+        for file in files:
+             file_path = Path(root) / file
+             
+             # Check ignore patterns
+             if respect_ignore and should_ignore(file_path, project_path, spec):
+                 continue
+                 
+             ext = file_path.suffix.lower()
+             if ext in EXTENSION_TO_LANGUAGE:
+                 found_languages.add(EXTENSION_TO_LANGUAGE[ext])
+
+    # Return sorted list intersect with ALL_LANGUAGES to ensure validity
+    return sorted(list(found_languages & set(ALL_LANGUAGES)))
 
 
 def build_semantic_index(
@@ -966,14 +1272,33 @@ def build_semantic_index(
     # Extract all units (respecting .tldrignore)
     if console:
         with console.status("[bold green]Extracting code units...") as status:
-            units = extract_units_from_project(
-                str(project), lang=lang, respect_ignore=respect_ignore
-            )
+            if lang == "all":
+                # Optimization: detect which languages are actually present
+                status.update("[bold green]Scanning project languages...")
+                target_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
+                if not target_languages:
+                    console.print("[yellow]No supported languages detected in project[/yellow]")
+                    return 0
+                if console:
+                    console.print(f"[dim]Detected languages: {', '.join(target_languages)}[/dim]")
+
+                units = []
+                for lang_name in target_languages:
+                    status.update(f"[bold green]Extracting {lang_name} code units...")
+                    units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
+            else:
+                units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
-        units = extract_units_from_project(
-            str(project), lang=lang, respect_ignore=respect_ignore
-        )
+        if lang == "all":
+            target_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
+            if not target_languages:
+                return 0
+            units = []
+            for lang_name in target_languages:
+                units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
+        else:
+            units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
 
     if not units:
         return 0
