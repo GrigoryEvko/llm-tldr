@@ -32,26 +32,6 @@ def _hash_path(path: str) -> str:
     return hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:16]
 
 
-def _find_project_root(file_path: str) -> Path:
-    """Find project root from a file path by walking up to find .git or .tldr.
-
-    This ensures daemon socket lookup works correctly for files in subdirectories.
-    """
-    current = Path(file_path).resolve()
-    if current.is_file():
-        current = current.parent
-
-    # Look for .git/ (preferred) or .tldr/
-    search = current
-    while search != search.parent:
-        if (search / ".git").is_dir() or (search / ".tldr").is_dir():
-            return search
-        search = search.parent
-
-    # No markers found - return resolved directory
-    return current
-
-
 mcp = FastMCP("tldr-code")
 
 
@@ -159,20 +139,15 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _send_raw(project: str, command: dict, timeout: float = 120.0) -> dict:
+def _send_raw(project: str, command: dict) -> dict:
     """Send command to daemon socket.
-
-    Args:
-        project: Project path for daemon socket lookup.
-        command: Command dict to send.
-        timeout: Socket timeout in seconds (default 120s for expensive ops).
 
     Raises:
         RuntimeError: With descriptive message for connection/communication failures.
     """
     socket_path = _get_socket_path(project)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    sock.settimeout(30.0)  # 30 second timeout to prevent hanging forever
     try:
         sock.connect(str(socket_path))
         sock.sendall(json.dumps(command).encode() + b"\n")
@@ -281,7 +256,7 @@ def extract(file: str) -> dict:
     Args:
         file: Path to source file
     """
-    project = str(_find_project_root(file))
+    project = str(Path(file).parent)
     return _send_command(project, {"cmd": "extract", "file": file})
 
 
@@ -338,7 +313,7 @@ def cfg(file: str, function: str, language: str = "python") -> dict:
         function: Function name to analyze
         language: Programming language
     """
-    project = str(_find_project_root(file))
+    project = str(Path(file).parent)
     return _send_command(
         project,
         {"cmd": "cfg", "file": file, "function": function, "language": language},
@@ -357,7 +332,7 @@ def dfg(file: str, function: str, language: str = "python") -> dict:
         function: Function name to analyze
         language: Programming language
     """
-    project = str(_find_project_root(file))
+    project = str(Path(file).parent)
     return _send_command(
         project,
         {"cmd": "dfg", "file": file, "function": function, "language": language},
@@ -387,7 +362,7 @@ def slice(
     Returns:
         Dict with lines in the slice and count
     """
-    project = str(_find_project_root(file))
+    project = str(Path(file).parent)
     return _send_command(
         project,
         {
@@ -478,7 +453,7 @@ def imports(file: str, language: str = "python") -> dict:
         file: Path to source file
         language: Programming language
     """
-    project = str(_find_project_root(file))
+    project = str(Path(file).parent)
     return _send_command(
         project, {"cmd": "imports", "file": file, "language": language}
     )
@@ -534,7 +509,7 @@ def diagnostics(path: str, language: str = "python") -> dict:
         path: File or directory path
         language: Programming language
     """
-    project = str(_find_project_root(path))
+    project = str(Path(path).parent) if Path(path).is_file() else path
     return _send_command(
         project, {"cmd": "diagnostics", "file": path, "language": language}
     )
