@@ -60,11 +60,11 @@ The daemon keeps indexes in memory for **100ms queries** instead of 30-second CL
 │  │   L1    │ │   L2    │ │   L3    │ │   L4    │ │   L5    │    │
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘    │
 └───────────────────────────┬──────────────────────────────────────┘
-                            │ bge-large-en-v1.5
+                            │ Qwen3-Embedding + TEI
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                    SEMANTIC INDEX                                 │
-│  1024-dim embeddings in FAISS  →  "find JWT validation"          │
+│  1024-dim embeddings in usearch  →  "find JWT validation"         │
 └───────────────────────────┬──────────────────────────────────────┘
                             │
                             ▼
@@ -86,7 +86,7 @@ Every function gets indexed with:
 - Dependencies (L5)
 - First ~10 lines of actual code
 
-This gets encoded into **1024-dimensional vectors** using `bge-large-en-v1.5`. The result: search by *what code does*, not just what it says.
+This gets encoded into **1024-dimensional vectors** using `Qwen3-Embedding-0.6B`. The result: search by *what code does*, not just what it says.
 
 ```bash
 # "validate JWT" finds verify_access_token() even without that exact text
@@ -105,7 +105,56 @@ tldr warm /path/to/project
 tldr semantic "database connection pooling" .
 ```
 
-Embedding dependencies (`sentence-transformers`, `faiss-cpu`) are included with `pip install llm-tldr`. The index is cached in `.tldr/cache/semantic.faiss`.
+Embedding dependencies (`sentence-transformers`, `usearch`, `httpx`) are included with `pip install llm-tldr`. The index is cached in `.tldr/cache/semantic/`.
+
+### High-Performance Setup with TEI Server
+
+For **2-16x faster** embeddings, run a TEI (text-embeddings-inference) server:
+
+```bash
+# Start TEI server (requires Docker/Podman with GPU support)
+docker run -d --name tei-qwen3 \
+  --gpus all \
+  -p 18080:80 \
+  -v ~/.cache/huggingface:/data \
+  ghcr.io/huggingface/text-embeddings-inference:cuda-latest \
+  --model-id Qwen/Qwen3-Embedding-0.6B \
+  --pooling last-token \
+  --auto-truncate
+
+# Configure TLDR to use it
+export TLDR_TEI_HOST=localhost
+export TLDR_TEI_PORT=18080
+
+# Now indexing and search use the high-performance server
+tldr warm .
+tldr semantic "authentication logic" .
+```
+
+**TEI Image Tags** (`ghcr.io/huggingface/text-embeddings-inference:<tag>`):
+
+| Tag | Hardware | Notes |
+|-----|----------|-------|
+| `cuda-latest` | NVIDIA Ampere 80 | A100, A30 (default CUDA) |
+| `turing-latest` | NVIDIA Turing | T4, RTX 2080 |
+| `86-latest` | NVIDIA Ampere 86 | A10, A40, RTX 3090 |
+| `89-latest` | NVIDIA Ada | RTX 4090, L4 |
+| `hopper-latest` | NVIDIA Hopper | H100, H200 |
+| `cpu-latest` | CPU only | No GPU needed |
+| `cpu-ipex-latest` | Intel CPU | Optimized with Intel Extension |
+| `xpu-ipex-latest` | Intel XPU | Intel Arc/Data Center GPU |
+| `hpu-latest` | Intel Gaudi | Habana HPU accelerators |
+| `*-grpc` | gRPC variant | Add `-grpc` suffix for gRPC API |
+
+Check your GPU: `nvidia-smi --query-gpu=name --format=csv`
+
+**Without TEI server:** Falls back to local `sentence-transformers` (slower but works everywhere).
+
+**TEI benefits:**
+- 2.4x faster on short sequences, 16x with batching
+- Rust-based server (no Python GIL)
+- Native MRL dimension truncation
+- Works with any Python version
 
 ### Keeping the Index Fresh
 

@@ -56,6 +56,8 @@ dependencies = [
     "rich>=14.2.0",
     "blake3>=1.0.0",  # 5-10x faster hashing (falls back to hashlib.md5 if unavailable)
     "orjson>=3.10.0",  # 3-10x faster JSON for IPC hot paths (falls back to stdlib json)
+    "grpcio>=1.70.0",  # gRPC client for TEI server (text-embeddings-inference)
+    "usearch>=2.0.0",  # Fast vector similarity search (replaces FAISS)
 ]
 
 [project.optional-dependencies]

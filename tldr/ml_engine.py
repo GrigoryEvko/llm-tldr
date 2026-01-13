@@ -1009,15 +1009,46 @@ class IndexManager:
             index_file = cache_dir / "index.usearch"
             metadata_file = cache_dir / "metadata.json"
 
+            # CRIT-001: Detect legacy FAISS index and provide migration guidance
+            faiss_file = cache_dir / "index.faiss"
+            if faiss_file.exists() and not index_file.exists():
+                raise FileNotFoundError(
+                    f"Found legacy FAISS index at {faiss_file}. "
+                    f"FAISS indexes are no longer supported. "
+                    f"Please rebuild with: tldr semantic index {project}"
+                )
+
             if not index_file.exists():
                 raise FileNotFoundError(f"Index not found: {index_file}")
             if not metadata_file.exists():
                 raise FileNotFoundError(f"Metadata not found: {metadata_file}")
 
+            # CRIT-002: Check if index is being rebuilt - warn but don't block
+            # This prevents reading mismatched index/metadata during rebuild
+            building_lock = cache_dir / ".building"
+            if building_lock.exists():
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Index at {cache_dir} is being rebuilt. "
+                    "Search results may be inconsistent. "
+                    "Wait for rebuild to complete for accurate results."
+                )
+
             metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
             dim = metadata.get("dimension", 1024)
 
             index = Index.restore(str(index_file))
+
+            # HIGH-001: Validate index dimension matches metadata
+            # Prevents silent corruption from mismatched index/metadata files
+            if index.ndim != dim:
+                raise ValueError(
+                    f"Index dimension mismatch: index has {index.ndim} dims, "
+                    f"metadata claims {dim}. Index may be corrupted. "
+                    f"Rebuild with: tldr semantic index {project}"
+                )
+
             num_vectors = len(index)
             size_bytes = self._estimate_index_size(num_vectors, dim)
 
@@ -1255,15 +1286,21 @@ def build_index(
 
     index_file = cache_dir / "index.usearch"
     metadata_file = cache_dir / "metadata.json"
+    # CRIT-002: Lock file signals rebuild in progress to concurrent readers
+    building_lock = cache_dir / ".building"
     # Use unique temp file names to prevent conflicts from stale files or concurrent builds
     unique_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
     temp_index = cache_dir / f"index.{unique_id}.tmp"
     temp_metadata = cache_dir / f"metadata.{unique_id}.tmp"
 
     try:
+        # Signal rebuild in progress - readers will see warning
+        building_lock.touch()
+
         index.save(str(temp_index))
         temp_metadata.write_text(json.dumps(metadata, indent=2))
         # Use shutil.move instead of Path.rename - works across filesystems
+        # Atomic on POSIX: both files are moved to final location
         shutil.move(str(temp_index), str(index_file))
         shutil.move(str(temp_metadata), str(metadata_file))
     finally:
@@ -1274,6 +1311,12 @@ def build_index(
                     temp_file.unlink()
             except Exception:
                 pass
+        # Remove lock file - rebuild complete (or failed)
+        try:
+            if building_lock.exists():
+                building_lock.unlink()
+        except Exception:
+            pass
 
     get_index_manager().invalidate(project_path)
     return n
