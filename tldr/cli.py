@@ -34,6 +34,39 @@ from . import __version__
 from .languages import EXTENSION_TO_LANGUAGE, detect_language_with_default
 
 
+def _validate_path(
+    path: str,
+    must_exist: bool = True,
+    must_be_file: bool = False,
+    must_be_dir: bool = False,
+) -> Path:
+    """Validate a path with consistent error handling.
+
+    Args:
+        path: Path string to validate
+        must_exist: If True, path must exist on filesystem
+        must_be_file: If True, path must be a file (not directory)
+        must_be_dir: If True, path must be a directory (not file)
+
+    Returns:
+        Path object if valid
+
+    Raises:
+        SystemExit: If validation fails (prints error to stderr)
+    """
+    p = Path(path)
+    if must_exist and not p.exists():
+        print(f"Error: Path not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    if must_be_file and not p.is_file():
+        print(f"Error: Not a file: {path}", file=sys.stderr)
+        sys.exit(1)
+    if must_be_dir and not p.is_dir():
+        print(f"Error: Not a directory: {path}", file=sys.stderr)
+        sys.exit(1)
+    return p
+
+
 def _get_subprocess_detach_kwargs() -> dict:
     """Get platform-specific kwargs for detaching subprocess."""
     import subprocess
@@ -264,7 +297,7 @@ Semantic Search:
     struct_p.add_argument("path", nargs="?", default=".", help="Directory to analyze")
     struct_p.add_argument(
         "--lang",
-        default="python",
+        default=None,
         choices=[
             "python",
             "typescript",
@@ -283,7 +316,7 @@ Semantic Search:
             "lua",
             "elixir",
         ],
-        help="Language to analyze",
+        help="Language to analyze (auto-detected if not specified)",
     )
     struct_p.add_argument(
         "--max", type=int, default=50, help="Max files to analyze (default: 50)"
@@ -347,7 +380,7 @@ Semantic Search:
     ctx_p.add_argument("--depth", type=int, default=2, help="Call depth (default: 2)")
     ctx_p.add_argument(
         "--lang",
-        default="python",
+        default=None,
         choices=[
             "python",
             "typescript",
@@ -366,7 +399,7 @@ Semantic Search:
             "lua",
             "elixir",
         ],
-        help="Language",
+        help="Language (auto-detected if not specified)",
     )
 
     # tldr cfg <file> <function>
@@ -913,19 +946,28 @@ Semantic Search:
 
     try:
         if args.command == "tree":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             ext = set(args.ext) if args.ext else None
             result = get_file_tree(
                 args.path, extensions=ext, exclude_hidden=not args.show_hidden
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "structure":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.path)
+            respect_ignore = not getattr(args, "no_ignore", False)
             result = get_code_structure(
-                args.path, language=args.lang, max_results=args.max
+                args.path,
+                language=lang,
+                max_results=args.max,
+                respect_ignore=respect_ignore,
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "search":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             ext = set(args.ext) if args.ext else None
             result = api_search(
                 args.pattern,
@@ -935,9 +977,10 @@ Semantic Search:
                 max_results=args.max,
                 max_files=args.max_files,
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "extract":
+            _validate_path(args.file, must_exist=True, must_be_file=True)
             result = extract_file(args.file)
 
             # Apply filters if specified
@@ -986,11 +1029,14 @@ Semantic Search:
                     if filter_class:
                         result["functions"] = []
 
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "context":
+            _validate_path(args.project, must_exist=True, must_be_dir=True)
+            # Auto-detect language if not specified
+            lang = args.lang or _detect_project_language(args.project)
             ctx = get_relevant_context(
-                args.project, args.entry, depth=args.depth, language=args.lang
+                args.project, args.entry, depth=args.depth, language=lang
             )
             # Output LLM-ready string directly
             print(ctx.to_llm_string())
@@ -1001,7 +1047,7 @@ Semantic Search:
                 sys.exit(1)
             lang = args.lang or detect_language_with_default(args.file)
             result = get_cfg_context(args.file, args.function, language=lang)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "dfg":
             if not Path(args.file).exists():
@@ -1009,9 +1055,10 @@ Semantic Search:
                 sys.exit(1)
             lang = args.lang or detect_language_with_default(args.file)
             result = get_dfg_context(args.file, args.function, language=lang)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "slice":
+            _validate_path(args.file, must_exist=True, must_be_file=True)
             lang = args.lang or detect_language_with_default(args.file)
             lines = get_slice(
                 args.file,
@@ -1022,9 +1069,10 @@ Semantic Search:
                 language=lang,
             )
             result = {"lines": sorted(lines), "count": len(lines)}
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "calls":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             # Find project root for consistent cache handling
             # This allows `tldr calls src/` to work the same as `tldr calls .`
             project_root = _find_project_root(args.path)
@@ -1063,9 +1111,10 @@ Semantic Search:
                 ],
                 "count": len(edges),
             }
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "impact":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             # Auto-detect language if not specified
             lang = args.lang or _detect_project_language(args.path)
             result = analyze_impact(
@@ -1075,9 +1124,10 @@ Semantic Search:
                 target_file=args.file,
                 language=lang,
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "dead":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             # Auto-detect language if not specified
             lang = args.lang or _detect_project_language(args.path)
             result = analyze_dead_code(
@@ -1085,31 +1135,26 @@ Semantic Search:
                 entry_points=args.entry if args.entry else None,
                 language=lang,
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "arch":
+            _validate_path(args.path, must_exist=True, must_be_dir=True)
             # Auto-detect language if not specified
             lang = args.lang or _detect_project_language(args.path)
             result = analyze_architecture(args.path, language=lang)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "imports":
-            file_path = Path(args.file).resolve()
-            if not file_path.exists():
-                print(f"Error: File not found: {args.file}", file=sys.stderr)
-                sys.exit(1)
+            file_path = _validate_path(args.file, must_exist=True, must_be_file=True).resolve()
             lang = args.lang or detect_language_with_default(args.file)
             result = get_imports(str(file_path), language=lang)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "importers":
             # Find all files that import the given module
             from .daemon.cached_queries import module_matches
 
-            project = Path(args.path).resolve()
-            if not project.exists():
-                print(f"Error: Path not found: {args.path}", file=sys.stderr)
-                sys.exit(1)
+            project = _validate_path(args.path, must_exist=True, must_be_dir=True).resolve()
 
             # Auto-detect language if not specified
             lang = args.lang or _detect_project_language(args.path)
@@ -1138,7 +1183,7 @@ Semantic Search:
                     # Skip files that can't be parsed
                     pass
 
-            print(json.dumps({"module": args.module, "importers": importers}, indent=2))
+            print(json.dumps({"module": args.module, "importers": importers}, indent=2, ensure_ascii=False))
 
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
@@ -1171,7 +1216,7 @@ Semantic Search:
                 print(f"Running: {shlex.join(cmd)}", file=sys.stderr)
                 sp.run(cmd)  # No shell=True - safe from injection
             else:
-                print(json.dumps(result, indent=2))
+                print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "diagnostics":
             from .diagnostics import (
@@ -1201,7 +1246,7 @@ Semantic Search:
             if args.format == "text":
                 print(format_diagnostics_for_llm(result))
             else:
-                print(json.dumps(result, indent=2))
+                print(json.dumps(result, indent=2, ensure_ascii=False))
 
         elif args.command == "warm":
             import subprocess
@@ -1253,26 +1298,26 @@ Semantic Search:
                 combined_edges = []
                 processed_languages = []
 
-                for lang in target_languages:
+                for target_lang in target_languages:
                     try:
                         # Scan files
-                        files = scan_project(project_path, language=lang, respect_ignore=respect_ignore)
+                        files = scan_project(project_path, language=target_lang, respect_ignore=respect_ignore)
                         all_files.update(files)
 
                         # Build graph
-                        graph = build_project_call_graph(project_path, language=lang)
+                        graph = build_project_call_graph(project_path, language=target_lang)
                         combined_edges.extend([
                             {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
                             for e in graph.edges
                         ])
-                        print(f"Processed {lang}: {len(files)} files, {len(graph.edges)} edges")
-                        processed_languages.append(lang)
+                        print(f"Processed {target_lang}: {len(files)} files, {len(graph.edges)} edges")
+                        processed_languages.append(target_lang)
                     except ValueError as e:
                         # Expected for unsupported languages
-                        print(f"Warning: {lang}: {e}", file=sys.stderr)
+                        print(f"Warning: {target_lang}: {e}", file=sys.stderr)
                     except Exception as e:
                         # Unexpected error - show traceback if debug enabled
-                        print(f"Warning: Failed to process {lang}: {e}", file=sys.stderr)
+                        print(f"Warning: Failed to process {target_lang}: {e}", file=sys.stderr)
                         if os.environ.get("TLDR_DEBUG"):
                             import traceback
                             traceback.print_exc()
@@ -1337,7 +1382,7 @@ Semantic Search:
                     expand_graph=args.expand,
                     backend=args.backend,
                 )
-                print(json.dumps(results, indent=2))
+                print(json.dumps(results, indent=2, ensure_ascii=False))
 
             elif args.action == "warmup":
                 from .ml_engine import get_model_manager, DEFAULT_MODEL
@@ -1346,7 +1391,7 @@ Semantic Search:
                 model = args.model or DEFAULT_MODEL
                 mm.load(model)
                 result = mm.warmup()
-                print(json.dumps(result, indent=2))
+                print(json.dumps(result, indent=2, ensure_ascii=False))
 
             elif args.action == "unload":
                 from .ml_engine import get_model_manager
@@ -1364,7 +1409,7 @@ Semantic Search:
                     im.clear()
                     print("Index cache cleared")
                 elif args.cache_action == "stats":
-                    print(json.dumps(im.stats(), indent=2))
+                    print(json.dumps(im.stats(), indent=2, ensure_ascii=False))
                 elif args.cache_action == "invalidate":
                     project_path = Path(args.path).resolve()
                     im.invalidate(str(project_path))
@@ -1388,14 +1433,14 @@ Semantic Search:
                     "supports_bf16": dev.supports_bf16,
                     "tei_available": check_tei_available(),
                 }
-                print(json.dumps(info, indent=2))
+                print(json.dumps(info, indent=2, ensure_ascii=False))
 
             elif args.action == "memory":
                 from .ml_engine import get_model_manager
 
                 mm = get_model_manager()
                 stats = mm.memory_stats()
-                print(json.dumps(stats, indent=2))
+                print(json.dumps(stats, indent=2, ensure_ascii=False))
 
         elif args.command == "doctor":
             import shutil
@@ -1527,17 +1572,36 @@ Semantic Search:
                     )
                     sys.exit(1)
 
-                cmd = INSTALL_COMMANDS[lang]
-                print(f"Installing tools for {lang}: {' '.join(cmd)}")
-                try:
-                    subprocess.run(cmd, check=True)
-                    print(f"✓ Installed {lang} tools")
-                except subprocess.CalledProcessError as e:
-                    print(f"✗ Install failed: {e}", file=sys.stderr)
-                    sys.exit(1)
-                except FileNotFoundError:
-                    print(f"✗ Command not found: {cmd[0]}", file=sys.stderr)
-                    sys.exit(1)
+                # Check which tools are already installed
+                tools_info = TOOL_INFO.get(lang, {})
+                tool_names = []
+                if tools_info.get("type_checker"):
+                    tool_names.append(tools_info["type_checker"][0])
+                if tools_info.get("linter"):
+                    tool_names.append(tools_info["linter"][0])
+
+                missing_tools = []
+                for tool in tool_names:
+                    if shutil.which(tool):
+                        print(f"  Already installed: {tool}")
+                    else:
+                        missing_tools.append(tool)
+
+                if not missing_tools:
+                    print(f"All tools for {lang} are already installed")
+                else:
+                    print(f"Missing tools: {', '.join(missing_tools)}")
+                    cmd = INSTALL_COMMANDS[lang]
+                    print(f"Installing tools for {lang}: {' '.join(cmd)}")
+                    try:
+                        subprocess.run(cmd, check=True)
+                        print(f"Installed {lang} tools")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Install failed: {e}", file=sys.stderr)
+                        sys.exit(1)
+                    except FileNotFoundError:
+                        print(f"Command not found: {cmd[0]}", file=sys.stderr)
+                        sys.exit(1)
             else:
                 # Check all tools
                 results = {}
@@ -1567,7 +1631,7 @@ Semantic Search:
                     results[lang] = lang_result
 
                 if args.json:
-                    print(json.dumps(results, indent=2))
+                    print(json.dumps(results, indent=2, ensure_ascii=False))
                 else:
                     print("TLDR Diagnostics Check")
                     print("=" * 50)
@@ -1641,7 +1705,7 @@ Semantic Search:
             elif args.action == "query":
                 try:
                     result = query_daemon(project_path, {"cmd": args.cmd})
-                    print(json.dumps(result, indent=2))
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
                 except (ConnectionRefusedError, FileNotFoundError):
                     print("Error: Daemon not running", file=sys.stderr)
                     sys.exit(1)

@@ -17,6 +17,69 @@ _tokenizer: Optional[Any] = None
 _tokenizer_lock = threading.Lock()
 
 
+def estimate_tokens_fallback(text: str) -> int:
+    """Estimate tokens when tokenizer unavailable.
+
+    Uses character-type heuristics for better accuracy than simple len//4.
+    Different character types have different token densities:
+    - ASCII/code: ~4 chars per token
+    - CJK characters: ~1.5 chars per token (each ideograph often = 1 token)
+    - Emoji: ~3 tokens per emoji
+    - Other Unicode: ~2 chars per token
+
+    Args:
+        text: Text to estimate token count for.
+
+    Returns:
+        Estimated number of tokens (minimum 1 for non-empty text).
+    """
+    if not text:
+        return 0
+
+    ascii_chars = 0
+    cjk_chars = 0
+    emoji_chars = 0
+    other_chars = 0
+
+    for char in text:
+        code = ord(char)
+        if code < 128:
+            # ASCII (includes code, English text)
+            ascii_chars += 1
+        elif (0x4E00 <= code <= 0x9FFF or      # CJK Unified Ideographs
+              0x3400 <= code <= 0x4DBF or      # CJK Extension A
+              0x20000 <= code <= 0x2A6DF or    # CJK Extension B
+              0x2A700 <= code <= 0x2B73F or    # CJK Extension C
+              0x2B740 <= code <= 0x2B81F or    # CJK Extension D
+              0xF900 <= code <= 0xFAFF or      # CJK Compatibility
+              0x3000 <= code <= 0x303F or      # CJK Punctuation
+              0x3040 <= code <= 0x309F or      # Hiragana
+              0x30A0 <= code <= 0x30FF or      # Katakana
+              0xAC00 <= code <= 0xD7AF):       # Korean Hangul
+            cjk_chars += 1
+        elif (0x1F300 <= code <= 0x1F9FF or    # Misc Symbols and Pictographs, Emoticons
+              0x1FA00 <= code <= 0x1FA6F or    # Chess Symbols, Extended-A
+              0x1F600 <= code <= 0x1F64F or    # Emoticons
+              0x2600 <= code <= 0x26FF or      # Misc Symbols
+              0x2700 <= code <= 0x27BF or      # Dingbats
+              0xFE00 <= code <= 0xFE0F or      # Variation Selectors
+              0x1F000 <= code <= 0x1F02F):     # Mahjong, Dominos
+            emoji_chars += 1
+        else:
+            # Other Unicode (extended Latin, Cyrillic, Arabic, etc.)
+            other_chars += 1
+
+    # Estimate tokens by character type density
+    estimated = (
+        ascii_chars / 4.0 +      # ~4 ASCII chars per token
+        cjk_chars * 1.5 +        # Each CJK char often = 1-2 tokens
+        emoji_chars * 3.0 +      # Emoji = 2-4 tokens each
+        other_chars / 2.0        # Other Unicode ~2 chars per token
+    )
+
+    return max(1, int(estimated))
+
+
 def get_tokenizer() -> Optional[Any]:
     """Get or create the Qwen3 tokenizer.
 
@@ -42,8 +105,8 @@ def get_tokenizer() -> Optional[Any]:
 def count_tokens(text: str) -> int:
     """Count tokens in text using Qwen3 tokenizer.
 
-    Falls back to character-based estimation (~4 chars per token) when
-    the tokenizer is unavailable.
+    Falls back to character-type aware estimation when the tokenizer
+    is unavailable (handles CJK, emoji, and other Unicode correctly).
 
     Args:
         text: Text to count tokens for.
@@ -66,8 +129,8 @@ def count_tokens(text: str) -> int:
         except Exception:
             pass
 
-    # Fallback: ~4 chars per token for code
-    return len(text) // 4
+    # Fallback: character-type aware estimation
+    return estimate_tokens_fallback(text)
 
 
 def truncate_to_tokens(text: str, max_tokens: int) -> str:

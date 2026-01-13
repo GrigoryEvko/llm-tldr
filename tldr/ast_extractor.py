@@ -35,6 +35,7 @@ class FunctionInfo:
     is_async: bool = False
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
+    end_line_number: int | None = None  # End line for precise code extraction
     language: str = "python"
 
     def signature(self) -> str:
@@ -104,6 +105,7 @@ class ClassInfo:
     methods: list[FunctionInfo] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
+    end_line_number: int | None = None  # End line for precise code extraction
     language: str = "python"
 
     def signature(self) -> str:
@@ -214,6 +216,7 @@ class ModuleInfo:
                 {
                     "name": c.name,
                     "line_number": c.line_number,
+                    "end_line_number": c.end_line_number,
                     "signature": c.signature(),
                     "bases": c.bases,
                     "docstring": c.docstring,
@@ -222,6 +225,7 @@ class ModuleInfo:
                         {
                             "name": m.name,
                             "line_number": m.line_number,
+                            "end_line_number": m.end_line_number,
                             "signature": m.signature(),
                             "params": m.params,
                             "return_type": m.return_type,
@@ -238,6 +242,7 @@ class ModuleInfo:
                 {
                     "name": f.name,
                     "line_number": f.line_number,
+                    "end_line_number": f.end_line_number,
                     "signature": f.signature(),
                     "params": f.params,
                     "return_type": f.return_type,
@@ -430,6 +435,7 @@ class PythonASTExtractor:
             docstring=ast.get_docstring(node),
             decorators=decorators,
             line_number=node.lineno,
+            end_line_number=getattr(node, "end_lineno", None),  # Python 3.8+ provides end line
         )
 
         # Extract methods and nested classes
@@ -473,6 +479,7 @@ class PythonASTExtractor:
                             ]
                             + method.decorators,
                             line_number=method.line_number,
+                            end_line_number=method.end_line_number,
                         )
                         module_info.functions.append(nested_method)
 
@@ -547,6 +554,7 @@ class PythonASTExtractor:
             is_async=isinstance(node, ast.AsyncFunctionDef),
             decorators=decorators,
             line_number=node.lineno,
+            end_line_number=getattr(node, "end_lineno", None),  # Python 3.8+ provides end line
         )
 
     def _extract_params(self, args: ast.arguments) -> list[str]:

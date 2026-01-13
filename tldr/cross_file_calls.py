@@ -4,7 +4,20 @@ Cross-file call graph resolution.
 Builds a project-wide call graph that resolves function calls across files
 by analyzing import statements and matching call sites to definitions.
 
-Supports: Python (.py), TypeScript (.ts, .tsx), Go (.go), and Rust (.rs)
+Supported languages for call graph analysis (SUPPORTED_CALL_GRAPH_LANGUAGES):
+- Python (.py)
+- TypeScript (.ts, .tsx)
+- Go (.go)
+- Rust (.rs)
+- Java (.java)
+- C (.c, .h)
+
+File discovery (scan_project) supports all languages in SUPPORTED_LANGUAGES:
+python, typescript, javascript, go, rust, java, c, cpp, kotlin, scala,
+csharp, php, ruby, swift, lua, elixir.
+
+Note: Languages not in SUPPORTED_CALL_GRAPH_LANGUAGES can be scanned for
+file discovery, but call graph analysis will raise ValueError.
 
 Key functions:
 - scan_project(root, language) - find all source files in a project
@@ -57,7 +70,39 @@ LANGUAGE_CONFIG: dict[str, tuple[str, str]] = {
     "swift": ("tree_sitter_swift", "language"),
     "csharp": ("tree_sitter_c_sharp", "language"),
     "cpp": ("tree_sitter_cpp", "language"),
+    "kotlin": ("tree_sitter_kotlin", "language"),
+    "scala": ("tree_sitter_scala", "language"),
 }
+
+# Supported languages for file discovery (used by scan_project).
+# Single source of truth for language -> file extensions mapping.
+# Must be kept in sync with LANGUAGE_CONFIG above.
+SUPPORTED_LANGUAGES: dict[str, set[str]] = {
+    "python": {".py"},
+    "typescript": {".ts", ".tsx"},
+    "javascript": {".js", ".jsx"},
+    "go": {".go"},
+    "rust": {".rs"},
+    "java": {".java"},
+    "c": {".c", ".h"},
+    "cpp": {".cpp", ".cc", ".cxx", ".hpp"},
+    "kotlin": {".kt", ".kts"},
+    "scala": {".scala", ".sc"},
+    "csharp": {".cs"},
+    "php": {".php"},
+    "ruby": {".rb"},
+    "swift": {".swift"},
+    "lua": {".lua"},
+    "elixir": {".ex", ".exs"},
+}
+
+# Languages with full call graph support (have indexing + call graph building).
+# scan_project() supports more languages for file discovery, but call graph
+# analysis requires language-specific AST traversal that's only implemented
+# for these languages. Others will fail fast with a clear error.
+SUPPORTED_CALL_GRAPH_LANGUAGES: frozenset[str] = frozenset({
+    "python", "typescript", "go", "rust", "java", "c"
+})
 
 
 def get_parser(language: str) -> Optional["tree_sitter.Parser"]:
@@ -172,13 +217,18 @@ def scan_project(
 
     Args:
         root: Project root directory
-        language: "python", "typescript", "go", or "rust"
+        language: One of the languages in SUPPORTED_LANGUAGES (python, typescript,
+                 javascript, go, rust, java, c, cpp, kotlin, scala, csharp, php,
+                 ruby, swift, lua, elixir)
         workspace_config: Optional WorkspaceConfig for monorepo scoping.
                          If provided, filters files by activePackages and excludePatterns.
         respect_ignore: If True, respect .tldrignore patterns (default True)
 
     Returns:
         List of absolute paths to source files
+
+    Raises:
+        ValueError: If language is not in SUPPORTED_LANGUAGES
     """
     from .tldrignore import load_ignore_patterns, should_ignore
 
@@ -188,32 +238,13 @@ def scan_project(
     # Load ignore patterns if respecting .tldrignore
     ignore_spec = load_ignore_patterns(root_str) if respect_ignore else None
 
-    if language == "python":
-        extensions = {".py"}
-    elif language == "typescript":
-        extensions = {".ts", ".tsx"}
-    elif language == "go":
-        extensions = {".go"}
-    elif language == "rust":
-        extensions = {".rs"}
-    elif language == "java":
-        extensions = {".java"}
-    elif language == "c":
-        extensions = {".c", ".h"}
-    elif language == "ruby":
-        extensions = {".rb"}
-    elif language == "php":
-        extensions = {".php"}
-    elif language == "kotlin":
-        extensions = {".kt", ".kts"}
-    elif language == "swift":
-        extensions = {".swift"}
-    elif language == "csharp":
-        extensions = {".cs"}
-    elif language == "scala":
-        extensions = {".scala", ".sc"}
-    else:
-        raise ValueError(f"Unsupported language: {language}")
+    # Look up extensions from single source of truth
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Unsupported language: {language}. "
+            f"Supported: {sorted(SUPPORTED_LANGUAGES.keys())}"
+        )
+    extensions = SUPPORTED_LANGUAGES[language]
 
     for dirpath, dirnames, filenames in os.walk(root_str):
         # Skip ignored directories (modifying dirnames in-place prunes os.walk)
@@ -264,7 +295,7 @@ def parse_imports(file_path: str | Path) -> list[dict]:
     """
     file_path = Path(file_path)
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8-sig", errors="replace")
         tree = ast.parse(source)
     except (SyntaxError, FileNotFoundError):
         return []
@@ -283,19 +314,27 @@ def parse_imports(file_path: str | Path) -> list[dict]:
                     }
                 )
         elif isinstance(node, ast.ImportFrom):
-            if node.module:
+            # Handle both 'from .module import x' (module='module', level=1)
+            # and 'from . import x' (module=None, level=1)
+            if node.module or node.level > 0:
                 names = []
                 aliases = {}
                 for alias in node.names:
                     names.append(alias.name)
                     if alias.asname:
                         aliases[alias.asname] = alias.name
+                # Build module name with relative import prefix
+                # e.g., level=2, module='utils' -> '..utils'
+                # e.g., level=1, module=None -> '.'
+                prefix = "." * node.level
+                module_name = prefix + (node.module or "")
                 imports.append(
                     {
-                        "module": node.module,
+                        "module": module_name,
                         "names": names,
                         "is_from": True,
                         "aliases": aliases,
+                        "level": node.level,  # For downstream resolution
                     }
                 )
 
@@ -476,7 +515,8 @@ def parse_rust_imports(file_path: str | Path) -> list[dict]:
         file_path: Path to Rust file
 
     Returns:
-        List of import info dicts with keys: module, names, is_mod
+        List of import info dicts with keys: module, names, aliases, is_mod
+        - aliases: Dict mapping alias -> original_name for 'as' renames
     """
     file_path = Path(file_path)
     parser = get_parser("rust")
@@ -528,7 +568,14 @@ def parse_rust_imports(file_path: str | Path) -> list[dict]:
 
 
 def _parse_rust_use_node(node, source: bytes) -> dict | None:
-    """Parse a single Rust use statement."""
+    """Parse a single Rust use statement.
+
+    Returns dict with keys:
+        module: The module path (e.g., "crate::utils")
+        names: List of imported names (original names, not aliases)
+        aliases: Dict mapping alias -> original_name for 'as' renames
+        is_mod: Always False for use statements
+    """
     # Get the full use path text
     text = source[node.start_byte : node.end_byte].decode("utf-8")
 
@@ -545,29 +592,45 @@ def _parse_rust_use_node(node, source: bytes) -> dict | None:
     #   crate::utils::helper -> module="crate::utils", names=["helper"]
     #   self::inner::*       -> module="self::inner", names=["*"]
     #   std::collections::{HashMap, HashSet} -> module="std::collections", names=["HashMap", "HashSet"]
+    #   crate::foo as bar    -> module="crate", names=["foo"], aliases={"bar": "foo"}
 
-    names = []
+    raw_names = []
     module = text
 
     # Handle glob imports: use foo::*
     if text.endswith("::*"):
         module = text[:-3]
-        names = ["*"]
+        raw_names = ["*"]
     # Handle grouped imports: use foo::{bar, baz}
     elif "{" in text:
         brace_start = text.index("{")
         module = text[:brace_start].rstrip("::")
         brace_content = text[brace_start + 1 : text.rindex("}")]
-        names = [n.strip() for n in brace_content.split(",")]
-    # Handle simple imports: use foo::bar
+        raw_names = [n.strip() for n in brace_content.split(",")]
+    # Handle simple imports: use foo::bar or use foo::bar as baz
     elif "::" in text:
         parts = text.rsplit("::", 1)
         module = parts[0]
-        names = [parts[1]]
+        raw_names = [parts[1]]
+
+    # Process names to extract 'as' aliases
+    # e.g., "foo as bar" -> name="foo", alias="bar"
+    names = []
+    aliases = {}
+    for raw_name in raw_names:
+        if " as " in raw_name:
+            orig_name, alias = raw_name.split(" as ", 1)
+            orig_name = orig_name.strip()
+            alias = alias.strip()
+            names.append(orig_name)
+            aliases[alias] = orig_name
+        else:
+            names.append(raw_name.strip())
 
     return {
         "module": module,
         "names": names,
+        "aliases": aliases,
         "is_mod": False,
     }
 
@@ -810,7 +873,16 @@ def build_function_index(
 
     Returns:
         Dict mapping (module, func_name) tuples to relative file paths
+
+    Raises:
+        ValueError: If language is not supported for call graph analysis.
     """
+    if language not in SUPPORTED_CALL_GRAPH_LANGUAGES:
+        raise ValueError(
+            f"Call graph analysis not supported for '{language}'. "
+            f"Supported languages: {sorted(SUPPORTED_CALL_GRAPH_LANGUAGES)}"
+        )
+
     root = Path(root)
     index: dict = {}
 
@@ -876,7 +948,7 @@ def _index_python_file(
 ):
     """Index functions and classes from a Python file."""
     try:
-        source = src_path.read_text(encoding="utf-8", errors="replace")
+        source = src_path.read_text(encoding="utf-8-sig", errors="replace")
         tree = ast.parse(source)
     except (SyntaxError, FileNotFoundError):
         return
@@ -1336,7 +1408,7 @@ def _extract_file_calls(
         call_type is 'direct', 'attr', or 'intra'
     """
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8-sig", errors="replace")
         tree = ast.parse(source)
     except (SyntaxError, FileNotFoundError):
         return {}
@@ -2035,7 +2107,16 @@ def build_project_call_graph(
 
     Returns:
         ProjectCallGraph with edges as (src_file, src_func, dst_file, dst_func)
+
+    Raises:
+        ValueError: If language is not supported for call graph analysis.
     """
+    if language not in SUPPORTED_CALL_GRAPH_LANGUAGES:
+        raise ValueError(
+            f"Call graph analysis not supported for '{language}'. "
+            f"Supported languages: {sorted(SUPPORTED_CALL_GRAPH_LANGUAGES)}"
+        )
+
     root = Path(root)
     graph = ProjectCallGraph()
 
@@ -2179,6 +2260,15 @@ def _build_python_call_graph(
         for imp in imports:
             if imp["is_from"]:
                 module = imp["module"]
+                level = imp.get("level", 0)
+                # Resolve relative imports to absolute module paths
+                if level > 0:
+                    # Strip leading dots from module for resolution
+                    module_without_dots = module.lstrip(".")
+                    resolved = _resolve_python_relative_import(
+                        rel_path, module_without_dots, level, str(root)
+                    )
+                    module = resolved
                 aliases = imp.get("aliases", {})
                 for name in imp["names"]:
                     alias = None
@@ -2382,6 +2472,67 @@ def _resolve_ts_import(from_file: str, import_path: str, root: str = "") -> str:
                 return str(candidate.relative_to(root_path))
 
     return resolved
+
+
+@lru_cache(maxsize=1024)
+def _resolve_python_relative_import(
+    from_file: str, import_module: str, level: int, root: str = ""
+) -> str:
+    """Resolve a Python relative import to a module path.
+
+    Handles Python's relative import semantics:
+    - level=1 (from . import x): import from same package
+    - level=2 (from .. import x): import from parent package
+    - level=N: go up N-1 directories from current file's package
+
+    Args:
+        from_file: The file containing the import (relative path)
+        import_module: The module part after dots (e.g., 'utils' from 'from .utils import')
+        level: Number of dots (1 for '.', 2 for '..', etc.)
+        root: Project root for file existence checks
+
+    Returns:
+        Resolved module path (e.g., 'pkg.subpkg.utils') or original if not relative
+    """
+    if level == 0:
+        # Absolute import - return as-is
+        return import_module
+
+    # Get directory parts from the importing file
+    from_path = Path(from_file)
+    parts = list(from_path.parts[:-1])  # Remove filename
+
+    # Go up (level - 1) directories for relative import
+    # level=1 means current package, level=2 means parent package
+    for _ in range(level - 1):
+        if parts:
+            parts.pop()
+
+    # Add the import module to the path
+    if import_module:
+        parts.extend(import_module.split("."))
+
+    # Build the resolved module name
+    resolved_module = ".".join(parts) if parts else import_module
+
+    # Verify file exists if root provided
+    if root and resolved_module:
+        root_path = Path(root)
+        # Try as a module file
+        module_file = root_path / "/".join(parts)
+        candidates = [
+            module_file.with_suffix(".py"),
+            module_file / "__init__.py",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                # Return relative path stem as module name
+                rel = candidate.relative_to(root_path)
+                if rel.name == "__init__.py":
+                    return ".".join(rel.parts[:-1])
+                return ".".join(rel.parts[:-1]) + "." + rel.stem if rel.parts[:-1] else rel.stem
+
+    return resolved_module
 
 
 def _build_name_to_files_index(func_index: dict) -> dict:
@@ -2604,12 +2755,19 @@ def _build_rust_call_graph(
                 # use declaration
                 # Resolve crate::, self::, super:: prefixes
                 resolved_module = _resolve_rust_module(module, rel_path, root)
+                aliases = imp.get("aliases", {})
 
                 for name in names:
                     if name == "*":
                         # Glob import - can't resolve specific names
                         continue
+                    # Map original name to itself
                     import_map[name] = (resolved_module, name)
+
+                # Also map aliases to their original names
+                # e.g., `use crate::foo as bar;` -> import_map['bar'] = (module, 'foo')
+                for alias, orig_name in aliases.items():
+                    import_map[alias] = (resolved_module, orig_name)
 
         # Get calls from this file
         calls_by_func = _extract_rust_file_calls(rs_path, root)

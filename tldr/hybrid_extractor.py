@@ -841,6 +841,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="typescript",
         )
 
@@ -917,6 +918,7 @@ class HybridExtractor:
             docstring=class_docstring,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="typescript",
         )
 
@@ -1128,6 +1130,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="go",
         )
 
@@ -1172,6 +1175,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="go",
         )
 
@@ -1245,6 +1249,7 @@ class HybridExtractor:
                                             docstring=None,
                                             is_method=True,
                                             line_number=iface_child.start_point[0] + 1,
+                                            end_line_number=iface_child.end_point[0] + 1,
                                             language="go",
                                         )
                                     )
@@ -1258,6 +1263,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="go",
         )
 
@@ -1418,6 +1424,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="rust",
         )
 
@@ -1451,6 +1458,7 @@ class HybridExtractor:
             docstring=None,
             methods=[],
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="rust",
         )
 
@@ -1479,6 +1487,7 @@ class HybridExtractor:
                                 docstring=None,
                                 is_method=True,
                                 line_number=item.start_point[0] + 1,
+                                end_line_number=item.end_point[0] + 1,
                                 language="rust",
                             )
                         )
@@ -1492,6 +1501,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="rust",
         )
 
@@ -1737,6 +1747,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="java",
         )
 
@@ -1773,6 +1784,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="java",
         )
 
@@ -1810,6 +1822,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="java",
         )
 
@@ -1833,6 +1846,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="java",
         )
 
@@ -2036,6 +2050,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="c",
         )
 
@@ -2241,6 +2256,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="cpp",
         )
 
@@ -2397,6 +2413,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="ruby",
         )
 
@@ -2457,6 +2474,7 @@ class HybridExtractor:
             bases=[superclass] if superclass else [],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="ruby",
         )
 
@@ -2648,6 +2666,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="kotlin",
         )
 
@@ -2694,6 +2713,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="kotlin",
         )
 
@@ -2885,6 +2905,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="swift",
         )
 
@@ -2918,6 +2939,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="swift",
         )
 
@@ -3043,6 +3065,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="csharp",
         )
 
@@ -3083,6 +3106,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="csharp",
         )
 
@@ -3229,6 +3253,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="scala",
         )
 
@@ -3278,6 +3303,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="scala",
         )
 
@@ -3449,6 +3475,7 @@ class HybridExtractor:
             return_type=None,  # Lua is dynamically typed
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="lua",
         )
 
@@ -3641,6 +3668,7 @@ class HybridExtractor:
             return_type=None,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line_number=node.end_point[0] + 1,
             language="elixir",
         )
 

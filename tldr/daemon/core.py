@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Optional
 
@@ -74,7 +75,43 @@ IDLE_TIMEOUT = 30 * 60
 # infinite data without newline terminator
 MAX_REQUEST_SIZE = 10 * 1024 * 1024
 
+# DA-7 FIX: Maximum concurrent connections - prevents resource exhaustion
+# from connection floods or misbehaving clients. 100 is generous for a
+# local daemon; typical usage is 1-5 concurrent connections.
+MAX_CONNECTIONS = 100
+
 logger = logging.getLogger(__name__)
+
+# DA-1 FIX: Track all daemon instances for proper atexit cleanup.
+# WeakSet automatically removes instances when they are garbage collected,
+# preventing memory leaks while ensuring all live instances get cleaned up.
+_daemon_instances: weakref.WeakSet["TLDRDaemon"] = weakref.WeakSet()
+_cleanup_registered: bool = False
+
+
+def _cleanup_all_daemons() -> None:
+    """Clean up all daemon instances at program exit.
+
+    Iterates through all live daemon instances and calls their cleanup methods.
+    Each instance has idempotency guards (_stats_persisted, _model_unloaded)
+    so double-cleanup is safe.
+
+    This fixes DA-1: Previously only the first instance's handlers were registered,
+    causing stats loss for subsequent daemon instances.
+    """
+    # Convert to list to avoid set modification during iteration
+    # (though WeakSet handles this gracefully, explicit is better)
+    for daemon in list(_daemon_instances):
+        try:
+            daemon._persist_all_stats()
+        except Exception:
+            # Don't raise in atexit - log and continue to next instance
+            logger.debug(f"Failed to persist stats for {daemon.project}")
+        try:
+            daemon._unload_model()
+        except Exception:
+            # Don't raise in atexit - log and continue to next instance
+            logger.debug(f"Failed to unload model for {daemon.project}")
 
 
 class TLDRDaemon:
@@ -84,10 +121,6 @@ class TLDRDaemon:
     Listens on a Unix socket for commands and responds with JSON.
     Automatically shuts down after IDLE_TIMEOUT seconds of inactivity.
     """
-
-    # Class-level flag to prevent memory leak from repeated atexit registrations
-    # (CRIT-008: each instance was registering new handlers, accumulating unboundedly)
-    _atexit_registered: bool = False
 
     def __init__(self, project_path: Path):
         """
@@ -151,12 +184,22 @@ class TLDRDaemon:
         self._stats_persisted = False  # Guard against double-persist
         self._model_unloaded = False  # Guard against double-unload
 
-        # CRIT-008 FIX: Only register atexit handlers once per class to prevent
-        # memory leak from accumulating handlers when multiple instances are created
-        if not TLDRDaemon._atexit_registered:
-            atexit.register(self._persist_all_stats)
-            atexit.register(self._unload_model)
-            TLDRDaemon._atexit_registered = True
+        # DA-7 FIX: Connection limit enforcement via semaphore.
+        # Prevents resource exhaustion from connection floods.
+        # Semaphore allows up to MAX_CONNECTIONS concurrent handlers.
+        self._connection_semaphore = threading.Semaphore(MAX_CONNECTIONS)
+        self._active_connections = 0
+        self._connection_count_lock = threading.Lock()
+
+        # DA-1 FIX: Track this instance for cleanup at exit.
+        # Uses module-level WeakSet + single atexit handler so ALL daemon instances
+        # get cleaned up, not just the first one (the CRIT-008 fix's bug).
+        # WeakSet auto-removes GC'd instances, preventing memory leaks.
+        global _cleanup_registered
+        _daemon_instances.add(self)
+        if not _cleanup_registered:
+            atexit.register(_cleanup_all_daemons)
+            _cleanup_registered = True
 
     def _compute_socket_path(self) -> Path:
         """Compute deterministic socket path from project path."""
@@ -523,7 +566,11 @@ class TLDRDaemon:
             self._flush_hook_stats_unlocked()
 
     def _handle_status(self, command: dict) -> dict:
-        """Handle status command with P5 cache statistics."""
+        """Handle status command with P5 cache statistics.
+
+        DA-3 FIX: All dict iterations are protected by their respective locks
+        to prevent RuntimeError from concurrent modification.
+        """
         uptime = time.time() - self._start_time
 
         # Get SalsaDB stats
@@ -534,29 +581,32 @@ class TLDRDaemon:
         if self.dedup_index:
             dedup_stats = self.dedup_index.stats()
 
-        # Get session stats if session ID provided
+        # DA-3 FIX: Gather all session stats under lock to prevent
+        # RuntimeError "dictionary changed size during iteration"
         session_id = command.get("session")
         session_stats = None
-        if session_id:
-            # Normalize to 8 chars (matches status.py convention)
-            normalized_id = session_id[:8] if session_id else session_id
-            stats = self._session_stats.get(normalized_id)
-            if stats:
-                session_stats = stats.to_dict()
+        with self._session_stats_lock:
+            if session_id:
+                # Normalize to 8 chars (matches status.py convention)
+                normalized_id = session_id[:8] if session_id else session_id
+                stats = self._session_stats.get(normalized_id)
+                if stats:
+                    session_stats = stats.to_dict()
 
-        # Get all sessions summary
-        all_sessions_stats = {
-            "active_sessions": len(self._session_stats),
-            "total_raw_tokens": sum(s.raw_tokens for s in self._session_stats.values()),
-            "total_tldr_tokens": sum(s.tldr_tokens for s in self._session_stats.values()),
-            "total_requests": sum(s.requests for s in self._session_stats.values()),
-            "session_ids": list(self._session_stats.keys()),  # Debug: show stored IDs
-        }
+            # Get all sessions summary (must be inside lock for consistent snapshot)
+            all_sessions_stats = {
+                "active_sessions": len(self._session_stats),
+                "total_raw_tokens": sum(s.raw_tokens for s in self._session_stats.values()),
+                "total_tldr_tokens": sum(s.tldr_tokens for s in self._session_stats.values()),
+                "total_requests": sum(s.requests for s in self._session_stats.values()),
+                "session_ids": list(self._session_stats.keys()),  # Debug: show stored IDs
+            }
 
-        # Get all hook stats (P8)
-        hook_stats_dict = {
-            name: stats.to_dict() for name, stats in self._hook_stats.items()
-        }
+        # DA-3 FIX: Get all hook stats under lock (P8)
+        with self._hook_stats_lock:
+            hook_stats_dict = {
+                name: stats.to_dict() for name, stats in self._hook_stats.items()
+            }
 
         # Get ML model stats (P9)
         ml_model_stats = {}
@@ -571,6 +621,10 @@ class TLDRDaemon:
         else:
             ml_model_stats = {"loaded": False}
 
+        # DA-7 FIX: Include connection stats for monitoring
+        with self._connection_count_lock:
+            active_conns = self._active_connections
+
         return {
             "status": self._status,
             "uptime": uptime,
@@ -582,10 +636,18 @@ class TLDRDaemon:
             "all_sessions": all_sessions_stats,
             "hook_stats": hook_stats_dict,
             "ml_model": ml_model_stats,
+            "connections": {
+                "active": active_conns,
+                "max": MAX_CONNECTIONS,
+            },
         }
 
     def _handle_shutdown(self, command: dict) -> dict:
         """Handle shutdown command with stats persistence and model cleanup."""
+        # DA-4 FIX: Wait for background reindex thread before shutdown
+        # This ensures index consistency - an incomplete reindex could leave
+        # the semantic index in a corrupted state
+        self._wait_for_reindex_thread()
         # Persist all session stats before shutdown
         self._persist_all_stats()
         # Unload ML model to free GPU/memory
@@ -593,11 +655,40 @@ class TLDRDaemon:
         self._shutdown_requested = True
         return {"status": "shutting_down"}
 
+    def _wait_for_reindex_thread(self, timeout: float = 30.0) -> None:
+        """Wait for background reindex thread to complete.
+
+        DA-4 FIX: Ensures index consistency on shutdown. Without this wait,
+        an in-progress reindex could leave the semantic index in an inconsistent
+        state (partially written files, missing metadata, etc.).
+
+        Args:
+            timeout: Maximum seconds to wait for thread completion.
+                    30s is generous - typical reindex takes 5-15s.
+        """
+        thread = self._reindex_thread
+        if thread is None or not thread.is_alive():
+            return
+
+        logger.info(f"Waiting for background reindex thread to complete (timeout: {timeout}s)...")
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            logger.warning(
+                f"Reindex thread {thread.name} did not finish within {timeout}s. "
+                "Index may be in an inconsistent state. Consider running 'tldr semantic index' manually."
+            )
+        else:
+            logger.info("Background reindex thread completed successfully")
+
     def _persist_all_stats(self) -> None:
         """Persist all session and hook stats to JSONL stores.
 
         Thread-safe: uses a lock to prevent double-persist when both
         atexit and finally block trigger this method concurrently.
+
+        DA-2 FIX: Copies session_stats items under lock before iterating,
+        preventing RuntimeError from dict modification during iteration.
         """
         # Guard against double-persist (atexit + finally can both trigger)
         # Lock ensures atomic check-and-set to prevent race condition
@@ -606,8 +697,14 @@ class TLDRDaemon:
                 return
             self._stats_persisted = True
 
-        # Persist session stats
-        for session_id, stats in self._session_stats.items():
+        # DA-2 FIX: Copy items under lock to avoid holding lock during I/O.
+        # This prevents RuntimeError "dictionary changed size during iteration"
+        # when concurrent requests modify _session_stats while we iterate.
+        with self._session_stats_lock:
+            session_items = list(self._session_stats.items())
+
+        # Persist session stats (now safe to iterate without lock)
+        for session_id, stats in session_items:
             if stats.requests > 0:  # Only persist if there were actual requests
                 try:
                     self._stats_store.append(stats)
@@ -1637,7 +1734,12 @@ class TLDRDaemon:
         logger.info("Socket cleaned up")
 
     def _handle_one_connection(self):
-        """Handle a single client connection."""
+        """Handle a single client connection with connection limit enforcement.
+
+        DA-7 FIX: Uses semaphore to enforce MAX_CONNECTIONS limit.
+        If limit is reached, new connections are immediately rejected with
+        a 503 Service Unavailable-style error instead of hanging.
+        """
         if not self._socket:
             return
 
@@ -1647,6 +1749,30 @@ class TLDRDaemon:
             return
         except OSError:
             return
+
+        # DA-7 FIX: Try to acquire semaphore with timeout
+        # Non-blocking acquire to immediately reject when at limit
+        acquired = self._connection_semaphore.acquire(blocking=False)
+        if not acquired:
+            # At connection limit - reject immediately with helpful error
+            try:
+                response = {
+                    "status": "error",
+                    "message": f"Server busy: maximum {MAX_CONNECTIONS} concurrent connections reached",
+                    "code": "CONNECTION_LIMIT",
+                }
+                conn.settimeout(1.0)
+                conn.sendall(json.dumps(response).encode() + b"\n")
+            except Exception:
+                pass
+            finally:
+                conn.close()
+            logger.warning(f"Connection rejected: at {MAX_CONNECTIONS} connection limit")
+            return
+
+        # Track active connections for status reporting
+        with self._connection_count_lock:
+            self._active_connections += 1
 
         try:
             conn.settimeout(5.0)
@@ -1689,6 +1815,10 @@ class TLDRDaemon:
             logger.exception("Error handling connection")
         finally:
             conn.close()
+            # DA-7 FIX: Release semaphore and update counter
+            with self._connection_count_lock:
+                self._active_connections -= 1
+            self._connection_semaphore.release()
 
     def run(self):
         """Run the daemon main loop."""
@@ -1742,6 +1872,13 @@ class TLDRDaemon:
         except Exception:
             logger.exception("Daemon error")
         finally:
+            # DA-4 FIX: Wait for background reindex thread before cleanup
+            # This ensures index consistency - must complete before we unload ML model
+            try:
+                self._wait_for_reindex_thread()
+            except Exception as e:
+                logger.error(f"Failed to wait for reindex thread: {e}")
+
             # Persist stats before cleanup (graceful shutdown)
             try:
                 self._persist_all_stats()

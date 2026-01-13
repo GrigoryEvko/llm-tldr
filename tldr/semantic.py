@@ -28,8 +28,10 @@ The CLI (tldr semantic index/search) now uses ml_engine.py which provides:
 """
 
 import logging
+import multiprocessing as mp
 import os
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,11 +119,15 @@ def detect_semantic_patterns(code: str) -> Set[str]:
     Scans code for common patterns (CRUD, validation, error handling, etc.)
     and returns matching categories for semantic enrichment.
 
+    Note: Patterns use word boundaries (\\b) to match whole words only.
+    This prevents false positives like "created" matching "crud" pattern.
+    For example, "create_user" matches but "recreate" does not.
+
     Args:
         code: Code string to analyze.
 
     Returns:
-        Set of matched pattern categories.
+        Set of matched pattern categories (e.g., {"crud", "validation"}).
     """
     if not code:
         return set()
@@ -137,26 +143,28 @@ def detect_semantic_patterns(code: str) -> Set[str]:
 
 
 def _get_indent_depth(line: str) -> int:
-    """Calculate indent depth handling both tabs and spaces.
+    """Calculate indent depth handling both tabs and spaces consistently.
 
-    Examines only leading whitespace to determine indentation level.
-    Tabs count as 1 level each, spaces count as 1 level per 4 spaces.
+    Expands tabs to 4 spaces before counting, ensuring consistent indentation
+    measurement regardless of whether the file uses tabs, spaces, or mixed
+    indentation. This matches common editor behavior (tabstop=4).
 
     Args:
         line: A single line of code.
 
     Returns:
-        Indentation depth (number of levels).
+        Indentation depth (number of 4-space levels).
     """
     stripped = line.lstrip()
     if not stripped:
         return 0
-    indent = len(line) - len(stripped)
-    # Check leading whitespace type
-    leading = line[:indent]
-    if '\t' in leading:
-        return leading.count('\t')
-    return indent // 4
+
+    # BUG SE-11 FIX: Expand tabs to 4 spaces for consistent counting
+    # This handles mixed tabs/spaces correctly by normalizing to spaces first
+    leading_len = len(line) - len(stripped)
+    leading = line[:leading_len]
+    expanded = leading.replace('\t', '    ')
+    return len(expanded) // 4
 
 
 def detect_code_complexity(code: str) -> Dict[str, Any]:
@@ -261,7 +269,12 @@ def split_into_chunks(
 
             current_chunk = overlap_lines
             current_tokens = overlap_count
-            chunk_start = char_offset - sum(len(l) + 1 for l in overlap_lines)
+            # SE-4 fix: Calculate chunk_start accounting for newlines between lines
+            # overlap_lines stores lines WITHOUT trailing newlines
+            # The source text has newlines after each line (we're mid-file, not at end)
+            # Total overlap length = sum of line lengths + number of newlines
+            overlap_char_count = sum(len(l) for l in overlap_lines) + len(overlap_lines)
+            chunk_start = char_offset - overlap_char_count
 
         current_chunk.append(line)
         current_tokens += line_tokens
@@ -402,16 +415,17 @@ def chunk_unit(unit: EmbeddingUnit) -> List[EmbeddingUnit]:
     return chunk_units
 
 
-def enrich_unit(unit: EmbeddingUnit) -> EmbeddingUnit:
-    """Add semantic enrichment to a unit.
+def enrich_unit(unit: EmbeddingUnit) -> None:
+    """Add semantic enrichment to a unit. Modifies unit in place.
 
     Detects patterns, calculates complexity, and computes token count.
 
     Args:
         unit: The EmbeddingUnit to enrich.
 
-    Returns:
-        The enriched unit (modified in place and returned).
+    Note:
+        This function mutates the input unit directly. It does not return
+        a value to avoid the confusing pattern of mutate-and-return.
     """
     if unit.code_preview:
         # Detect semantic patterns
@@ -424,8 +438,6 @@ def enrich_unit(unit: EmbeddingUnit) -> EmbeddingUnit:
         unit.semantic_tags = []
         unit.complexity = {}
         unit.token_count = 0
-
-    return unit
 
 
 def _parse_identifier_to_words(name: str) -> str:
@@ -466,6 +478,32 @@ def _parse_identifier_to_words(name: str) -> str:
     return words
 
 
+def _is_char_escaped(code: str, pos: int) -> bool:
+    """Check if character at position is escaped by counting preceding backslashes.
+
+    A character is escaped if preceded by an odd number of backslashes.
+    Examples:
+        "foo\\"  - quote at end is NOT escaped (2 backslashes = even)
+        "foo\\"" - second quote IS escaped (1 backslash = odd)
+        "foo\\\\" - quote after 4 backslashes is NOT escaped (even)
+
+    Args:
+        code: The code string.
+        pos: Position of the character to check.
+
+    Returns:
+        True if character at pos is escaped (preceded by odd number of backslashes).
+    """
+    if pos <= 0:
+        return False
+    num_backslashes = 0
+    j = pos - 1
+    while j >= 0 and code[j] == '\\':
+        num_backslashes += 1
+        j -= 1
+    return num_backslashes % 2 == 1
+
+
 def _extract_inline_comments(code: str) -> List[str]:
     """Extract inline comments from code preview.
 
@@ -473,6 +511,12 @@ def _extract_inline_comments(code: str) -> List[str]:
     Comments often contain valuable natural language describing intent.
     Uses state machine to avoid false positives from # inside strings
     (e.g., f-string format specifiers like f"{value:#.2f}").
+
+    Handles edge cases:
+    - Triple-quoted strings (docstrings)
+    - Escaped quotes with proper backslash counting
+    - Raw strings (r"...") where backslashes don't escape
+    - Shebang lines (#!/usr/bin/env python)
 
     Args:
         code: The code string to parse.
@@ -482,50 +526,82 @@ def _extract_inline_comments(code: str) -> List[str]:
     """
     comments = []
     in_string = False
-    string_char = None
+    string_char = None  # Single char ('"' or "'") or triple ('"""' or "'''")
+    is_raw_string = False  # r"..." strings where backslashes don't escape
     i = 0
     code_len = len(code)
 
     while i < code_len:
         char = code[i]
 
-        # Track string state - handle escaped quotes
-        if char in ('"', "'") and (i == 0 or code[i - 1] != '\\'):
+        # Track string state
+        if char in ('"', "'"):
             if not in_string:
-                # Check for triple-quoted strings
+                # Check for raw string prefix (r" or r')
+                is_raw = i > 0 and code[i - 1] in ('r', 'R')
+                # Also check for f-raw strings (fr" or rf")
+                if not is_raw and i > 1:
+                    prev_two = code[i - 2:i].lower()
+                    is_raw = prev_two in ('fr', 'rf', 'br', 'rb')
+
+                # Check for triple-quoted strings first
                 if i + 2 < code_len and code[i:i + 3] in ('"""', "'''"):
                     in_string = True
                     string_char = code[i:i + 3]
+                    is_raw_string = is_raw
                     i += 3
                     continue
+                # Single-quoted string
                 in_string = True
                 string_char = char
+                is_raw_string = is_raw
             elif in_string:
-                # Check for closing triple quote
-                if len(string_char) == 3 and i + 2 < code_len and code[i:i + 3] == string_char:
+                # Check for closing quote - must match opener and not be escaped
+                # In raw strings, backslashes don't escape quotes
+                char_escaped = not is_raw_string and _is_char_escaped(code, i)
+
+                if len(string_char) == 3:
+                    # Triple-quoted: check for matching triple quote
+                    if i + 2 < code_len and code[i:i + 3] == string_char:
+                        # Triple quotes can't be escaped (even in raw strings,
+                        # you can't have \" at end of raw string)
+                        in_string = False
+                        string_char = None
+                        is_raw_string = False
+                        i += 3
+                        continue
+                elif char == string_char and not char_escaped:
+                    # Single-quoted: matching unescaped quote closes string
                     in_string = False
                     string_char = None
-                    i += 3
-                    continue
-                # Check for closing single quote
-                elif len(string_char) == 1 and char == string_char:
-                    in_string = False
-                    string_char = None
+                    is_raw_string = False
 
         # Only match # outside strings
         elif char == '#' and not in_string:
-            # Skip shebang lines
-            if i > 0 and code[i - 1] == '\n' and i + 1 < code_len and code[i + 1] == '!':
-                pass
-            else:
-                # Extract comment text until end of line
+            # BUG SE-13 FIX: Skip shebang lines properly by advancing to end of line
+            # Check for shebang at file start (i == 0) or after newline
+            is_shebang = (
+                i + 1 < code_len and code[i + 1] == '!' and
+                (i == 0 or (i > 0 and code[i - 1] == '\n'))
+            )
+            if is_shebang:
+                # Skip entire shebang line
                 end = code.find('\n', i)
-                comment_text = code[i + 1:end if end != -1 else code_len].strip()
-                # Filter out noise comments
-                if len(comment_text) > 3 and not comment_text.startswith("!"):
-                    comments.append(comment_text)
-                i = end if end != -1 else code_len
+                if end == -1:
+                    break  # Shebang is only content in file
+                i = end
                 continue
+
+            # Extract comment text until end of line
+            end = code.find('\n', i)
+            if end == -1:
+                end = code_len
+            comment_text = code[i + 1:end].strip()
+            # Filter out noise comments (too short or special markers)
+            if len(comment_text) > 3 and not comment_text.startswith("!"):
+                comments.append(comment_text)
+            i = end
+            continue
 
         i += 1
 
@@ -712,6 +788,28 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     return truncate_to_tokens(result, MAX_EMBEDDING_TOKENS)
 
 
+def _is_binary_file(path: Path, sample_size: int = 8192) -> bool:
+    """Check if file is binary by looking for null bytes.
+
+    Binary files with code extensions (e.g., compiled .py files, .pyc renamed)
+    can produce garbled UTF-8 and silently fail AST parsing. This check
+    prevents wasted processing on such files.
+
+    Args:
+        path: Path to the file to check.
+        sample_size: Number of bytes to sample (default 8KB).
+
+    Returns:
+        True if file appears to be binary (contains null bytes).
+    """
+    try:
+        with open(path, "rb") as f:
+            sample = f.read(sample_size)
+            return b"\x00" in sample
+    except Exception:
+        return False
+
+
 # Threshold for switching to parallel processing
 MIN_FILES_FOR_PARALLEL = 15
 
@@ -807,7 +905,19 @@ def extract_units_from_project(
     # Use parallel processing if we have enough files to justify overhead
     if len(files) >= MIN_FILES_FOR_PARALLEL and max_workers > 1:
         try:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # SE-7 fix: Use explicit multiprocessing context for cross-platform safety
+            # macOS defaults to 'spawn' since Python 3.8, Windows requires 'spawn'
+            # Linux can use 'fork' for better performance (no pickle overhead)
+            if sys.platform == "darwin":
+                mp_context = mp.get_context("spawn")
+            elif sys.platform == "win32":
+                mp_context = mp.get_context("spawn")
+            else:
+                # Linux: 'fork' is faster but requires fork-safe code
+                # Our _process_file_for_extraction is fork-safe (no thread-unsafe globals)
+                mp_context = mp.get_context("fork")
+
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
                 futures = {}
                 for file_info in files:
                     # Filter call maps to reduce pickle overhead (Bug MED-005 fix)
@@ -889,9 +999,15 @@ def _process_file_for_extraction(
     if not full_path.exists():
         return units
 
+    # SE-8 fix: Skip binary files that may have code extensions
+    # Binary files produce garbled UTF-8 and silently fail AST parsing
+    if _is_binary_file(full_path):
+        logger.debug(f"Skipping binary file: {file_path}")
+        return units
+
     try:
         # Read file content ONCE
-        content = full_path.read_text(encoding="utf-8", errors="replace")
+        content = full_path.read_text(encoding="utf-8-sig", errors="replace")
         lines = content.split('\n')
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
@@ -919,27 +1035,41 @@ def _process_file_for_extraction(
         module_info = extract_file(str(full_path))
 
         # Build lookup dicts from extracted info
-        # Note: We extract generous amounts of code, chunking happens later if needed
+        # Note: We extract precise function boundaries using end_line_number (SE-3 fix)
         for func in module_info.functions:
-            # Extract raw code without truncation - chunking handles oversized
             start_offset = get_char_offset(func.line_number)
-            # Extract up to ~32K tokens worth (safe for model context, chunk if bigger)
-            raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
+
+            # Use end_line_number for precise extraction (SE-3 fix)
+            if func.end_line_number:
+                # Extract only this function's code using precise boundaries
+                end_offset = get_char_offset(func.end_line_number + 1)
+                raw_code = content[start_offset:end_offset]
+            else:
+                # Fallback: use token limit when end line is unknown
+                raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
 
             ast_info["functions"][func.name] = {
                 "line": func.line_number,
+                "end_line": func.end_line_number,
                 "code_preview": raw_code,  # Will be chunked if > 6K tokens
             }
             all_signatures[func.name] = func.signature()
             all_docstrings[func.name] = func.docstring or ""
 
         for cls in module_info.classes:
-            # Extract class body - large classes will be chunked
             class_offset = get_char_offset(cls.line_number)
-            raw_code, _ = extract_code_by_tokens(content, class_offset, 32000)
+
+            # Use end_line_number for precise extraction (SE-3 fix)
+            if cls.end_line_number:
+                end_offset = get_char_offset(cls.end_line_number + 1)
+                raw_code = content[class_offset:end_offset]
+            else:
+                # Fallback: use token limit when end line is unknown
+                raw_code, _ = extract_code_by_tokens(content, class_offset, 32000)
 
             ast_info["classes"][cls.name] = {
                 "line": cls.line_number,
+                "end_line": cls.end_line_number,
                 "code_preview": raw_code,  # Will be chunked if > 6K tokens
             }
 
@@ -947,10 +1077,18 @@ def _process_file_for_extraction(
             for method in cls.methods:
                 method_key = f"{cls.name}.{method.name}"
                 start_offset = get_char_offset(method.line_number)
-                raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
+
+                # Use end_line_number for precise extraction (SE-3 fix)
+                if method.end_line_number:
+                    end_offset = get_char_offset(method.end_line_number + 1)
+                    raw_code = content[start_offset:end_offset]
+                else:
+                    # Fallback: use token limit when end line is unknown
+                    raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
 
                 ast_info["methods"][method_key] = {
                     "line": method.line_number,
+                    "end_line": method.end_line_number,
                     "code_preview": raw_code,  # Will be chunked if > 6K tokens
                 }
                 all_signatures[method_key] = method.signature()
@@ -973,35 +1111,59 @@ def _process_file_for_extraction(
     cfg_cache = {}
     dfg_cache = {}
 
-    if lang == "python":
-        # Get all function names we need to process
-        all_func_names = list(file_info.get("functions", []))
-        for class_info in file_info.get("classes", []):
-            if isinstance(class_info, dict):
-                all_func_names.extend(class_info.get("methods", []))
+    # Languages with CFG/DFG extractor support
+    SUPPORTED_CFG_LANGUAGES = {"python", "typescript", "go", "rust"}
 
-        for func_name in all_func_names:
-            try:
-                from tldr.cfg_extractor import extract_python_cfg
-                cfg = extract_python_cfg(content, func_name)
-                cfg_cache[func_name] = f"complexity:{cfg.cyclomatic_complexity}, blocks:{len(cfg.blocks)}"
-            except Exception:
-                cfg_cache[func_name] = ""
+    if lang in SUPPORTED_CFG_LANGUAGES:
+        # Import extractors for this language (once per file, not per function)
+        cfg_extractor = None
+        dfg_extractor = None
 
-            try:
-                from tldr.dfg_extractor import extract_python_dfg
-                dfg = extract_python_dfg(content, func_name)
-                var_names = set(ref.name for ref in dfg.var_refs)
-                dfg_cache[func_name] = f"vars:{len(var_names)}, def-use chains:{len(dfg.dataflow_edges)}"
-            except Exception:
-                dfg_cache[func_name] = ""
+        try:
+            if lang == "python":
+                from tldr.cfg_extractor import extract_python_cfg as cfg_extractor
+                from tldr.dfg_extractor import extract_python_dfg as dfg_extractor
+            elif lang == "typescript":
+                from tldr.cfg_extractor import extract_typescript_cfg as cfg_extractor
+                from tldr.dfg_extractor import extract_typescript_dfg as dfg_extractor
+            elif lang == "go":
+                from tldr.cfg_extractor import extract_go_cfg as cfg_extractor
+                from tldr.dfg_extractor import extract_go_dfg as dfg_extractor
+            elif lang == "rust":
+                from tldr.cfg_extractor import extract_rust_cfg as cfg_extractor
+                from tldr.dfg_extractor import extract_rust_dfg as dfg_extractor
+        except ImportError as e:
+            logger.debug(f"CFG/DFG extractors not available for {lang}: {e}")
+
+        if cfg_extractor or dfg_extractor:
+            # Get all function names we need to process
+            all_func_names = list(file_info.get("functions", []))
+            for class_info in file_info.get("classes", []):
+                if isinstance(class_info, dict):
+                    all_func_names.extend(class_info.get("methods", []))
+
+            for func_name in all_func_names:
+                if cfg_extractor:
+                    try:
+                        cfg = cfg_extractor(content, func_name)
+                        cfg_cache[func_name] = f"complexity:{cfg.cyclomatic_complexity}, blocks:{len(cfg.blocks)}"
+                    except Exception:
+                        cfg_cache[func_name] = ""
+
+                if dfg_extractor:
+                    try:
+                        dfg = dfg_extractor(content, func_name)
+                        var_names = set(ref.name for ref in dfg.var_refs)
+                        dfg_cache[func_name] = f"vars:{len(var_names)}, def-use chains:{len(dfg.dataflow_edges)}"
+                    except Exception:
+                        dfg_cache[func_name] = ""
 
     # Process functions - create units, enrich, and chunk if needed
     for func_name in file_info.get("functions", []):
         func_info = ast_info.get("functions", {}).get(func_name, {})
         unit = EmbeddingUnit(
             name=func_name,
-            qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
+            qualified_name=f"{file_path}::{func_name}",
             file=file_path,
             line=func_info.get("line", 1),
             language=lang,
@@ -1037,7 +1199,7 @@ def _process_file_for_extraction(
         # Add class itself with code preview
         unit = EmbeddingUnit(
             name=class_name,
-            qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
+            qualified_name=f"{file_path}::{class_name}",
             file=file_path,
             line=class_line,
             language=lang,
@@ -1064,7 +1226,7 @@ def _process_file_for_extraction(
 
             unit = EmbeddingUnit(
                 name=method,
-                qualified_name=f"{file_path.replace('/', '.')}.{method_key}",
+                qualified_name=f"{file_path}::{method_key}",
                 file=file_path,
                 line=method_info.get("line", 1),
                 language=lang,

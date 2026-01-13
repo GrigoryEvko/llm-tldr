@@ -18,8 +18,9 @@ import functools
 import logging
 import os
 import re
+import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from .languages import get_extensions_with_default, get_primary_extension
+from .tokenizer import estimate_tokens_fallback
 
 from .ast_extractor import (
     CallGraphInfo,  # Re-exported for API consumers
@@ -360,7 +362,7 @@ def _resolve_source(source_or_path: str) -> tuple[str, str | None]:
 
             path = Path(source_or_path)
             if path.exists() and path.is_file():
-                return path.read_text(encoding="utf-8"), str(path)
+                return path.read_text(encoding="utf-8-sig"), str(path)
         except PathTraversalError:
             # Security error - must propagate
             raise
@@ -379,70 +381,85 @@ def _resolve_source(source_or_path: str) -> tuple[str, str | None]:
 
 # Module-level cache for call graphs: {(project_path, language): (mtime, graph)}
 # Bounded to prevent unbounded memory growth
-_call_graph_cache: dict[tuple[str, str], tuple[float, ProjectCallGraph]] = {}
+# Thread-safe: Protected by _call_graph_lock for multi-threaded access
+# Uses OrderedDict for true LRU eviction (move_to_end on access)
+_call_graph_cache: OrderedDict[tuple[str, str], tuple[float, ProjectCallGraph]] = OrderedDict()
+_call_graph_lock = threading.Lock()
 MAX_CALL_GRAPH_CACHE_SIZE = 100
 
 
-def _get_project_mtime_uncached(project: Path, extensions: set[str]) -> float:
+def _get_project_mtime_uncached(
+    project: Path,
+    extensions: set[str],
+    respect_ignore: bool = False,
+) -> float:
     """Get latest mtime of source files in project for cache invalidation.
 
     Only checks files with relevant extensions to avoid scanning irrelevant files.
+    Uses iter_source_files() for consistent filtering (DEFAULT_SKIP_DIRS).
+
+    Note: respect_ignore defaults to False for mtime checks to ensure cache
+    invalidation even for ignored files (they still affect project state).
 
     Args:
         project: Project root path
         extensions: Set of file extensions to check (e.g., {".py"})
+        respect_ignore: If True, respect .tldrignore patterns (default False)
 
     Returns:
         Latest mtime as float, or 0.0 if no files found or errors occur.
     """
     latest = 0.0
     try:
-        for f in project.rglob("*"):
-            if f.is_file() and f.suffix in extensions:
-                # Skip hidden directories
-                try:
-                    rel = f.relative_to(project)
-                    if any(p.startswith(".") for p in rel.parts):
-                        continue
-                except ValueError:
-                    continue
-                try:
-                    mtime = f.stat().st_mtime
-                    if mtime > latest:
-                        latest = mtime
-                except (OSError, PermissionError):
-                    pass
+        for f in iter_source_files(project, extensions, respect_ignore=respect_ignore):
+            try:
+                mtime = f.stat().st_mtime
+                if mtime > latest:
+                    latest = mtime
+            except (OSError, PermissionError):
+                pass
     except (OSError, PermissionError):
         pass
     return latest
 
 
 # TTL cache for _get_project_mtime to avoid expensive rglob on every call
-# Format: {project_path: (check_time, mtime)}
-_mtime_cache: dict[str, tuple[float, float]] = {}
+# Format: {(project_path, extensions_tuple): (check_time, mtime)}
+# Thread-safe: Protected by _mtime_lock for multi-threaded access
+_mtime_cache: dict[tuple[str, tuple[str, ...]], tuple[float, float]] = {}
+_mtime_lock = threading.Lock()
 MTIME_CACHE_TTL = 2.0  # seconds
 
 
 def _get_project_mtime(project: Path, extensions: set[str]) -> float:
     """Get project mtime with short TTL cache to avoid expensive rglob on every call.
-    
+
+    Thread-safe implementation using double-check locking pattern.
+
     Args:
         project: Project root path
         extensions: Set of file extensions to check
-        
+
     Returns:
         Latest mtime as float, using cached value if within TTL.
     """
-    key = str(project)
+    key = (str(project), tuple(sorted(extensions)))
     now = time.time()
-    
-    if key in _mtime_cache:
-        check_time, cached_mtime = _mtime_cache[key]
-        if now - check_time < MTIME_CACHE_TTL:
-            return cached_mtime
-    
+
+    # Fast path: check cache under lock
+    with _mtime_lock:
+        if key in _mtime_cache:
+            check_time, cached_mtime = _mtime_cache[key]
+            if now - check_time < MTIME_CACHE_TTL:
+                return cached_mtime
+
+    # Slow path: compute mtime outside lock to avoid blocking
     mtime = _get_project_mtime_uncached(project, extensions)
-    _mtime_cache[key] = (now, mtime)
+
+    # Update cache under lock
+    with _mtime_lock:
+        _mtime_cache[key] = (time.time(), mtime)
+
     return mtime
 
 
@@ -453,6 +470,7 @@ def _get_cached_call_graph(
 ) -> ProjectCallGraph:
     """Get call graph with mtime-based caching.
 
+    Thread-safe implementation using double-check locking pattern.
     Caches call graph per (project, language) and invalidates when any
     source file has been modified since the cache was created.
 
@@ -467,20 +485,33 @@ def _get_cached_call_graph(
     cache_key = (str(project), language)
     project_mtime = _get_project_mtime(project, extensions)
 
-    if cache_key in _call_graph_cache:
-        cached_mtime, cached_graph = _call_graph_cache[cache_key]
-        if cached_mtime >= project_mtime:
-            return cached_graph
+    # Fast path: check cache under lock
+    with _call_graph_lock:
+        if cache_key in _call_graph_cache:
+            cached_mtime, cached_graph = _call_graph_cache[cache_key]
+            if cached_mtime >= project_mtime:
+                # Move to end for true LRU (mark as recently used)
+                _call_graph_cache.move_to_end(cache_key)
+                return cached_graph
 
-    # Cache miss or stale - rebuild
+    # Slow path: build call graph outside lock to avoid blocking
     call_graph = build_project_call_graph(str(project), language=language)
 
-    # Enforce cache size limit (LRU-style: evict oldest entry)
-    if len(_call_graph_cache) >= MAX_CALL_GRAPH_CACHE_SIZE:
-        oldest_key = next(iter(_call_graph_cache))
-        del _call_graph_cache[oldest_key]
+    # Update cache under lock (atomic eviction + insert)
+    with _call_graph_lock:
+        # Double-check: another thread might have populated the cache
+        if cache_key in _call_graph_cache:
+            cached_mtime, cached_graph = _call_graph_cache[cache_key]
+            if cached_mtime >= project_mtime:
+                return cached_graph
 
-    _call_graph_cache[cache_key] = (project_mtime, call_graph)
+        # Enforce cache size limit (true LRU: evict least recently used entry)
+        while len(_call_graph_cache) >= MAX_CALL_GRAPH_CACHE_SIZE:
+            # popitem(last=False) removes the oldest (least recently used) entry
+            _call_graph_cache.popitem(last=False)
+
+        _call_graph_cache[cache_key] = (project_mtime, call_graph)
+
     return call_graph
 
 
@@ -544,7 +575,7 @@ class RelevantContext:
 
         # Footer with stats
         result = "\n".join(lines)
-        token_estimate = len(result) // 4
+        token_estimate = estimate_tokens_fallback(result)
         return (
             result
             + f"\n---\n📊 {len(self.functions)} functions | ~{token_estimate} tokens"
@@ -649,8 +680,9 @@ def iter_source_files(
     extensions: set[str],
     skip_hidden: bool = True,
     skip_dirs: set[str] | None = None,
+    respect_ignore: bool = True,
 ) -> Iterator[Path]:
-    """Unified file iterator with consistent filtering.
+    """Unified file iterator with consistent filtering and .tldrignore support.
 
     Centralizes the rglob + filtering logic that was duplicated across 6 places:
     - _get_project_mtime
@@ -665,6 +697,7 @@ def iter_source_files(
         extensions: Set of file extensions to include (e.g., {".py", ".ts"}).
         skip_hidden: If True, skip files/dirs starting with "." (default True).
         skip_dirs: Additional directories to skip. Merged with DEFAULT_SKIP_DIRS.
+        respect_ignore: If True, respect .tldrignore patterns (default True).
 
     Yields:
         Path objects for matching source files.
@@ -675,6 +708,12 @@ def iter_source_files(
         - Skips directories early to avoid unnecessary stat() calls
     """
     effective_skip_dirs = DEFAULT_SKIP_DIRS | (skip_dirs or set())
+
+    # Load .tldrignore patterns once for efficiency
+    ignore_spec = None
+    if respect_ignore:
+        from .tldrignore import load_ignore_patterns, should_ignore
+        ignore_spec = load_ignore_patterns(root)
 
     for f in root.rglob("*"):
         if not f.is_file():
@@ -690,6 +729,10 @@ def iter_source_files(
             # Skip excluded directories
             if any(p in effective_skip_dirs for p in parts):
                 continue
+            # Skip files matching .tldrignore patterns
+            if respect_ignore and ignore_spec is not None:
+                if should_ignore(f, root, ignore_spec):
+                    continue
         except ValueError:
             continue
         yield f
@@ -699,69 +742,70 @@ def iter_source_files(
 # Cached Project File Scanner (with mtime-based invalidation)
 # =============================================================================
 
-# Module-level cache: {(project, language): (mtime, file_list)}
+# Module-level cache: {(project, language, respect_ignore): (mtime, file_list)}
 # Invalidates when any source file is newer than cache timestamp
-_scan_cache: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+# Thread-safe: Protected by _scan_lock for multi-threaded access
+_scan_cache: dict[tuple[str, str, bool], tuple[float, tuple[str, ...]]] = {}
+_scan_lock = threading.Lock()
 MAX_SCAN_CACHE_SIZE = 32
 
 
-def _cached_scan_project_files(project: str, language: str) -> tuple[str, ...]:
+def _cached_scan_project_files(
+    project: str,
+    language: str,
+    respect_ignore: bool = True,
+) -> tuple[str, ...]:
     """Cached project file scan with mtime-based invalidation.
 
+    Thread-safe implementation using double-check locking pattern.
     Returns all source files for a given project and language, cached by
     (project, language) pair. Cache invalidates when any source file has
     been modified, or when files are added/deleted (detected via directory mtime).
 
+    Uses iter_source_files() to ensure consistent filtering across the API,
+    including DEFAULT_SKIP_DIRS and .tldrignore support.
+
     Args:
         project: Absolute path to project root (string for hashability)
         language: Language identifier ("python", "typescript", "go", "rust")
+        respect_ignore: If True, respect .tldrignore patterns (default True)
 
     Returns:
         Tuple of absolute file paths matching the language's extensions
     """
-    extensions = {
-        "python": {".py"},
-        "typescript": {".ts", ".tsx"},
-        "go": {".go"},
-        "rust": {".rs"},
-    }.get(language, {".py"})
+    from .languages import get_extensions_with_default
 
-    cache_key = (project, language)
+    extensions = get_extensions_with_default(language)
+    cache_key = (project, language, respect_ignore)
     current_mtime = _get_project_mtime(Path(project), extensions)
 
-    # Check cache validity
-    if cache_key in _scan_cache:
-        cached_mtime, cached_files = _scan_cache[cache_key]
-        if current_mtime <= cached_mtime:
-            return cached_files
+    # Fast path: check cache under lock
+    with _scan_lock:
+        if cache_key in _scan_cache:
+            cached_mtime, cached_files = _scan_cache[cache_key]
+            if current_mtime <= cached_mtime:
+                return cached_files
 
-    # Cache miss or stale - rescan
+    # Slow path: scan project using iter_source_files (respects DEFAULT_SKIP_DIRS + .tldrignore)
     project_path = Path(project)
-    result = []
-
-    for f in project_path.rglob("*"):
-        if not f.is_file():
-            continue
-        if f.suffix not in extensions:
-            continue
-        # Skip hidden directories
-        try:
-            rel = f.relative_to(project_path)
-            if any(part.startswith(".") for part in rel.parts):
-                continue
-        except ValueError:
-            continue
-        result.append(str(f))
-
+    result = [str(f) for f in iter_source_files(project_path, extensions, respect_ignore=respect_ignore)]
     result_tuple = tuple(result)
 
-    # Enforce cache size limit (LRU-style: evict oldest entry)
-    if len(_scan_cache) >= MAX_SCAN_CACHE_SIZE:
-        # Remove first (oldest) entry
-        oldest_key = next(iter(_scan_cache))
-        del _scan_cache[oldest_key]
+    # Update cache under lock (atomic eviction + insert)
+    with _scan_lock:
+        # Double-check: another thread might have populated the cache
+        if cache_key in _scan_cache:
+            cached_mtime, cached_files = _scan_cache[cache_key]
+            if current_mtime <= cached_mtime:
+                return cached_files
 
-    _scan_cache[cache_key] = (current_mtime, result_tuple)
+        # Enforce cache size limit (FIFO: evict oldest by insertion order)
+        while len(_scan_cache) >= MAX_SCAN_CACHE_SIZE:
+            oldest_key = next(iter(_scan_cache))
+            del _scan_cache[oldest_key]
+
+        _scan_cache[cache_key] = (current_mtime, result_tuple)
+
     return result_tuple
 
 
@@ -787,7 +831,35 @@ def _get_file_source(file_path: str) -> str:
     Raises:
         OSError: If file cannot be read.
     """
-    return Path(file_path).read_text(encoding="utf-8")
+    return Path(file_path).read_text(encoding="utf-8-sig")
+
+
+def _is_module_path(entry_point: str, language: str = "python") -> bool:
+    """Detect if entry_point is a module path vs function name.
+
+    Module paths contain / or have file extensions (.py, .ts, etc).
+    Function names are like "func_name" or "Class.method".
+
+    Args:
+        entry_point: The entry point string to analyze.
+        language: The language context for extension detection.
+
+    Returns:
+        True if entry_point looks like a module path, False otherwise.
+    """
+    # Paths with / are definitely module paths
+    if "/" in entry_point:
+        return True
+
+    # Check if it looks like a file path with known extension
+    if "." in entry_point:
+        parts = entry_point.rsplit(".", 1)
+        if len(parts) == 2:
+            known_extensions = {"py", "ts", "tsx", "js", "jsx", "go", "rs", "java", "c", "h"}
+            if parts[1] in known_extensions:
+                return True
+
+    return False
 
 
 def get_relevant_context(
@@ -812,18 +884,20 @@ def get_relevant_context(
     """
     project = Path(project)
 
-    # Module query mode: path with / and no . (e.g., "providers/anthropic")
-    if "/" in entry_point and "." not in entry_point:
-        return _get_module_exports(project, entry_point, language, include_docstrings)
+    # Module query mode: detect paths (with /) or file extensions (.py, .ts, etc.)
+    # AP-9 FIX: paths with dots like "providers/anthropic.py" were misidentified
+    if _is_module_path(entry_point, language):
+        # Strip file extension if present for module query
+        module_path = entry_point
+        for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".c", ".h"):
+            if module_path.endswith(ext):
+                module_path = module_path[:-len(ext)]
+                break
+        return _get_module_exports(project, module_path, language, include_docstrings)
 
     # Check if entry_point is a module name (no / or .)
     # e.g., "unified_gate" -> check for unified_gate.py
-    ext_for_lang = {
-        "python": ".py",
-        "typescript": ".ts",
-        "go": ".go",
-        "rust": ".rs",
-    }.get(language, ".py")
+    ext_for_lang = get_primary_extension(language)
 
     # Search for module file matching entry_point (using cached scan)
     if "." not in entry_point and "/" not in entry_point:
@@ -1161,10 +1235,13 @@ def get_cfg_context(
         "java": extract_java_cfg,
         "c": extract_c_cfg,
         "cpp": extract_cpp_cfg,
+        "c++": extract_cpp_cfg,
         "ruby": extract_ruby_cfg,
         "php": extract_php_cfg,
+        "kotlin": extract_kotlin_cfg,
         "swift": extract_swift_cfg,
         "csharp": extract_csharp_cfg,
+        "scala": extract_scala_cfg,
         "lua": extract_lua_cfg,
         "elixir": extract_elixir_cfg,
     }
@@ -1594,6 +1671,7 @@ def get_file_tree(
     root: str | Path,
     extensions: set[str] | None = None,
     exclude_hidden: bool = True,
+    respect_ignore: bool = True,
 ) -> dict:
     """
     Get file tree structure for a project.
@@ -1602,6 +1680,7 @@ def get_file_tree(
         root: Root directory to scan
         extensions: Optional set of extensions to include (e.g., {".py", ".ts"})
         exclude_hidden: If True, exclude hidden files/directories (default True)
+        respect_ignore: If True, respect .tldrignore patterns (default True)
 
     Returns:
         Dict with tree structure:
@@ -1622,6 +1701,12 @@ def get_file_tree(
 
     root = Path(root)
 
+    # Load .tldrignore patterns once for efficiency
+    ignore_spec = None
+    if respect_ignore:
+        from .tldrignore import load_ignore_patterns, should_ignore
+        ignore_spec = load_ignore_patterns(root)
+
     def scan_dir(path: Path) -> dict:
         result = {"name": path.name, "type": "dir", "children": []}
 
@@ -1634,6 +1719,15 @@ def get_file_tree(
             # Skip hidden files/dirs
             if exclude_hidden and item.name.startswith("."):
                 continue
+
+            # Skip DEFAULT_SKIP_DIRS
+            if item.is_dir() and item.name in DEFAULT_SKIP_DIRS:
+                continue
+
+            # Check .tldrignore patterns
+            if respect_ignore and ignore_spec is not None:
+                if should_ignore(item, root, ignore_spec):
+                    continue
 
             if item.is_dir():
                 child = scan_dir(item)
@@ -1687,27 +1781,6 @@ def search(
     # Security: Validate path containment
     _validate_path_containment(str(root))
 
-    # Directories to skip (common junk)
-    SKIP_DIRS = {
-        "node_modules",
-        "__pycache__",
-        ".git",
-        ".svn",
-        ".hg",
-        "dist",
-        "build",
-        ".next",
-        ".nuxt",
-        "coverage",
-        ".tox",
-        "venv",
-        ".venv",
-        "env",
-        ".env",
-        "vendor",
-        ".cache",
-    }
-
     results = []
     root = Path(root)
     try:
@@ -1730,7 +1803,7 @@ def search(
             parts = rel_path.parts
             if any(part.startswith(".") for part in parts):
                 continue
-            if any(part in SKIP_DIRS for part in parts):
+            if any(part in DEFAULT_SKIP_DIRS for part in parts):
                 continue
         except ValueError:
             continue
@@ -1742,7 +1815,7 @@ def search(
         files_scanned += 1
 
         try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            content = file_path.read_text(encoding="utf-8-sig", errors="ignore")
             lines = content.splitlines()
 
             for i, line in enumerate(lines, 1):
@@ -1798,6 +1871,7 @@ def get_code_structure(
     root: str | Path,
     language: str = "python",
     max_results: int = 100,
+    respect_ignore: bool = True,
 ) -> dict:
     """
     Get code structure (codemaps) for all files in a project.
@@ -1806,6 +1880,7 @@ def get_code_structure(
         root: Root directory to analyze
         language: Language to analyze ("python", "typescript", "go", "rust")
         max_results: Maximum number of files to analyze (default 100)
+        respect_ignore: If True, respect .tldrignore patterns (default True)
 
     Returns:
         Dict with codemap structure:
@@ -1830,6 +1905,10 @@ def get_code_structure(
     # Get extensions for language
     extensions = get_extensions_with_default(language)
 
+    # Load ignore patterns if respecting .tldrignore
+    from .tldrignore import load_ignore_patterns, should_ignore
+    ignore_spec = load_ignore_patterns(str(root)) if respect_ignore else None
+
     # Collect files to process (apply filtering before extraction)
     files_to_process: list[str] = []
     for file_path in root.rglob("*"):
@@ -1850,6 +1929,11 @@ def get_code_structure(
                 continue
         except ValueError:
             continue
+
+        # Check against .tldrignore patterns
+        if respect_ignore and ignore_spec:
+            if should_ignore(file_path, root, ignore_spec):
+                continue
 
         files_to_process.append(str(file_path))
 

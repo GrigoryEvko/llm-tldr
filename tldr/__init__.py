@@ -55,6 +55,9 @@ from .pdg_extractor import (
     extract_pdg,
 )
 
+# ML Engine: Semantic embeddings with optimal batching
+from .ml_engine import encode_optimally, build_index, search
+
 __all__ = [
     # Original
     "SignatureExtractor",
@@ -79,4 +82,8 @@ __all__ = [
     "PDGEdge",
     "extract_python_pdg",
     "extract_pdg",  # Multi-language convenience function
+    # ML Engine
+    "encode_optimally",
+    "build_index",
+    "search",
 ]

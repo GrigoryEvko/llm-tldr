@@ -250,7 +250,7 @@ def _can_parse_file(file_path: Path, lang: str) -> bool:
     import ast
 
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8-sig", errors="replace")
     except (FileNotFoundError, IOError):
         return False
 

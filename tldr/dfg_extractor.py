@@ -129,6 +129,8 @@ class PythonDefUseVisitor(ast.NodeVisitor):
 
     def _add_ref(self, name: str, ref_type: str, node: ast.AST):
         """Add a variable reference."""
+        if name in EXCLUDED_VAR_PATTERNS:
+            return  # Skip throwaway variables like _ and __
         ref = VarRef(
             name=name,
             ref_type=ref_type,
@@ -234,15 +236,23 @@ class PythonDefUseVisitor(ast.NodeVisitor):
             self._visit_target(node.target, "update")
 
     def _visit_target(self, target: ast.AST, ref_type: str):
-        """Visit an assignment target."""
-        if isinstance(target, ast.Name):
-            self._add_ref(target.id, ref_type, target)
-        elif isinstance(target, ast.Tuple) or isinstance(target, ast.List):
-            for elt in target.elts:
-                self._visit_target(elt, ref_type)
-        elif isinstance(target, ast.Starred):
-            self._visit_target(target.value, ref_type)
-        # Attribute/Subscript targets don't introduce new definitions
+        """Visit an assignment target.
+
+        Uses iterative processing to avoid recursion limit on deeply
+        nested tuple/list unpacking patterns.
+        """
+        # Use explicit stack for iterative traversal
+        stack = [target]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.Name):
+                self._add_ref(current.id, ref_type, current)
+            elif isinstance(current, (ast.Tuple, ast.List)):
+                # Add elements in reverse order so they're processed left-to-right
+                stack.extend(reversed(current.elts))
+            elif isinstance(current, ast.Starred):
+                stack.append(current.value)
+            # Attribute/Subscript targets don't introduce new definitions
 
     def visit_For(self, node: ast.For):
         """Handle for loop - target is definition."""
@@ -369,37 +379,55 @@ class PythonDefUseVisitor(ast.NodeVisitor):
                 self.visit(stmt)
 
     def _visit_pattern(self, pattern: ast.AST):
-        """Extract variable bindings from match patterns."""
-        if isinstance(pattern, ast.MatchAs):
-            if pattern.name:
-                self._add_ref(pattern.name, "definition", pattern)
-            if pattern.pattern:
-                self._visit_pattern(pattern.pattern)
-        elif isinstance(pattern, ast.MatchOr):
-            for p in pattern.patterns:
-                self._visit_pattern(p)
-        elif isinstance(pattern, ast.MatchSequence):
-            for p in pattern.patterns:
-                self._visit_pattern(p)
-        elif isinstance(pattern, ast.MatchMapping):
-            for p in pattern.patterns:
-                self._visit_pattern(p)
-            if pattern.rest:
-                self._add_ref(pattern.rest, "definition", pattern)
-        elif isinstance(pattern, ast.MatchClass):
-            for p in pattern.patterns:
-                self._visit_pattern(p)
-            for p in pattern.kwd_patterns:
-                self._visit_pattern(p)
-        elif isinstance(pattern, ast.MatchStar):
-            if pattern.name:
-                self._add_ref(pattern.name, "definition", pattern)
+        """Extract variable bindings from match patterns.
+
+        Uses iterative processing to avoid recursion limit on deeply
+        nested match patterns.
+        """
+        # Use explicit stack for iterative traversal
+        stack = [pattern]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.MatchAs):
+                if current.name:
+                    self._add_ref(current.name, "definition", current)
+                if current.pattern:
+                    stack.append(current.pattern)
+            elif isinstance(current, ast.MatchOr):
+                stack.extend(reversed(current.patterns))
+            elif isinstance(current, ast.MatchSequence):
+                stack.extend(reversed(current.patterns))
+            elif isinstance(current, ast.MatchMapping):
+                stack.extend(reversed(current.patterns))
+                if current.rest:
+                    self._add_ref(current.rest, "definition", current)
+            elif isinstance(current, ast.MatchClass):
+                # Process positional patterns then keyword patterns
+                stack.extend(reversed(current.kwd_patterns))
+                stack.extend(reversed(current.patterns))
+            elif isinstance(current, ast.MatchStar):
+                if current.name:
+                    self._add_ref(current.name, "definition", current)
 
     # Generic visitor for expressions with children
     def generic_visit(self, node: ast.AST):
-        """Visit all child nodes."""
-        for child in ast.iter_child_nodes(node):
-            self.visit(child)
+        """Visit all child nodes.
+
+        Uses iterative processing to avoid recursion limit on deeply
+        nested AST structures with 500+ nodes.
+        """
+        # Use explicit stack for iterative traversal
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            child = stack.pop()
+            # Dispatch to specific visitor method if exists
+            method_name = f"visit_{child.__class__.__name__}"
+            visitor = getattr(self, method_name, None)
+            if visitor is not None:
+                visitor(child)
+            else:
+                # No specific visitor - add children to stack for traversal
+                stack.extend(ast.iter_child_nodes(child))
 
 
 class PythonReachingDefsAnalyzer:

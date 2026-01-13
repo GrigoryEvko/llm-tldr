@@ -471,64 +471,95 @@ class PythonCFGBuilder(ast.NodeVisitor):
                 self.visit_Lambda(node)
 
     def visit_If(self, node: ast.If):
-        """Handle if/elif/else statements - creates diamond pattern."""
-        # Track decision point for complexity
-        self.decision_points += 1
+        """Handle if/elif/else statements - creates diamond pattern.
 
-        # Current block becomes branch block
-        if self.current_block:
-            self.current_block.block_type = "branch"
-            self.current_block.end_line = node.lineno
-            branch_block_id = self.current_block.id
-        else:
-            branch = self.new_block("branch", node.lineno)
-            branch_block_id = branch.id
-
-        condition = self._get_condition_str(node.test)
-
-        # Create block for true branch (if body)
-        if_body_start = node.body[0].lineno if node.body else node.lineno
-        if_body_end = node.body[-1].end_lineno if node.body else node.lineno
-        true_block = self.new_block("body", if_body_start, if_body_end)
-        self.add_edge(branch_block_id, true_block.id, "true", condition)
-
-        # Create after-if block for merging
+        Uses iterative processing for elif chains to avoid recursion limit
+        on large ASTs with 500+ elif branches.
+        """
+        # Create the final after-if block for merging all branches
+        # This is computed from the outermost if's end_lineno
         after_if = self.new_block("body", node.end_lineno or node.lineno)
 
-        # Process true branch
-        self.current_block = true_block
-        for stmt in node.body:
+        # Process the if/elif/else chain iteratively
+        # Each iteration handles one if/elif branch
+        current_if: ast.If | None = node
+        prev_branch_block_id: int | None = None
+
+        while current_if is not None:
+            # Track decision point for complexity
+            self.decision_points += 1
+
+            # Current block becomes branch block
             if self.current_block:
-                self._add_calls_to_block(self.current_block, stmt)
-            self.visit(stmt)
-        # Connect true branch to after-if (unless it ends with return)
-        if self.current_block and self.current_block.id not in self.exit_block_ids:
-            self.add_edge(self.current_block.id, after_if.id, "unconditional")
+                self.current_block.block_type = "branch"
+                self.current_block.end_line = current_if.lineno
+                branch_block_id = self.current_block.id
+            else:
+                branch = self.new_block("branch", current_if.lineno)
+                branch_block_id = branch.id
 
-        # Process false branch (else/elif)
-        if node.orelse:
-            else_body_start = node.orelse[0].lineno
-            else_body_end = (
-                node.orelse[-1].end_lineno
-                if hasattr(node.orelse[-1], "end_lineno")
-                else node.orelse[-1].lineno
-            )
-            false_block = self.new_block("body", else_body_start, else_body_end)
-            self.add_edge(
-                branch_block_id, false_block.id, "false", f"not ({condition})"
-            )
+            condition = self._get_condition_str(current_if.test)
 
-            self.current_block = false_block
-            for stmt in node.orelse:
+            # Create block for true branch (if/elif body)
+            if_body_start = current_if.body[0].lineno if current_if.body else current_if.lineno
+            if_body_end = current_if.body[-1].end_lineno if current_if.body else current_if.lineno
+            true_block = self.new_block("body", if_body_start, if_body_end)
+            self.add_edge(branch_block_id, true_block.id, "true", condition)
+
+            # Process true branch body
+            self.current_block = true_block
+            for stmt in current_if.body:
                 if self.current_block:
                     self._add_calls_to_block(self.current_block, stmt)
                 self.visit(stmt)
-            # Connect else branch to after-if (unless it ends with return)
+
+            # Connect true branch to after-if (unless it ends with return/raise)
             if self.current_block and self.current_block.id not in self.exit_block_ids:
                 self.add_edge(self.current_block.id, after_if.id, "unconditional")
-        else:
-            # No else - false edge goes directly to after-if
-            self.add_edge(branch_block_id, after_if.id, "false", f"not ({condition})")
+
+            # Check if orelse is an elif (single If node) or else block
+            if current_if.orelse:
+                if (
+                    len(current_if.orelse) == 1
+                    and isinstance(current_if.orelse[0], ast.If)
+                ):
+                    # This is an elif - continue the loop iteratively
+                    # Create false edge to the next branch block (will be created next iteration)
+                    next_if = current_if.orelse[0]
+                    next_branch = self.new_block("branch", next_if.lineno)
+                    self.add_edge(
+                        branch_block_id, next_branch.id, "false", f"not ({condition})"
+                    )
+                    self.current_block = next_branch
+                    current_if = next_if
+                else:
+                    # This is an else block - process it and exit the loop
+                    else_body_start = current_if.orelse[0].lineno
+                    else_body_end = (
+                        current_if.orelse[-1].end_lineno
+                        if hasattr(current_if.orelse[-1], "end_lineno")
+                        else current_if.orelse[-1].lineno
+                    )
+                    false_block = self.new_block("body", else_body_start, else_body_end)
+                    self.add_edge(
+                        branch_block_id, false_block.id, "false", f"not ({condition})"
+                    )
+
+                    self.current_block = false_block
+                    for stmt in current_if.orelse:
+                        if self.current_block:
+                            self._add_calls_to_block(self.current_block, stmt)
+                        self.visit(stmt)
+
+                    # Connect else branch to after-if (unless it ends with return/raise)
+                    if self.current_block and self.current_block.id not in self.exit_block_ids:
+                        self.add_edge(self.current_block.id, after_if.id, "unconditional")
+
+                    current_if = None  # Exit the loop
+            else:
+                # No else/elif - false edge goes directly to after-if
+                self.add_edge(branch_block_id, after_if.id, "false", f"not ({condition})")
+                current_if = None  # Exit the loop
 
         # Continue with after-if block
         self.current_block = after_if
@@ -770,6 +801,173 @@ class PythonCFGBuilder(ast.NodeVisitor):
 
         # Continue after loop
         self.current_block = after_loop
+
+    def visit_AsyncFor(self, node: ast.AsyncFor):
+        """Handle async for loops - same CFG structure as regular for.
+
+        Async for loops iterate over async iterables using __aiter__/__anext__.
+        The control flow structure is identical to sync for loops:
+        - Loop header (guard) block
+        - Loop body block with back edge
+        - Optional else clause on normal exhaustion
+        - Break skips else clause
+        """
+        # Track decision point for complexity
+        self.decision_points += 1
+
+        # Create loop guard block
+        guard = self.new_block("loop_header", node.lineno)
+
+        # Connect current block to guard
+        if self.current_block:
+            self.add_edge(self.current_block.id, guard.id, "unconditional")
+
+        # Create after-loop block (target for break - skips else)
+        after_loop = self.new_block("body", node.end_lineno or node.lineno)
+
+        # Track for break/continue
+        self.loop_guard_stack.append(guard.id)
+        self.after_loop_stack.append(after_loop.id)
+
+        # Create loop body block
+        if node.body:
+            body_start = node.body[0].lineno
+            body_end = (
+                node.body[-1].end_lineno
+                if hasattr(node.body[-1], "end_lineno")
+                else node.body[-1].lineno
+            )
+        else:
+            body_start = node.lineno
+            body_end = node.lineno
+        body = self.new_block("loop_body", body_start, body_end)
+
+        # Edge from guard to body (async iterator has next)
+        target_str = (
+            self._get_condition_str(node.target)
+            if isinstance(node.target, ast.expr)
+            else str(node.target)
+        )
+        iter_str = self._get_condition_str(node.iter)
+        self.add_edge(guard.id, body.id, "iterate", f"{target_str} in {iter_str}")
+
+        # Handle else clause: normal exhaustion goes to else, break skips else
+        if node.orelse:
+            else_start = node.orelse[0].lineno
+            else_end = (
+                node.orelse[-1].end_lineno
+                if hasattr(node.orelse[-1], "end_lineno")
+                else node.orelse[-1].lineno
+            )
+            else_block = self.new_block("body", else_start, else_end)
+            # Exhausted edge goes to else block (normal completion)
+            self.add_edge(guard.id, else_block.id, "exhausted")
+        else:
+            # No else clause - exhausted edge goes directly to after_loop
+            self.add_edge(guard.id, after_loop.id, "exhausted")
+
+        # Process loop body
+        self.current_block = body
+        for stmt in node.body:
+            if self.current_block:
+                self._add_calls_to_block(self.current_block, stmt)
+            self.visit(stmt)
+
+        # Back edge from end of body to guard
+        if self.current_block and self.current_block.id not in self.exit_block_ids:
+            self.add_edge(self.current_block.id, guard.id, "back_edge")
+
+        # Pop loop tracking
+        self.loop_guard_stack.pop()
+        self.after_loop_stack.pop()
+
+        # Process else clause if present
+        if node.orelse:
+            self.current_block = else_block
+            for stmt in node.orelse:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+            # Connect else block to after_loop
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_loop.id, "unconditional")
+
+        # Continue after loop
+        self.current_block = after_loop
+
+    def visit_With(self, node: ast.With):
+        """Handle with statements - context manager entry/body/exit.
+
+        Control flow:
+        - Enter context manager (__enter__ called)
+        - Execute body
+        - Exit context manager (__exit__ called, even on exception)
+
+        For CFG purposes, we model this as mostly sequential since the
+        context manager protocol is primarily about resource management.
+        Exceptions in body are handled by try/except if present.
+        """
+        if self.current_block is None:
+            self.current_block = self.new_block("body", node.lineno)
+
+        # Extract calls from context expressions
+        self._add_calls_to_block(self.current_block, node)
+
+        # Create body block
+        if node.body:
+            body_start = node.body[0].lineno
+            body_end = (
+                node.body[-1].end_lineno
+                if hasattr(node.body[-1], "end_lineno")
+                else node.body[-1].lineno
+            )
+        else:
+            body_start = node.lineno
+            body_end = node.lineno
+
+        body_block = self.new_block("body", body_start, body_end)
+        self.add_edge(self.current_block.id, body_block.id, "unconditional")
+        self.current_block = body_block
+
+        # Process body statements
+        for stmt in node.body:
+            if self.current_block:
+                self._add_calls_to_block(self.current_block, stmt)
+            self.visit(stmt)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith):
+        """Handle async with statements - same structure as regular with.
+
+        Async with uses __aenter__/__aexit__ instead of __enter__/__exit__,
+        but the control flow structure is identical.
+        """
+        if self.current_block is None:
+            self.current_block = self.new_block("body", node.lineno)
+
+        # Extract calls from context expressions
+        self._add_calls_to_block(self.current_block, node)
+
+        # Create body block
+        if node.body:
+            body_start = node.body[0].lineno
+            body_end = (
+                node.body[-1].end_lineno
+                if hasattr(node.body[-1], "end_lineno")
+                else node.body[-1].lineno
+            )
+        else:
+            body_start = node.lineno
+            body_end = node.lineno
+
+        body_block = self.new_block("body", body_start, body_end)
+        self.add_edge(self.current_block.id, body_block.id, "unconditional")
+        self.current_block = body_block
+
+        # Process body statements
+        for stmt in node.body:
+            if self.current_block:
+                self._add_calls_to_block(self.current_block, stmt)
+            self.visit(stmt)
 
     def visit_Assert(self, node: ast.Assert):
         """Handle assert statements - creates branch for pass/fail paths.
@@ -1623,25 +1821,28 @@ class TreeSitterCFGBuilder:
         self.current_block = after_loop
 
     def _visit_return(self, node):
-        """Handle return statements."""
+        """Handle return statements - terminates current path."""
         if self.current_block:
             self.current_block.block_type = "return"
             self.current_block.end_line = node.start_point[0] + 1
             self.exit_block_ids.append(self.current_block.id)
 
-        self.current_block = self.new_block("body", node.start_point[0] + 1)
+        # Mark control flow as terminated - don't create orphan blocks
+        self.current_block = None
 
     def _visit_break(self, node):
-        """Handle break statements."""
+        """Handle break statements - exits current loop."""
         if self.after_loop_stack and self.current_block:
             self.add_edge(self.current_block.id, self.after_loop_stack[-1], "break")
-            self.current_block = self.new_block("body", node.start_point[0] + 1)
+            # Mark control flow as terminated - don't create orphan blocks
+            self.current_block = None
 
     def _visit_continue(self, node):
-        """Handle continue statements."""
+        """Handle continue statements - jumps to loop header."""
         if self.loop_guard_stack and self.current_block:
             self.add_edge(self.current_block.id, self.loop_guard_stack[-1], "continue")
-            self.current_block = self.new_block("body", node.start_point[0] + 1)
+            # Mark control flow as terminated - don't create orphan blocks
+            self.current_block = None
 
     def _visit_guard(self, node):
         """Handle Swift guard statements - guard let/guard else pattern."""

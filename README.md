@@ -113,18 +113,24 @@ For **2-16x faster** embeddings, run a TEI (text-embeddings-inference) server:
 
 ```bash
 # Start TEI server (requires Docker/Podman with GPU support)
+# Adjust --max-batch-tokens based on your GPU VRAM:
+#   6GB GPU:  65536 (default)
+#   12GB GPU: 131072
+#   24GB GPU: 262144
 docker run -d --name tei-qwen3 \
   --gpus all \
   -p 18080:80 \
   -v ~/.cache/huggingface:/data \
-  ghcr.io/huggingface/text-embeddings-inference:cuda-latest \
+  ghcr.io/huggingface/text-embeddings-inference:89-latest-grpc \
   --model-id Qwen/Qwen3-Embedding-0.6B \
   --pooling last-token \
-  --auto-truncate
+  --max-batch-tokens 65536 \
+  --dtype float16
 
 # Configure TLDR to use it
 export TLDR_TEI_HOST=localhost
 export TLDR_TEI_PORT=18080
+export TEI_MAX_BATCH_TOKENS=65536  # Match server config
 
 # Now indexing and search use the high-performance server
 tldr warm .
@@ -151,10 +157,13 @@ Check your GPU: `nvidia-smi --query-gpu=name --format=csv`
 **Without TEI server:** Falls back to local `sentence-transformers` (slower but works everywhere).
 
 **TEI benefits:**
-- 2.4x faster on short sequences, 16x with batching
+- 2-16x faster with intelligent token-budget batching
+- Flash attention for memory-efficient long sequences
 - Rust-based server (no Python GIL)
 - Native MRL dimension truncation
 - Works with any Python version
+
+**Memory usage:** TEI with flash attention uses ~1.3GB for model weights + ~0.5-3GB for inference depending on batch size. A 6GB GPU comfortably handles `--max-batch-tokens 65536`.
 
 ### Keeping the Index Fresh
 

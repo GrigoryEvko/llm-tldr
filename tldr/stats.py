@@ -151,17 +151,60 @@ class StatsStore:
         self.path = Path(path)
 
     def append(self, stats: SessionStats) -> None:
-        """Append session stats to JSONL file.
+        """Atomically append session stats to JSONL file.
+
+        DA-6 FIX: Uses temp file + atomic replace to prevent corruption from:
+        - Concurrent writes from multiple daemon instances
+        - Interrupted writes (signal, crash, disk full)
+        - Power failure during write
+
+        The trade-off is higher I/O cost (full file copy), but stats files
+        are typically small (< 1MB) and appends are infrequent (every 10 requests).
 
         Args:
             stats: Session stats to persist
         """
+        import os
+        import tempfile
+
         # Ensure parent directory exists
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Append as single line
-        with open(self.path, "a") as f:
-            f.write(json.dumps(stats.to_dict()) + "\n")
+        line = json.dumps(stats.to_dict()) + "\n"
+        line_bytes = line.encode("utf-8")
+
+        # Write to temp file first, then atomic replace
+        fd, temp_path = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        try:
+            # Copy existing content if file exists
+            if self.path.exists():
+                with open(self.path, "rb") as src:
+                    # Read in chunks to handle large files efficiently
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        os.write(fd, chunk)
+
+            # Append new line
+            os.write(fd, line_bytes)
+            os.fsync(fd)  # Ensure data hits disk before replace
+            os.close(fd)
+            fd = -1  # Mark as closed
+
+            # Atomic replace - this is the key to atomicity
+            # os.replace() is atomic on POSIX systems
+            os.replace(temp_path, self.path)
+
+        except Exception:
+            # Clean up on failure
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     def get_session_history(self, session_id: str) -> list[dict[str, Any]]:
         """Get all records for a specific session.
