@@ -29,6 +29,7 @@ Example usage:
 
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import threading
@@ -118,6 +119,10 @@ class SalsaDB:
     This allows multiple queries to execute concurrently without blocking each other.
     """
 
+    # HIGH-010 FIX: Maximum cache entries before LRU eviction kicks in.
+    # Prevents unbounded memory growth in long-running processes.
+    MAX_CACHE_SIZE: int = 10000
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._thread_local = threading.local()  # Thread-local state for query tracking
@@ -134,6 +139,11 @@ class SalsaDB:
 
         # File to query dependencies: file_path -> set of query_keys
         self._file_to_queries: Dict[str, Set[QueryKey]] = {}
+
+        # HIGH-014 FIX: In-flight queries tracking to prevent duplicate execution.
+        # Maps query_key -> Event that signals when computation completes.
+        # Threads waiting for same query block on the Event instead of recomputing.
+        self._in_flight: Dict[QueryKey, threading.Event] = {}
 
         # Stats (shared, protected by lock)
         self._stats = QueryStats()
@@ -268,43 +278,89 @@ class SalsaDB:
             Query result
 
         Note:
-            Two threads computing the same query simultaneously will both
-            execute (acceptable for idempotent queries). The last to finish
-            wins the cache write - this is safe since queries are pure functions.
+            HIGH-014 FIX: If another thread is computing the same query,
+            we wait for it to finish instead of recomputing.
         """
         key = self._make_key(func, args)
 
         # =====================================================================
-        # Phase 1: Check cache (with lock - fast operation)
+        # Phase 1: Check cache and in-flight (with lock - fast operation)
+        # HIGH-011 FIX: Take snapshots inside lock, validate outside
         # =====================================================================
+        entry_snapshot: Optional[CacheEntry] = None
+        file_revisions_snapshot: Dict[str, int] = {}
+        wait_event: Optional[threading.Event] = None
+
         with self._lock:
-            if key in self._query_cache:
-                if self._is_entry_valid(key):
+            # HIGH-014 FIX: Check if another thread is computing this query
+            if key in self._in_flight:
+                wait_event = self._in_flight[key]
+
+            if wait_event is None and key in self._query_cache:
+                # HIGH-011 FIX: Snapshot entry data for validation outside lock
+                entry = self._query_cache[key]
+                entry_snapshot = entry
+                # Snapshot current file revisions for validation
+                for path in entry.file_dependencies:
+                    file_revisions_snapshot[path] = self._file_revisions.get(path, 0)
+
+        # HIGH-014 FIX: Wait for in-flight query if another thread is computing
+        if wait_event is not None:
+            wait_event.wait()
+            # After waiting, the result should be in cache - retry
+            with self._lock:
+                if key in self._query_cache:
                     self._stats.cache_hits += 1
-                    # Register dependency to parent even on cache hit.
-                    # Must push key onto stack so _register_dependency_to_parent
-                    # sees the correct parent-child relationship:
-                    # stack[-2] = parent (the currently executing query)
-                    # stack[-1] = child (the cached query being called)
                     self._query_stack.append(key)
                     self._register_dependency_to_parent(key)
                     self._query_stack.pop()
-                    return cast(T, self._query_cache[key].result)
+                    return cast(T, copy.deepcopy(self._query_cache[key].result))
+            # If not in cache after waiting (invalidated?), fall through to compute
 
-            self._stats.cache_misses += 1
+        # HIGH-011 FIX: Validate outside lock using snapshots
+        if entry_snapshot is not None:
+            if self._is_entry_valid_unlocked(entry_snapshot, file_revisions_snapshot):
+                with self._lock:
+                    # Double-check entry still exists (could have been invalidated)
+                    if key in self._query_cache:
+                        self._stats.cache_hits += 1
+                        self._query_stack.append(key)
+                        self._register_dependency_to_parent(key)
+                        self._query_stack.pop()
+                        return cast(T, copy.deepcopy(self._query_cache[key].result))
 
         # =====================================================================
-        # Phase 2: Setup thread-local state (no lock needed - per-thread)
+        # Phase 2: Register as in-flight and setup thread-local state
         # =====================================================================
+        completion_event = threading.Event()
+        with self._lock:
+            # HIGH-014 FIX: Check again if another thread started computing
+            if key in self._in_flight:
+                wait_event = self._in_flight[key]
+            else:
+                self._in_flight[key] = completion_event
+                self._stats.cache_misses += 1
+
+        # If another thread beat us, wait for it
+        if wait_event is not None:
+            wait_event.wait()
+            with self._lock:
+                if key in self._query_cache:
+                    self._stats.cache_hits += 1
+                    self._query_stack.append(key)
+                    self._register_dependency_to_parent(key)
+                    self._query_stack.pop()
+                    return cast(T, copy.deepcopy(self._query_cache[key].result))
+            # Fall through to compute if still not in cache
+
+        # Setup thread-local state (no lock needed - per-thread)
         self._pending_deps[key] = set()
-        self._file_reads[key] = {}  # Will capture file revisions at read time
+        self._file_reads[key] = {}
         self._query_stack.append(key)
 
         try:
             # =================================================================
             # Phase 3: Execute query (WITHOUT lock - slow operation!)
-            # This is the critical performance improvement: other queries
-            # can execute concurrently during this phase.
             # =================================================================
             if is_salsa_query(func):
                 original = getattr(func, "_original_func", func)
@@ -318,8 +374,6 @@ class SalsaDB:
             with self._lock:
                 self._stats.recomputations += 1
 
-                # Get file dependencies from thread-local tracker
-                # (captured at read time, not store time - prevents race conditions)
                 file_deps = self._file_reads.get(key, {}).copy()
 
                 entry = CacheEntry(
@@ -329,16 +383,14 @@ class SalsaDB:
                 )
 
                 self._query_cache[key] = entry
-
-                # Register dependency to parent (must be inside lock
-                # since it writes to shared state: _query_cache, _reverse_deps)
                 self._register_dependency_to_parent(key)
+                self._maybe_evict()
 
-            return result
+            return copy.deepcopy(result)
 
         finally:
             # =================================================================
-            # Phase 5: Cleanup thread-local state (no lock needed)
+            # Phase 5: Cleanup thread-local state and signal completion
             # =================================================================
             self._query_stack.pop()
 
@@ -347,6 +399,12 @@ class SalsaDB:
 
             if key in self._file_reads:
                 del self._file_reads[key]
+
+            # HIGH-014 FIX: Signal waiting threads and remove from in-flight
+            with self._lock:
+                if key in self._in_flight and self._in_flight[key] is completion_event:
+                    del self._in_flight[key]
+            completion_event.set()
 
     def _register_dependency_to_parent(self, child_key: QueryKey) -> None:
         """Register a child query as a dependency of the current parent query.
@@ -365,7 +423,6 @@ class SalsaDB:
             return
 
         # Track in pending deps (for queries still being computed)
-        # Note: _pending_deps is always available (it's a property returning thread-local dict)
         if parent_key in self._pending_deps:
             self._pending_deps[parent_key].add(child_key)
 
@@ -383,14 +440,11 @@ class SalsaDB:
 
         Handles SalsaDB instances by using id() for hashing.
         """
-        # Convert args to hashable form
         hashable_args = []
         for arg in args:
             if isinstance(arg, SalsaDB):
-                # Use id for SalsaDB instances (they're not hashable otherwise)
                 hashable_args.append(("__salsa_db__", id(arg)))
             elif isinstance(arg, (list, dict, set)):
-                # Convert mutable types
                 hashable_args.append(self._to_hashable(arg))
             else:
                 hashable_args.append(arg)
@@ -404,23 +458,29 @@ class SalsaDB:
         falling back to recursive tuple conversion for small ones.
         """
         if isinstance(obj, dict):
-            # Fast path: JSON serialize for large dicts (>10 items)
             if len(obj) > 10:
                 try:
+                    json_str = json.dumps(obj, sort_keys=True, default=str)
                     return (
-                        "__dict_hash__",
-                        hash(json.dumps(obj, sort_keys=True, default=str)),
+                        "__dict__",
+                        len(obj),
+                        hash(json_str),
+                        json_str[:100],
                     )
                 except (TypeError, ValueError):
                     pass
-            # Small dicts: use tuple approach for better debuggability
             return tuple(sorted((k, self._to_hashable(v)) for k, v in obj.items()))
 
         if isinstance(obj, (list, tuple)):
-            # Fast path: JSON serialize for large sequences (>100 items)
             if len(obj) > 100:
                 try:
-                    return ("__seq_hash__", hash(json.dumps(obj, default=str)))
+                    json_str = json.dumps(obj, default=str)
+                    return (
+                        "__seq__",
+                        len(obj),
+                        hash(json_str),
+                        json_str[:100],
+                    )
                 except (TypeError, ValueError):
                     pass
             return tuple(self._to_hashable(item) for item in obj)
@@ -428,7 +488,6 @@ class SalsaDB:
         if isinstance(obj, set):
             return frozenset(self._to_hashable(item) for item in obj)
 
-        # Primitives: verify hashability, fallback to str representation
         try:
             hash(obj)
             return obj
@@ -438,7 +497,7 @@ class SalsaDB:
     def _is_entry_valid(
         self, key: QueryKey, visited: Optional[Set[QueryKey]] = None
     ) -> bool:
-        """Check if a cache entry is still valid.
+        """Check if a cache entry is still valid (requires lock held).
 
         An entry is valid if:
         - All file dependencies have the same revision
@@ -451,12 +510,9 @@ class SalsaDB:
         Returns:
             True if the entry is valid, False otherwise
         """
-        # Initialize visited set on first call to detect cycles
         if visited is None:
             visited = set()
 
-        # Cycle detection: if we've already visited this key, consider it valid
-        # to break the recursion (we haven't invalidated it yet in this traversal)
         if key in visited:
             return True
 
@@ -466,17 +522,38 @@ class SalsaDB:
         visited.add(key)
         entry = self._query_cache[key]
 
-        # Check file dependencies
         for path, revision in entry.file_dependencies.items():
             current_revision = self._file_revisions.get(path, 0)
             if current_revision != revision:
                 return False
 
-        # Check query dependencies (recursively with cycle detection)
         for dep_key in entry.dependencies:
             if not self._is_entry_valid(dep_key, visited):
                 return False
 
+        return True
+
+    def _is_entry_valid_unlocked(
+        self,
+        entry: CacheEntry,
+        file_revisions: Dict[str, int],
+    ) -> bool:
+        """HIGH-011 FIX: Validate entry using pre-snapshotted data (no lock needed).
+
+        This allows validation to happen outside the lock, reducing contention.
+        Only checks file dependencies - query dependencies require lock access.
+
+        Args:
+            entry: The cache entry to validate
+            file_revisions: Snapshot of current file revisions
+
+        Returns:
+            True if file dependencies are valid, False otherwise
+        """
+        for path, expected_revision in entry.file_dependencies.items():
+            current_revision = file_revisions.get(path, 0)
+            if current_revision != expected_revision:
+                return False
         return True
 
     # -------------------------------------------------------------------------
@@ -517,7 +594,6 @@ class SalsaDB:
                 key = self._make_key(func, args)
                 self._invalidate_key(key)
             else:
-                # Invalidate all instances of this function
                 keys_to_invalidate = [
                     k for k in self._query_cache.keys() if k[0] == func
                 ]
@@ -525,14 +601,35 @@ class SalsaDB:
                     self._invalidate_key(key)
 
     def _invalidate_key(self, key: QueryKey) -> None:
-        """Invalidate a specific query key and cascade to dependents."""
+        """Invalidate a specific query key and cascade to dependents.
+
+        HIGH-012 FIX: Cleans up _file_to_queries references.
+        HIGH-013 FIX: Cleans up _reverse_deps references.
+        """
         if key not in self._query_cache:
             return
+
+        entry = self._query_cache[key]
+
+        # HIGH-012 FIX: Clean up ALL file dependency references
+        for path in entry.file_dependencies:
+            if path in self._file_to_queries:
+                self._file_to_queries[path].discard(key)
+                if not self._file_to_queries[path]:
+                    del self._file_to_queries[path]
+
+        # HIGH-013 FIX: Clean up reverse dependency references
+        # Remove this key from the reverse_deps sets of its children
+        for child_key in entry.dependencies:
+            if child_key in self._reverse_deps:
+                self._reverse_deps[child_key].discard(key)
+                if not self._reverse_deps[child_key]:
+                    del self._reverse_deps[child_key]
 
         # Remove from cache
         del self._query_cache[key]
 
-        # Cascade to dependents (reverse deps)
+        # Cascade to dependents (queries that depend on this one)
         if key in self._reverse_deps:
             dependents = list(self._reverse_deps[key])
             del self._reverse_deps[key]
@@ -549,6 +646,18 @@ class SalsaDB:
 
         for key in queries:
             self._invalidate_key(key)
+
+    def _maybe_evict(self) -> None:
+        """Evict oldest cache entries if cache exceeds MAX_CACHE_SIZE.
+
+        HIGH-010 FIX: Prevents unbounded memory growth by removing oldest
+        entries (FIFO eviction - dict preserves insertion order in Python 3.7+).
+
+        Must be called with lock held.
+        """
+        while len(self._query_cache) > self.MAX_CACHE_SIZE:
+            oldest_key = next(iter(self._query_cache))
+            self._invalidate_key(oldest_key)
 
     # -------------------------------------------------------------------------
     # Statistics
@@ -574,6 +683,5 @@ class SalsaDB:
             self._query_cache.clear()
             self._reverse_deps.clear()
             self._file_to_queries.clear()
-            # Keep file contents and revisions
-            # Reset stats
+            self._in_flight.clear()
             self._stats = QueryStats()

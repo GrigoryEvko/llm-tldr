@@ -339,7 +339,7 @@ class PythonCFGBuilder(ast.NodeVisitor):
 
         # Visit function body
         for stmt in func_node.body:
-            # Extract calls before visiting (which may create new blocks)
+            # Extract calls and scan expressions before visiting (which may create new blocks)
             if self.current_block:
                 self._add_calls_to_block(self.current_block, stmt)
             self.visit(stmt)
@@ -441,11 +441,34 @@ class PythonCFGBuilder(ast.NodeVisitor):
         return []
 
     def _add_calls_to_block(self, block: CFGBlock, stmt: ast.AST):
-        """Extract and add function calls from statement to block."""
+        """Extract and add function calls from statement to block.
+
+        Also scans for comprehensions and lambdas that affect complexity.
+        """
         calls = self._extract_calls_shallow(stmt)
         for call in calls:
             if call not in block.func_calls:
                 block.func_calls.append(call)
+        # Scan for expressions that affect complexity
+        self._scan_expressions(stmt)
+
+    def _scan_expressions(self, stmt: ast.AST):
+        """Scan statement for expressions that affect complexity or contain calls.
+
+        Walks the AST to find comprehensions and lambdas that may not be
+        visited by the normal statement visitor pattern.
+        """
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.ListComp):
+                self.visit_ListComp(node)
+            elif isinstance(node, ast.SetComp):
+                self.visit_SetComp(node)
+            elif isinstance(node, ast.DictComp):
+                self.visit_DictComp(node)
+            elif isinstance(node, ast.GeneratorExp):
+                self.visit_GeneratorExp(node)
+            elif isinstance(node, ast.Lambda):
+                self.visit_Lambda(node)
 
     def visit_If(self, node: ast.If):
         """Handle if/elif/else statements - creates diamond pattern."""
@@ -510,8 +533,76 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Continue with after-if block
         self.current_block = after_if
 
+    def visit_Match(self, node: ast.Match):
+        """Handle match/case statements (Python 3.10+).
+
+        Creates a multi-way branch with one decision point per case.
+        Guards on cases create additional decision points.
+        """
+        # The match statement itself is a branch point
+        if self.current_block:
+            self.current_block.block_type = "branch"
+            self.current_block.end_line = node.lineno
+            match_block_id = self.current_block.id
+        else:
+            match_block = self.new_block("branch", node.lineno)
+            match_block_id = match_block.id
+
+        # Create after-match block for merging all case branches
+        after_match = self.new_block("body", node.end_lineno or node.lineno)
+
+        # Process each case clause
+        for case in node.cases:
+            # Each case is a decision point
+            self.decision_points += 1
+
+            # Determine case block line range
+            case_start = (
+                case.pattern.lineno
+                if hasattr(case.pattern, "lineno")
+                else case.body[0].lineno if case.body else node.lineno
+            )
+            case_end = (
+                case.body[-1].end_lineno
+                if case.body and hasattr(case.body[-1], "end_lineno")
+                else case_start
+            )
+
+            case_block = self.new_block("body", case_start, case_end)
+
+            # Get pattern as condition string for edge label
+            try:
+                pattern_str = ast.unparse(case.pattern)
+            except Exception:
+                pattern_str = "<pattern>"
+
+            self.add_edge(match_block_id, case_block.id, "case", pattern_str)
+
+            # Guard creates an additional decision point
+            if case.guard:
+                self.decision_points += 1
+
+            # Process case body
+            self.current_block = case_block
+            for stmt in case.body:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+
+            # Connect to after-match (unless case ends with return/raise)
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_match.id, "unconditional")
+
+        # Continue with after-match block
+        self.current_block = after_match
+
     def visit_While(self, node: ast.While):
-        """Handle while loops - creates loop with back edge."""
+        """Handle while loops - creates loop with back edge.
+
+        Python while loops can have an else clause that executes when
+        the loop completes normally (condition becomes false), but NOT
+        when exited via break.
+        """
         # Track decision point for complexity
         self.decision_points += 1
 
@@ -524,7 +615,7 @@ class PythonCFGBuilder(ast.NodeVisitor):
 
         condition = self._get_condition_str(node.test)
 
-        # Create after-loop block
+        # Create after-loop block (target for break - skips else)
         after_loop = self.new_block("body", node.end_lineno or node.lineno)
 
         # Track for break/continue
@@ -547,8 +638,20 @@ class PythonCFGBuilder(ast.NodeVisitor):
         # Edge from guard to body (condition true)
         self.add_edge(guard.id, body.id, "true", condition)
 
-        # Edge from guard to after (condition false)
-        self.add_edge(guard.id, after_loop.id, "false", f"not ({condition})")
+        # Handle else clause: normal exit goes to else, break skips else
+        if node.orelse:
+            else_start = node.orelse[0].lineno
+            else_end = (
+                node.orelse[-1].end_lineno
+                if hasattr(node.orelse[-1], "end_lineno")
+                else node.orelse[-1].lineno
+            )
+            else_block = self.new_block("body", else_start, else_end)
+            # False edge goes to else block (normal completion)
+            self.add_edge(guard.id, else_block.id, "false", f"not ({condition})")
+        else:
+            # No else clause - false edge goes directly to after_loop
+            self.add_edge(guard.id, after_loop.id, "false", f"not ({condition})")
 
         # Process loop body
         self.current_block = body
@@ -565,11 +668,26 @@ class PythonCFGBuilder(ast.NodeVisitor):
         self.loop_guard_stack.pop()
         self.after_loop_stack.pop()
 
+        # Process else clause if present
+        if node.orelse:
+            self.current_block = else_block
+            for stmt in node.orelse:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+            # Connect else block to after_loop
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_loop.id, "unconditional")
+
         # Continue after loop
         self.current_block = after_loop
 
     def visit_For(self, node: ast.For):
-        """Handle for loops - similar to while but with iterator."""
+        """Handle for loops - similar to while but with iterator.
+
+        Python for loops can have an else clause that executes when
+        the iterator is exhausted normally, but NOT when exited via break.
+        """
         # Track decision point for complexity
         self.decision_points += 1
 
@@ -580,7 +698,7 @@ class PythonCFGBuilder(ast.NodeVisitor):
         if self.current_block:
             self.add_edge(self.current_block.id, guard.id, "unconditional")
 
-        # Create after-loop block
+        # Create after-loop block (target for break - skips else)
         after_loop = self.new_block("body", node.end_lineno or node.lineno)
 
         # Track for break/continue
@@ -609,8 +727,20 @@ class PythonCFGBuilder(ast.NodeVisitor):
         iter_str = self._get_condition_str(node.iter)
         self.add_edge(guard.id, body.id, "iterate", f"{target_str} in {iter_str}")
 
-        # Edge from guard to after (iterator exhausted)
-        self.add_edge(guard.id, after_loop.id, "exhausted")
+        # Handle else clause: normal exhaustion goes to else, break skips else
+        if node.orelse:
+            else_start = node.orelse[0].lineno
+            else_end = (
+                node.orelse[-1].end_lineno
+                if hasattr(node.orelse[-1], "end_lineno")
+                else node.orelse[-1].lineno
+            )
+            else_block = self.new_block("body", else_start, else_end)
+            # Exhausted edge goes to else block (normal completion)
+            self.add_edge(guard.id, else_block.id, "exhausted")
+        else:
+            # No else clause - exhausted edge goes directly to after_loop
+            self.add_edge(guard.id, after_loop.id, "exhausted")
 
         # Process loop body
         self.current_block = body
@@ -627,8 +757,145 @@ class PythonCFGBuilder(ast.NodeVisitor):
         self.loop_guard_stack.pop()
         self.after_loop_stack.pop()
 
+        # Process else clause if present
+        if node.orelse:
+            self.current_block = else_block
+            for stmt in node.orelse:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+            # Connect else block to after_loop
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_loop.id, "unconditional")
+
         # Continue after loop
         self.current_block = after_loop
+
+    def visit_Assert(self, node: ast.Assert):
+        """Handle assert statements - creates branch for pass/fail paths.
+
+        Assert is a decision point: execution either continues (assertion pass)
+        or raises AssertionError (assertion fail). This affects cyclomatic
+        complexity and should be modeled as a branch in the CFG.
+        """
+        self.decision_points += 1
+
+        if self.current_block is None:
+            self.current_block = self.new_block("branch", node.lineno)
+
+        assert_block = self.current_block
+        assert_block.block_type = "branch"
+        assert_block.end_line = node.lineno
+
+        condition = self._get_condition_str(node.test)
+
+        # Create exception path (AssertionError) - this is an exit point
+        error_block = self.new_block("return", node.lineno)
+        error_block.end_line = node.lineno
+        self.add_edge(
+            assert_block.id, error_block.id, "assert_fail", f"not ({condition})"
+        )
+        self.exit_block_ids.append(error_block.id)
+
+        # Continue normal path (assertion passed)
+        pass_block = self.new_block("body", node.lineno)
+        self.add_edge(assert_block.id, pass_block.id, "assert_pass", condition)
+        self.current_block = pass_block
+
+    def visit_Try(self, node: ast.Try):
+        """Handle try/except/else/finally blocks.
+
+        Control flow:
+        - try body executes, can either complete or raise
+        - Each except handler catches specific exceptions
+        - else block runs only if try completes without exception
+        - finally block always runs (modeled as part of exit path)
+        """
+        # Save try start block
+        try_start = self.current_block
+        try_start_id = try_start.id if try_start else None
+
+        # Create after-try block for merging all paths
+        after_try = self.new_block("body", node.end_lineno or node.lineno)
+
+        # Process try body
+        for stmt in node.body:
+            if self.current_block:
+                self._add_calls_to_block(self.current_block, stmt)
+            self.visit(stmt)
+
+        try_end_block = self.current_block
+        try_end_id = try_end_block.id if try_end_block else None
+
+        # Track if try end can flow to else/after (wasn't terminated by return/raise)
+        try_can_continue = try_end_block and try_end_block.id not in self.exit_block_ids
+
+        # Each except handler is a decision point
+        for handler in node.handlers:
+            self.decision_points += 1
+
+            handler_start = handler.lineno
+            handler_end = (
+                handler.body[-1].end_lineno
+                if handler.body and hasattr(handler.body[-1], "end_lineno")
+                else handler_start
+            )
+
+            except_block = self.new_block("body", handler_start, handler_end)
+
+            # Edge from try start to except (on exception)
+            if try_start_id is not None:
+                exception_type = ast.unparse(handler.type) if handler.type else "BaseException"
+                self.add_edge(try_start_id, except_block.id, "exception", exception_type)
+
+            self.current_block = except_block
+            for stmt in handler.body:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+
+            # Connect handler exit to after-try
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_try.id, "unconditional")
+
+        # else block runs if no exception
+        if node.orelse:
+            else_start = node.orelse[0].lineno
+            else_end = (
+                node.orelse[-1].end_lineno
+                if hasattr(node.orelse[-1], "end_lineno")
+                else node.orelse[-1].lineno
+            )
+
+            else_block = self.new_block("body", else_start, else_end)
+
+            if try_can_continue and try_end_id is not None:
+                self.add_edge(try_end_id, else_block.id, "no_exception")
+
+            self.current_block = else_block
+            for stmt in node.orelse:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+
+            if self.current_block and self.current_block.id not in self.exit_block_ids:
+                self.add_edge(self.current_block.id, after_try.id, "unconditional")
+        else:
+            # No else - try end goes directly to after-try
+            if try_can_continue and try_end_id is not None:
+                self.add_edge(try_end_id, after_try.id, "unconditional")
+
+        # finally block - process as sequential statements
+        # In reality, finally runs in all cases, but for CFG we model it
+        # as code that runs after exception handling converges
+        if node.finalbody:
+            self.current_block = after_try
+            for stmt in node.finalbody:
+                if self.current_block:
+                    self._add_calls_to_block(self.current_block, stmt)
+                self.visit(stmt)
+
+        self.current_block = after_try
 
     def visit_Return(self, node: ast.Return):
         """Handle return statements - marks exit block."""
@@ -637,22 +904,93 @@ class PythonCFGBuilder(ast.NodeVisitor):
             self.current_block.end_line = node.lineno
             self.exit_block_ids.append(self.current_block.id)
 
-        # Create unreachable block for any code after return
-        self.current_block = self.new_block("body", node.lineno)
+        # Mark control flow as terminated - don't create orphan blocks
+        self.current_block = None
+
+    def visit_Raise(self, node: ast.Raise):
+        """Handle raise statements - marks exit point.
+
+        A raise statement transfers control to exception handlers,
+        effectively terminating the current block like return.
+        """
+        if self.current_block:
+            self.current_block.block_type = "raise"
+            self.current_block.end_line = node.lineno
+            self.exit_block_ids.append(self.current_block.id)
+
+        # Mark control flow as terminated - don't create orphan blocks
+        self.current_block = None
 
     def visit_Break(self, node: ast.Break):
         """Handle break - edge to after-loop block."""
         if self.after_loop_stack and self.current_block:
             self.add_edge(self.current_block.id, self.after_loop_stack[-1], "break")
-            # Create unreachable block for any code after break
-            self.current_block = self.new_block("body", node.lineno)
+            # Mark control flow as terminated - don't create orphan blocks
+            self.current_block = None
 
     def visit_Continue(self, node: ast.Continue):
         """Handle continue - edge to loop guard."""
         if self.loop_guard_stack and self.current_block:
             self.add_edge(self.current_block.id, self.loop_guard_stack[-1], "continue")
-            # Create unreachable block for any code after continue
-            self.current_block = self.new_block("body", node.lineno)
+            # Mark control flow as terminated - don't create orphan blocks
+            self.current_block = None
+
+    def _extract_calls_from_expr(self, expr: ast.expr):
+        """Extract function calls from an expression and add to current block."""
+        if self.current_block:
+            for child in ast.walk(expr):
+                if isinstance(child, ast.Call):
+                    calls = self._get_call_name(child)
+                    for call in calls:
+                        if call not in self.current_block.func_calls:
+                            self.current_block.func_calls.append(call)
+
+    def visit_Lambda(self, node: ast.Lambda):
+        """Track lambda expressions.
+
+        Lambdas are single expressions so they don't create complex control flow,
+        but we visit the body to capture any function calls within.
+        """
+        self._extract_calls_from_expr(node.body)
+
+    def _visit_comprehension(
+        self, generators: list[ast.comprehension], *exprs: ast.expr
+    ):
+        """Handle comprehension decision points and calls.
+
+        Each 'if' clause in a comprehension is a decision point that affects
+        cyclomatic complexity.
+
+        Args:
+            generators: List of comprehension generators (for clauses)
+            exprs: Element expressions to scan for calls (elt, key, value)
+        """
+        for generator in generators:
+            # Each 'if' clause in a comprehension is a decision point
+            for if_clause in generator.ifs:
+                self.decision_points += 1
+                self._extract_calls_from_expr(if_clause)
+            # Also extract calls from the iter expression
+            self._extract_calls_from_expr(generator.iter)
+        # Extract calls from element expressions
+        for expr in exprs:
+            self._extract_calls_from_expr(expr)
+
+    def visit_ListComp(self, node: ast.ListComp):
+        """Track list comprehension conditions as decision points."""
+        self._visit_comprehension(node.generators, node.elt)
+
+    def visit_SetComp(self, node: ast.SetComp):
+        """Track set comprehension conditions as decision points."""
+        self._visit_comprehension(node.generators, node.elt)
+
+    def visit_DictComp(self, node: ast.DictComp):
+        """Track dict comprehension conditions as decision points."""
+        self._visit_comprehension(node.generators, node.key, node.value)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        """Track generator expression conditions as decision points."""
+        self._visit_comprehension(node.generators, node.elt)
 
     def generic_visit(self, node: ast.AST):
         """Visit children for compound statements we don't handle specially."""
@@ -861,6 +1199,13 @@ class TreeSitterCFGBuilder:
             self.current_block.end_line = max(
                 self.current_block.end_line, func_node.end_point[0] + 1
             )
+
+        # Compute predecessors from edges (matching PythonCFGBuilder behavior)
+        block_map = {b.id: b for b in self.blocks}
+        for edge in self.edges:
+            target = block_map.get(edge.target_id)
+            if target and edge.source_id not in target.predecessors:
+                target.predecessors.append(edge.source_id)
 
         # Calculate cyclomatic complexity: decision points + 1
         complexity = self.decision_points + 1
@@ -1311,8 +1656,8 @@ class TreeSitterCFGBuilder:
             branch = self.new_block("branch", node.start_point[0] + 1)
             branch_block_id = branch.id
 
-        # Get condition text (guard condition) - kept for future use/debugging
-        _condition = self.get_node_text(node)
+        # Guard condition text extracted for edge labels
+        condition = self.get_node_text(node)
 
         # Create after-guard block for normal flow (guard passes)
         after_guard = self.new_block("body", node.end_point[0] + 1)
@@ -1328,7 +1673,7 @@ class TreeSitterCFGBuilder:
             false_block = self.new_block(
                 "body", else_body.start_point[0] + 1, else_body.end_point[0] + 1
             )
-            self.add_edge(branch_block_id, false_block.id, "false", "guard failed")
+            self.add_edge(branch_block_id, false_block.id, "false", f"guard failed: {condition}")
 
             self.current_block = false_block
             self._visit_node(else_body)
@@ -1337,18 +1682,23 @@ class TreeSitterCFGBuilder:
             if self.current_block and self.current_block.id not in self.exit_block_ids:
                 self.add_edge(self.current_block.id, after_guard.id, "unconditional")
         else:
-            self.add_edge(branch_block_id, after_guard.id, "false", "guard failed")
+            self.add_edge(branch_block_id, after_guard.id, "false", f"guard failed: {condition}")
 
         # True edge goes to after_guard (guard passes, execution continues)
-        self.add_edge(branch_block_id, after_guard.id, "true", "guard passed")
+        self.add_edge(branch_block_id, after_guard.id, "true", f"guard passed: {condition}")
 
         self.current_block = after_guard
 
     def _visit_switch(self, node):
-        """Handle switch/case statements."""
-        # Track decision point for complexity (each case is a decision)
-        self.decision_points += 1
+        """Handle switch/case statements.
 
+        Cyclomatic complexity: Each case contributes 1 decision point.
+        The switch itself is not a decision point (just routing).
+        For N cases, complexity contribution is N (not 1+N).
+
+        Fallthrough: A case falls through to the next if the PREVIOUS case
+        has no break/return statement.
+        """
         if self.current_block:
             self.current_block.block_type = "branch"
             self.current_block.end_line = node.start_point[0] + 1
@@ -1373,16 +1723,21 @@ class TreeSitterCFGBuilder:
         )
 
         def find_cases(parent_node):
-            """Recursively find case nodes (they may be inside compound_statement/switch_block)."""
+            """Recursively find case nodes (they may be inside container nodes)."""
             cases = []
             for child in parent_node.children:
                 if child.type in case_types:
                     cases.append(child)
-                elif child.type in ("compound_statement", "switch_block"):
+                elif child.type in (
+                    "compound_statement",
+                    "switch_block",
+                    "switch_body",  # JavaScript uses switch_body to contain switch_case
+                ):
                     cases.extend(find_cases(child))
             return cases
 
         prev_case_block = None
+        prev_case_node = None  # Track previous case AST node to check for break/return
         for child in find_cases(node):
             # Each case is a new decision point
             self.decision_points += 1
@@ -1391,15 +1746,17 @@ class TreeSitterCFGBuilder:
             )
             self.add_edge(switch_block_id, case_block.id, "case")
 
-            # Handle fallthrough from previous case (if no break/return)
+            # Handle fallthrough from previous case
+            # Check if PREVIOUS case had break/return (not current case)
             if prev_case_block and prev_case_block.id not in self.exit_block_ids:
-                has_break = any(
-                    c.type in ("break_statement", "return_statement")
-                    for c in child.children
-                    if c.is_named
-                )
-                if not has_break:
-                    self.add_edge(prev_case_block.id, case_block.id, "fallthrough")
+                if prev_case_node is not None:
+                    prev_had_break = any(
+                        c.type in ("break_statement", "return_statement")
+                        for c in prev_case_node.children
+                        if c.is_named
+                    )
+                    if not prev_had_break:
+                        self.add_edge(prev_case_block.id, case_block.id, "fallthrough")
 
             self.current_block = case_block
             # Visit case body
@@ -1416,6 +1773,7 @@ class TreeSitterCFGBuilder:
                 self.add_edge(self.current_block.id, after_switch.id, "unconditional")
 
             prev_case_block = self.current_block
+            prev_case_node = child  # Save current case AST node for next iteration
 
         self.current_block = after_switch
 
@@ -1437,7 +1795,7 @@ def _get_ts_parser(language: str):
         else:
             parser.language = Language(tree_sitter_typescript.language_typescript())
     elif language == "javascript":
-        if not TREE_SITTER_AVAILABLE:
+        if not TREE_SITTER_JS_AVAILABLE:
             raise ImportError("tree-sitter-javascript not available")
         import tree_sitter_javascript
 
@@ -2080,7 +2438,7 @@ class ElixirCFGBuilder:
             and len(self.blocks) == 1
             and self.entry_block_id is not None
         ):
-            # Change entry block back to "body" type
+            # Ensure first block is marked as entry point
             self.blocks[0].block_type = "entry"
             # Create a proper exit block
             exit_block = self.new_block("exit", func_node.end_point[0] + 1)
@@ -2088,6 +2446,13 @@ class ElixirCFGBuilder:
             self.add_edge(self.entry_block_id, exit_block.id, "unconditional")
             # Update exit block list
             self.exit_block_ids = [exit_block.id]
+
+        # Compute predecessors from edges (matching PythonCFGBuilder behavior)
+        block_map = {b.id: b for b in self.blocks}
+        for edge in self.edges:
+            target = block_map.get(edge.target_id)
+            if target and edge.source_id not in target.predecessors:
+                target.predecessors.append(edge.source_id)
 
         complexity = self.decision_points + 1
 

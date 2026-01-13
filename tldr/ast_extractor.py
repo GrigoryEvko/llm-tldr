@@ -136,14 +136,29 @@ class ImportInfo:
 
     module: str
     names: list[str]  # Empty for 'import x', filled for 'from x import y, z'
+    aliases: dict[str, str] = field(default_factory=dict)  # name -> asname mapping
     is_from: bool = False
+    level: int = 0  # Relative import level (0 = absolute, 1 = '.', 2 = '..', etc.)
     line_number: int = 0
 
     def statement(self) -> str:
         """Return import statement string."""
         if self.is_from:
-            names_str = ", ".join(self.names)
-            return f"from {self.module} import {names_str}"
+            # Format imported names with aliases
+            name_parts = []
+            for name in self.names:
+                if name in self.aliases:
+                    name_parts.append(f"{name} as {self.aliases[name]}")
+                else:
+                    name_parts.append(name)
+            names_str = ", ".join(name_parts)
+            # Handle relative imports: prepend dots for level
+            dots = "." * self.level
+            module_part = self.module or ""  # Empty for 'from . import foo'
+            return f"from {dots}{module_part} import {names_str}"
+        # Regular import with optional alias
+        if self.module in self.aliases:
+            return f"import {self.module} as {self.aliases[self.module]}"
         return f"import {self.module}"
 
 
@@ -186,7 +201,13 @@ class ModuleInfo:
             "language": self.language,
             "docstring": self.docstring,
             "imports": [
-                {"module": i.module, "names": i.names, "is_from": i.is_from}
+                {
+                    "module": i.module,
+                    "names": i.names,
+                    "aliases": i.aliases,
+                    "is_from": i.is_from,
+                    "level": i.level,
+                }
                 for i in self.imports
             ],
             "classes": [
@@ -312,10 +333,13 @@ class PythonASTExtractor:
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
+                    # Capture alias if present (e.g., 'import numpy as np')
+                    aliases = {alias.name: alias.asname} if alias.asname else {}
                     module_info.imports.append(
                         ImportInfo(
                             module=alias.name,
                             names=[],
+                            aliases=aliases,
                             is_from=False,
                             line_number=node.lineno,
                         )
@@ -324,11 +348,19 @@ class PythonASTExtractor:
             elif isinstance(node, ast.ImportFrom):
                 module_name = node.module or ""
                 names = [alias.name for alias in node.names]
+                # Capture all aliases (e.g., 'from x import y as z, a as b')
+                aliases = {
+                    alias.name: alias.asname
+                    for alias in node.names
+                    if alias.asname
+                }
                 module_info.imports.append(
                     ImportInfo(
                         module=module_name,
                         names=names,
+                        aliases=aliases,
                         is_from=True,
+                        level=node.level,  # Relative import level
                         line_number=node.lineno,
                     )
                 )
@@ -405,10 +437,13 @@ class PythonASTExtractor:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method = self._extract_function(item, is_method=True)
                 class_info.methods.append(method)
-                # Extract calls from this method
+                # Extract calls from this method with class context for self.method() qualification
                 if call_graph and defined_names:
                     caller_name = f"{qualified_name}.{item.name}"
-                    self._extract_calls(item, caller_name, call_graph, defined_names)
+                    self._extract_calls(
+                        item, caller_name, call_graph, defined_names,
+                        class_context=qualified_name
+                    )
 
             elif isinstance(item, ast.ClassDef):
                 # Recursively extract nested classes
@@ -449,21 +484,46 @@ class PythonASTExtractor:
         caller_name: str,
         call_graph: CallGraphInfo,
         defined_names: set[str],
+        class_context: str = "",
     ):
-        """Extract function calls from a function body."""
+        """Extract function calls from a function body.
+
+        Args:
+            node: The function AST node to analyze
+            caller_name: Qualified name of the calling function
+            call_graph: CallGraphInfo to populate
+            defined_names: Set of function names defined in the module
+            class_context: Name of containing class (for qualifying self.method calls)
+        """
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
-                callee = self._get_call_name(child)
-                if callee and callee in defined_names:
+                callee = self._get_call_name(child, class_context)
+                # Check both simple name and qualified name in defined_names
+                simple_name = callee.split(".")[-1] if callee and "." in callee else callee
+                if callee and simple_name in defined_names:
                     call_graph.add_call(caller_name, callee)
 
-    def _get_call_name(self, node: ast.Call) -> str | None:
-        """Get the name of a called function."""
+    def _get_call_name(self, node: ast.Call, class_context: str = "") -> str | None:
+        """Get the name of a called function.
+
+        Args:
+            node: The Call AST node
+            class_context: Name of containing class for qualifying self.method() calls
+
+        Returns:
+            Qualified function name if determinable, simple name otherwise
+        """
         if isinstance(node.func, ast.Name):
             return node.func.id
         elif isinstance(node.func, ast.Attribute):
             # For method calls like self.method() or obj.method()
-            # We only track the method name for simplicity
+            # Qualify with class context when caller is 'self'
+            if isinstance(node.func.value, ast.Name):
+                if node.func.value.id == "self" and class_context:
+                    return f"{class_context}.{node.func.attr}"
+                elif node.func.value.id == "cls" and class_context:
+                    return f"{class_context}.{node.func.attr}"
+            # For other attribute calls, return just the method name
             return node.func.attr
         return None
 
@@ -472,7 +532,10 @@ class PythonASTExtractor:
     ) -> FunctionInfo:
         """Extract function/method information."""
         params = self._extract_params(node.args)
-        return_type = self._node_to_str(node.returns) if node.returns else None
+        # Normalize return type to strip forward reference quotes
+        return_type = None
+        if node.returns:
+            return_type = self._normalize_annotation(self._node_to_str(node.returns))
         decorators = [self._node_to_str(d) for d in node.decorator_list]
 
         return FunctionInfo(
@@ -530,10 +593,19 @@ class PythonASTExtractor:
 
         return params
 
+    def _normalize_annotation(self, ann: str) -> str:
+        """Normalize type annotation by stripping forward reference quotes.
+
+        Forward references like 'Node' and direct references like Node
+        should be represented consistently without quotes.
+        """
+        return ann.strip("'\"")
+
     def _format_arg(self, arg: ast.arg) -> str:
         """Format a single argument with optional type annotation."""
         if arg.annotation:
-            return f"{arg.arg}: {self._node_to_str(arg.annotation)}"
+            ann = self._normalize_annotation(self._node_to_str(arg.annotation))
+            return f"{arg.arg}: {ann}"
         return arg.arg
 
     def _node_to_str(self, node: ast.AST | None) -> str:

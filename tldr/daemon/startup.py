@@ -86,6 +86,11 @@ def _try_acquire_pidfile_lock(pid_path: Path) -> Optional[IO]:
     try:
         # Open in append mode to create if not exists, don't truncate
         pidfile = open(pid_path, "a+")
+        # Ensure consistent file position across platforms before locking.
+        # In a+ mode, Windows starts at EOF while Unix may start at position 0.
+        # msvcrt.locking locks bytes from current position, so inconsistent
+        # positions cause inconsistent lock regions (BUG HIGH-019 fix).
+        pidfile.seek(0)
 
         if sys.platform == "win32":
             # Windows: msvcrt.locking with LK_NBLCK (non-blocking)
@@ -162,37 +167,35 @@ def _is_daemon_alive(project: Path, retries: int = 3, delay: float = 0.1) -> boo
             # Lock held by another process = daemon is alive
             return True
 
-        # We got the lock - check if there's a stale PID
-        pidfile.seek(0)
-        content = pidfile.read().strip()
-        if content:
-            try:
-                pid = int(content)
-                if _is_process_running(pid):
-                    # Process exists but we got the lock? Shouldn't happen normally.
-                    # Could be a daemon that crashed after writing PID but before locking.
-                    # Release lock and report alive (process still running).
-                    if sys.platform == "win32":
-                        msvcrt.locking(pidfile.fileno(), msvcrt.LK_UNLCK, _WINDOWS_LOCK_SIZE)
-                    else:
-                        fcntl.flock(pidfile.fileno(), fcntl.LOCK_UN)
-                    pidfile.close()
-                    return True
-            except ValueError:
-                pass  # Corrupt PID, ignore
-
-        # Release lock - no daemon running
-        if sys.platform == "win32":
-            try:
-                msvcrt.locking(pidfile.fileno(), msvcrt.LK_UNLCK, _WINDOWS_LOCK_SIZE)
-            except Exception:
-                pass
-        else:
-            try:
-                fcntl.flock(pidfile.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-        pidfile.close()
+        # We got the lock - use try/finally to ensure file handle is always
+        # closed, even if exceptions occur during operations (BUG HIGH-018 fix).
+        try:
+            # Check if there's a stale PID
+            pidfile.seek(0)
+            content = pidfile.read().strip()
+            if content:
+                try:
+                    pid = int(content)
+                    if _is_process_running(pid):
+                        # Process exists but we got the lock? Shouldn't happen normally.
+                        # Could be a daemon that crashed after writing PID but before locking.
+                        # Report alive (process still running).
+                        return True
+                except ValueError:
+                    pass  # Corrupt PID, ignore
+        finally:
+            # Release lock and close file handle
+            if sys.platform == "win32":
+                try:
+                    msvcrt.locking(pidfile.fileno(), msvcrt.LK_UNLCK, _WINDOWS_LOCK_SIZE)
+                except Exception:
+                    pass
+            else:
+                try:
+                    fcntl.flock(pidfile.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            pidfile.close()
 
         if attempt < retries - 1:
             time.sleep(delay)
@@ -267,10 +270,9 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
     if created:
         print(f"\n\033[33m{message}\033[0m\n")  # Yellow warning
 
-    daemon = TLDRDaemon(project)
-
     if foreground:
-        # Write PID and run - pidfile stays open (lock held)
+        # Create daemon and run in foreground - pidfile stays open (lock held)
+        daemon = TLDRDaemon(project)
         _write_pid_to_locked_file(pidfile, os.getpid())
         daemon._pidfile = pidfile  # Daemon keeps reference to hold lock
         daemon.run()
@@ -285,7 +287,9 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
                 pass
             pidfile.close()
 
-            # Get the connection info for display
+            # Create daemon briefly just for connection info display
+            # (subprocess will create its own daemon instance)
+            daemon = TLDRDaemon(project)
             addr, port = daemon._get_connection_info()
 
             # Start detached process on Windows
@@ -303,12 +307,17 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
         else:
             # Unix: Fork and run in background
             # Child inherits the lock, parent releases it
+            # IMPORTANT: Create daemon AFTER fork to avoid atexit handler
+            # inheritance - if daemon registers handlers in __init__, both
+            # parent and child would have them (BUG HIGH-020 fix).
 
             # Fork daemon process
             pid = os.fork()
             if pid == 0:
                 # Child process - we inherit the lock
                 os.setsid()
+                # Create daemon AFTER fork - only child gets atexit handlers
+                daemon = TLDRDaemon(project)
                 # Write our PID to the locked file
                 _write_pid_to_locked_file(pidfile, os.getpid())
                 daemon._pidfile = pidfile  # Keep reference to hold lock
@@ -323,19 +332,20 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
                 pidfile.close()
 
                 # Wait for daemon to be ready (socket exists)
+                # Use _get_socket_path() since parent doesn't have daemon instance
                 start_time = time.time()
                 timeout = 10.0
                 socket_path = _get_socket_path(project)
                 while time.time() - start_time < timeout:
                     if socket_path.exists() and _is_socket_connectable(project, timeout=0.5):
                         print(f"Daemon started with PID {pid}")
-                        print(f"Socket: {daemon.socket_path}")
+                        print(f"Socket: {socket_path}")
                         return
                     time.sleep(0.1)
 
                 # Daemon started but socket not ready - warn but don't fail
                 print(f"Warning: Daemon (PID {pid}) socket not ready within {timeout}s")
-                print(f"Socket: {daemon.socket_path}")
+                print(f"Socket: {socket_path}")
 
 
 def stop_daemon(project_path: str | Path) -> bool:

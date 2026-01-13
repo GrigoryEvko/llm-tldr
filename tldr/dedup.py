@@ -107,9 +107,17 @@ class ContentHashedIndex:
                 self._hash_to_paths[content_hash] = set()
             self._hash_to_paths[content_hash].add(file_path)
             # Remap edge paths to current file (cached edges have original file's path)
+            # Convert to relative path for consistency with extract_edges_from_file
+            root = Path(self.project_root)
+            try:
+                rel_path = str(Path(file_path).relative_to(root))
+            except ValueError:
+                # file_path not under project_root - use filename only
+                rel_path = Path(file_path).name
+
             cached_tuples = self._by_hash[content_hash]
             remapped = [
-                (file_path, func, file_path, target)
+                (rel_path, func, rel_path, target)
                 for (_, func, _, target) in cached_tuples
             ]
             return self._edges_from_tuples(remapped)

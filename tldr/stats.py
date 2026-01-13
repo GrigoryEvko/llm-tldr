@@ -15,40 +15,19 @@ Stats are persisted to JSONL for historical analysis.
 from __future__ import annotations
 
 import json
+import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import tiktoken
+from tldr.tokenizer import count_tokens
 
-# Lazy-loaded encoder (singleton)
-_encoder: tiktoken.Encoding | None = None
+logger = logging.getLogger(__name__)
 
-
-def _get_encoder() -> tiktoken.Encoding:
-    """Get or create tiktoken encoder (lazy loading)."""
-    global _encoder
-    if _encoder is None:
-        _encoder = tiktoken.get_encoding("cl100k_base")
-    return _encoder
-
-
-def count_tokens(text: str) -> int:
-    """Count tokens in text using tiktoken.
-
-    Uses cl100k_base encoding (same as GPT-4/Claude).
-
-    Args:
-        text: Text to count tokens for
-
-    Returns:
-        Number of tokens
-    """
-    if not text:
-        return 0
-    encoder = _get_encoder()
-    return len(encoder.encode(text))
+# Re-export count_tokens for backward compatibility
+__all__ = ["count_tokens", "SessionStats", "HookStats", "StatsStore", "HookStatsStore", "get_default_store"]
 
 
 @dataclass
@@ -206,7 +185,8 @@ class StatsStore:
                     record = json.loads(line)
                     if record.get("session_id") == session_id:
                         records.append(record)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping corrupted line in {self.path}: {e}")
                     continue
 
         return records
@@ -232,7 +212,8 @@ class StatsStore:
                     totals["raw_tokens"] += record.get("raw_tokens", 0)
                     totals["tldr_tokens"] += record.get("tldr_tokens", 0)
                     totals["requests"] += record.get("requests", 0)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping corrupted line in {self.path}: {e}")
                     continue
 
         return totals
@@ -240,16 +221,21 @@ class StatsStore:
     def get_recent(self, limit: int = 10) -> list[dict[str, Any]]:
         """Get most recent records.
 
+        Memory-efficient: Uses deque with maxlen to avoid loading all records
+        into memory when only the last N are needed.
+
         Args:
             limit: Max number of records to return
 
         Returns:
-            List of recent stats records
+            List of recent stats records (most recent last)
         """
         if not self.path.exists():
             return []
 
-        records = []
+        # Use deque with maxlen for memory efficiency - only keeps last N records
+        records: deque[dict[str, Any]] = deque(maxlen=limit)
+
         with open(self.path) as f:
             for line in f:
                 line = line.strip()
@@ -257,11 +243,11 @@ class StatsStore:
                     continue
                 try:
                     records.append(json.loads(line))
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping corrupted line in {self.path}: {e}")
                     continue
 
-        # Return last N records
-        return records[-limit:]
+        return list(records)
 
 
 # Default store location
@@ -331,8 +317,8 @@ class HookStatsStore:
                         else:
                             stats.metrics[key] = value
 
-                except json.JSONDecodeError:
-                    # Skip corrupted lines
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping corrupted line in {self.path}: {e}")
                     continue
 
         return aggregated
@@ -340,9 +326,21 @@ class HookStatsStore:
     def append(self, hook_stats: dict[str, HookStats]) -> None:
         """Append current hook stats snapshot to JSONL.
 
+        .. deprecated::
+            This method writes absolute values which causes double-counting
+            when multiple instances write to the same file. Use flush_delta()
+            instead, which tracks deltas between flushes.
+
         Args:
             hook_stats: Dict of hook name -> HookStats to persist
         """
+        import warnings
+        warnings.warn(
+            "HookStatsStore.append() is deprecated, use flush_delta() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         if not hook_stats:
             return
 
@@ -368,6 +366,8 @@ class HookStatsStore:
         """Flush only the delta (new activity) since baseline.
 
         This allows multiple instances to append without double-counting.
+        Guards against negative values that could occur if baseline is newer
+        than current (e.g., due to concurrent writes from other instances).
 
         Args:
             current: Current in-memory stats
@@ -390,22 +390,32 @@ class HookStatsStore:
                     delta_metrics = {}
                     for key, value in stats.metrics.items():
                         base_val = base.metrics.get(key, 0)
-                        delta_metrics[key] = value - base_val
+                        delta_val = value - base_val
+                        # Clamp negative metric values to 0 (defensive)
+                        delta_metrics[key] = max(0, delta_val) if isinstance(delta_val, (int, float)) else delta_val
                 else:
                     # No baseline - write all
                     delta_invocations = stats.invocations
                     delta_successes = stats.successes
                     delta_failures = stats.failures
-                    delta_metrics = stats.metrics
+                    delta_metrics = stats.metrics.copy()
 
-                # Only write if there's actual activity
-                if delta_invocations > 0:
-                    record = {
-                        "hook_name": hook_name,
-                        "invocations": delta_invocations,
-                        "successes": delta_successes,
-                        "failures": delta_failures,
-                        "metrics": delta_metrics,
-                        "timestamp": timestamp,
-                    }
-                    f.write(json.dumps(record) + "\n")
+                # Skip if no positive activity (all deltas are zero or negative)
+                if delta_invocations <= 0 and delta_successes <= 0 and delta_failures <= 0:
+                    continue
+
+                # Clamp negative values to 0 (shouldn't happen in normal operation,
+                # but can occur with concurrent writes or baseline drift)
+                delta_invocations = max(0, delta_invocations)
+                delta_successes = max(0, delta_successes)
+                delta_failures = max(0, delta_failures)
+
+                record = {
+                    "hook_name": hook_name,
+                    "invocations": delta_invocations,
+                    "successes": delta_successes,
+                    "failures": delta_failures,
+                    "metrics": delta_metrics,
+                    "timestamp": timestamp,
+                }
+                f.write(json.dumps(record) + "\n")

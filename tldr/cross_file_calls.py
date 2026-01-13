@@ -24,135 +24,73 @@ from typing import Optional
 
 from tldr.workspace import WorkspaceConfig, load_workspace_config, filter_paths
 
-# Tree-sitter support for TypeScript
+# Tree-sitter base library check
 try:
     import tree_sitter
-    import tree_sitter_typescript
 
     TREE_SITTER_AVAILABLE = True
 except ImportError:
     TREE_SITTER_AVAILABLE = False
 
-# Tree-sitter support for Go
-TREE_SITTER_GO_AVAILABLE = False
-try:
-    import tree_sitter_go
-
-    TREE_SITTER_GO_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Rust
-TREE_SITTER_RUST_AVAILABLE = False
-try:
-    import tree_sitter_rust
-
-    TREE_SITTER_RUST_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Java
-TREE_SITTER_JAVA_AVAILABLE = False
-try:
-    import tree_sitter_java
-
-    TREE_SITTER_JAVA_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for C
-TREE_SITTER_C_AVAILABLE = False
-try:
-    import tree_sitter_c
-
-    TREE_SITTER_C_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Ruby
-TREE_SITTER_RUBY_AVAILABLE = False
-try:
-    import tree_sitter_ruby
-
-    TREE_SITTER_RUBY_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for PHP
-TREE_SITTER_PHP_AVAILABLE = False
-try:
-    import tree_sitter_php
-
-    TREE_SITTER_PHP_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for C++
-TREE_SITTER_CPP_AVAILABLE = False
-try:
-    import tree_sitter_cpp
-
-    TREE_SITTER_CPP_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Kotlin
-TREE_SITTER_KOTLIN_AVAILABLE = False
-try:
-    import tree_sitter_kotlin
-
-    TREE_SITTER_KOTLIN_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Swift
-TREE_SITTER_SWIFT_AVAILABLE = False
-try:
-    import tree_sitter_swift
-
-    TREE_SITTER_SWIFT_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for C#
-TREE_SITTER_CSHARP_AVAILABLE = False
-try:
-    import tree_sitter_c_sharp
-
-    TREE_SITTER_CSHARP_AVAILABLE = True
-except ImportError:
-    pass
-
-TREE_SITTER_SCALA_AVAILABLE = False
-try:
-    import tree_sitter_scala
-
-    TREE_SITTER_SCALA_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Lua
-TREE_SITTER_LUA_AVAILABLE = False
-try:
-    import tree_sitter_lua
-
-    TREE_SITTER_LUA_AVAILABLE = True
-except ImportError:
-    pass
-
-# Tree-sitter support for Elixir
-TREE_SITTER_ELIXIR_AVAILABLE = False
-try:
-    import tree_sitter_elixir
-
-    TREE_SITTER_ELIXIR_AVAILABLE = True
-except ImportError:
-    pass
+import importlib
 
 # Module-level parser cache to avoid expensive parser recreation per file.
 # Creating a tree-sitter parser takes ~10-50ms. For a 100-file project,
 # caching saves 1-5 seconds of parser creation time.
 _PARSER_CACHE: dict[str, "tree_sitter.Parser"] = {}
+
+# Language module and function mapping for tree-sitter grammars.
+# Maps language name -> (module_name, language_function_name)
+# Some languages have non-standard function names (e.g., language_typescript)
+LANGUAGE_CONFIG: dict[str, tuple[str, str]] = {
+    "typescript": ("tree_sitter_typescript", "language_typescript"),
+    "go": ("tree_sitter_go", "language"),
+    "rust": ("tree_sitter_rust", "language"),
+    "java": ("tree_sitter_java", "language"),
+    "c": ("tree_sitter_c", "language"),
+    "python": ("tree_sitter_python", "language"),
+    "javascript": ("tree_sitter_javascript", "language"),
+    "ruby": ("tree_sitter_ruby", "language"),
+    "lua": ("tree_sitter_lua", "language"),
+    "elixir": ("tree_sitter_elixir", "language"),
+    "php": ("tree_sitter_php", "language_php"),
+    "swift": ("tree_sitter_swift", "language"),
+    "csharp": ("tree_sitter_c_sharp", "language"),
+    "cpp": ("tree_sitter_cpp", "language"),
+}
+
+
+def get_parser(language: str) -> Optional["tree_sitter.Parser"]:
+    """Get or create a cached tree-sitter parser for the given language.
+
+    Uses lazy loading via importlib to avoid importing unused language grammars.
+    Returns None if tree-sitter base library or language-specific grammar is unavailable.
+
+    Args:
+        language: Language identifier (e.g., "python", "typescript", "go")
+
+    Returns:
+        Cached Parser instance, or None if unavailable
+    """
+    if not TREE_SITTER_AVAILABLE:
+        return None
+
+    if language in _PARSER_CACHE:
+        return _PARSER_CACHE[language]
+
+    if language not in LANGUAGE_CONFIG:
+        return None
+
+    module_name, func_name = LANGUAGE_CONFIG[language]
+    try:
+        mod = importlib.import_module(module_name)
+        lang_func = getattr(mod, func_name)
+        lang = tree_sitter.Language(lang_func())
+        parser = tree_sitter.Parser(lang)
+        _PARSER_CACHE[language] = parser
+        return parser
+    except (ImportError, AttributeError):
+        return None
 
 # Threshold for parallel processing. Below this, sequential is faster due to
 # process spawn overhead (~50-100ms per worker).
@@ -221,138 +159,6 @@ class ProjectCallGraph:
     def __contains__(self, edge: tuple[str, str, str, str]) -> bool:
         """Check if an edge exists in the graph."""
         return edge in self._edges
-
-
-def _get_ts_parser():
-    """Get or create a cached tree-sitter TypeScript parser."""
-    if not TREE_SITTER_AVAILABLE:
-        raise RuntimeError("tree-sitter-typescript not available")
-
-    if "typescript" not in _PARSER_CACHE:
-        ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
-        _PARSER_CACHE["typescript"] = tree_sitter.Parser(ts_lang)
-    return _PARSER_CACHE["typescript"]
-
-
-def _get_rust_parser():
-    """Get or create a cached tree-sitter Rust parser."""
-    if not TREE_SITTER_RUST_AVAILABLE:
-        raise RuntimeError("tree-sitter-rust not available")
-
-    if "rust" not in _PARSER_CACHE:
-        rust_lang = tree_sitter.Language(tree_sitter_rust.language())
-        _PARSER_CACHE["rust"] = tree_sitter.Parser(rust_lang)
-    return _PARSER_CACHE["rust"]
-
-
-def _get_go_parser():
-    """Get or create a cached tree-sitter Go parser."""
-    if not TREE_SITTER_GO_AVAILABLE:
-        raise RuntimeError("tree-sitter-go not available")
-
-    if "go" not in _PARSER_CACHE:
-        go_lang = tree_sitter.Language(tree_sitter_go.language())
-        _PARSER_CACHE["go"] = tree_sitter.Parser(go_lang)
-    return _PARSER_CACHE["go"]
-
-
-def _get_java_parser():
-    """Get or create a cached tree-sitter Java parser."""
-    if not TREE_SITTER_JAVA_AVAILABLE:
-        raise RuntimeError("tree-sitter-java not available")
-
-    if "java" not in _PARSER_CACHE:
-        java_lang = tree_sitter.Language(tree_sitter_java.language())
-        _PARSER_CACHE["java"] = tree_sitter.Parser(java_lang)
-    return _PARSER_CACHE["java"]
-
-
-def _get_c_parser():
-    """Get or create a cached tree-sitter C parser."""
-    if not TREE_SITTER_C_AVAILABLE:
-        raise RuntimeError("tree-sitter-c not available")
-
-    if "c" not in _PARSER_CACHE:
-        c_lang = tree_sitter.Language(tree_sitter_c.language())
-        _PARSER_CACHE["c"] = tree_sitter.Parser(c_lang)
-    return _PARSER_CACHE["c"]
-
-
-def _get_ruby_parser():
-    """Get or create a cached tree-sitter Ruby parser."""
-    if not TREE_SITTER_RUBY_AVAILABLE:
-        raise RuntimeError("tree-sitter-ruby not available")
-
-    if "ruby" not in _PARSER_CACHE:
-        ruby_lang = tree_sitter.Language(tree_sitter_ruby.language())
-        _PARSER_CACHE["ruby"] = tree_sitter.Parser(ruby_lang)
-    return _PARSER_CACHE["ruby"]
-
-
-def _get_php_parser():
-    """Get or create a cached tree-sitter PHP parser."""
-    if not TREE_SITTER_PHP_AVAILABLE:
-        raise RuntimeError("tree-sitter-php not available")
-
-    if "php" not in _PARSER_CACHE:
-        php_lang = tree_sitter.Language(tree_sitter_php.language_php())
-        _PARSER_CACHE["php"] = tree_sitter.Parser(php_lang)
-    return _PARSER_CACHE["php"]
-
-
-def _get_cpp_parser():
-    """Get or create a cached tree-sitter C++ parser."""
-    if not TREE_SITTER_CPP_AVAILABLE:
-        raise RuntimeError("tree-sitter-cpp not available")
-
-    if "cpp" not in _PARSER_CACHE:
-        cpp_lang = tree_sitter.Language(tree_sitter_cpp.language())
-        _PARSER_CACHE["cpp"] = tree_sitter.Parser(cpp_lang)
-    return _PARSER_CACHE["cpp"]
-
-
-def _get_kotlin_parser():
-    """Get or create a cached tree-sitter Kotlin parser."""
-    if not TREE_SITTER_KOTLIN_AVAILABLE:
-        raise RuntimeError("tree-sitter-kotlin not available")
-
-    if "kotlin" not in _PARSER_CACHE:
-        kotlin_lang = tree_sitter.Language(tree_sitter_kotlin.language())
-        _PARSER_CACHE["kotlin"] = tree_sitter.Parser(kotlin_lang)
-    return _PARSER_CACHE["kotlin"]
-
-
-def _get_swift_parser():
-    """Get or create a cached tree-sitter Swift parser."""
-    if not TREE_SITTER_SWIFT_AVAILABLE:
-        raise RuntimeError("tree-sitter-swift not available")
-
-    if "swift" not in _PARSER_CACHE:
-        swift_lang = tree_sitter.Language(tree_sitter_swift.language())
-        _PARSER_CACHE["swift"] = tree_sitter.Parser(swift_lang)
-    return _PARSER_CACHE["swift"]
-
-
-def _get_csharp_parser():
-    """Get or create a cached tree-sitter C# parser."""
-    if not TREE_SITTER_CSHARP_AVAILABLE:
-        raise RuntimeError("tree-sitter-c-sharp not available")
-
-    if "csharp" not in _PARSER_CACHE:
-        csharp_lang = tree_sitter.Language(tree_sitter_c_sharp.language())
-        _PARSER_CACHE["csharp"] = tree_sitter.Parser(csharp_lang)
-    return _PARSER_CACHE["csharp"]
-
-
-def _get_scala_parser():
-    """Get or create a cached tree-sitter Scala parser."""
-    if not TREE_SITTER_SCALA_AVAILABLE:
-        raise RuntimeError("tree-sitter-scala not available")
-
-    if "scala" not in _PARSER_CACHE:
-        scala_lang = tree_sitter.Language(tree_sitter_scala.language())
-        _PARSER_CACHE["scala"] = tree_sitter.Parser(scala_lang)
-    return _PARSER_CACHE["scala"]
 
 
 def scan_project(
@@ -506,13 +312,13 @@ def parse_ts_imports(file_path: str | Path) -> list[dict]:
     Returns:
         List of import info dicts with keys: module, names, is_default, aliases
     """
-    if not TREE_SITTER_AVAILABLE:
+    file_path = Path(file_path)
+    parser = get_parser("typescript")
+    if parser is None:
         return []
 
-    file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_ts_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
@@ -602,13 +408,13 @@ def parse_go_imports(file_path: str | Path) -> list[dict]:
     Returns:
         List of import info dicts with keys: module, alias
     """
-    if not TREE_SITTER_GO_AVAILABLE:
+    file_path = Path(file_path)
+    parser = get_parser("go")
+    if parser is None:
         return []
 
-    file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_go_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
@@ -672,13 +478,13 @@ def parse_rust_imports(file_path: str | Path) -> list[dict]:
     Returns:
         List of import info dicts with keys: module, names, is_mod
     """
-    if not TREE_SITTER_RUST_AVAILABLE:
+    file_path = Path(file_path)
+    parser = get_parser("rust")
+    if parser is None:
         return []
 
-    file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_rust_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
@@ -776,13 +582,13 @@ def parse_java_imports(file_path: str | Path) -> list[dict]:
     Returns:
         List of import info dicts with keys: module, is_static, is_wildcard
     """
-    if not TREE_SITTER_JAVA_AVAILABLE:
+    file_path = Path(file_path)
+    parser = get_parser("java")
+    if parser is None:
         return []
 
-    file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_java_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
@@ -844,232 +650,6 @@ def _parse_java_import_node(node, source: bytes) -> dict | None:
     }
 
 
-def parse_kotlin_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract import statements from a Kotlin file.
-
-    Args:
-        file_path: Path to Kotlin file
-
-    Returns:
-        List of import info dicts with keys: module, is_wildcard, alias
-    """
-    if not TREE_SITTER_KOTLIN_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_kotlin_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # tree-sitter-kotlin uses "import" node type, not "import_header"
-        if node.type == "import":
-            import_info = _parse_kotlin_import_node(node, source)
-            if import_info:
-                imports.append(import_info)
-            # Don't recurse into import children (they have nested "import" keywords)
-            return
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_kotlin_import_node(node, source: bytes) -> dict | None:
-    """Parse a single Kotlin import statement."""
-    # Get the full import text
-    text = source[node.start_byte : node.end_byte].decode("utf-8")
-
-    # Check for wildcard import (ends with .*)
-    is_wildcard = ".*" in text or text.rstrip().endswith("*")
-
-    # Check for alias: import foo.bar as baz
-    alias = None
-    for child in node.children:
-        if child.type == "as":
-            # The next sibling should be the alias identifier
-            idx = list(node.children).index(child)
-            if idx + 1 < len(node.children):
-                alias_node = node.children[idx + 1]
-                if alias_node.type == "identifier":
-                    alias = source[alias_node.start_byte : alias_node.end_byte].decode(
-                        "utf-8"
-                    )
-            break
-
-    # Extract the module path from qualified_identifier
-    module = None
-    for child in node.children:
-        if child.type == "qualified_identifier":
-            module = source[child.start_byte : child.end_byte].decode("utf-8")
-            break
-
-    # Handle wildcard: if there's a * after qualified_identifier, append it
-    if module and is_wildcard and not module.endswith("*"):
-        module = module + ".*"
-
-    if not module:
-        # Fallback: parse from text
-        # Examples:
-        #   import kotlin.collections.List     -> module="kotlin.collections.List"
-        #   import kotlin.collections.*        -> module="kotlin.collections.*", is_wildcard=True
-        #   import kotlin.io.println as print  -> module="kotlin.io.println", alias="print"
-        text = text.strip()
-        if text.startswith("import "):
-            text = text[7:].strip()
-        if " as " in text:
-            module = text.split(" as ")[0].strip()
-        else:
-            module = text.rstrip("*").rstrip(".")
-            if is_wildcard:
-                module = module + ".*"
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "is_wildcard": is_wildcard,
-        "alias": alias,
-    }
-
-
-def parse_scala_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract import statements from a Scala file.
-
-    Scala import syntax:
-    - import package.Module
-    - import package.{A, B, C}  (selective imports)
-    - import package._          (wildcard import)
-    - import package.Module.{member => alias}  (with rename)
-
-    Args:
-        file_path: Path to Scala file
-
-    Returns:
-        List of import info dicts with keys: module, is_wildcard, alias
-    """
-    if not TREE_SITTER_SCALA_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    if not file_path.exists():
-        return []
-
-    try:
-        source = file_path.read_bytes()
-        parser = _get_scala_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # Scala uses "import_declaration" for import statements
-        if node.type == "import_declaration":
-            import_infos = _parse_scala_import_node(node, source)
-            imports.extend(import_infos)
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_scala_import_node(node, source: bytes) -> list[dict]:
-    """Parse a single Scala import statement.
-
-    Returns a list because one import statement can have multiple selectors.
-    """
-    results = []
-
-    # Get the full import text for fallback parsing
-    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
-
-    # Remove "import " prefix
-    if text.startswith("import "):
-        text = text[7:].strip()
-
-    # Check for selective imports: import scala.util.{Try, Success, Failure}
-    if "{" in text:
-        # Split into base path and selectors
-        base_path = text.split("{")[0].rstrip(".")
-        selectors_part = text.split("{")[1].rstrip("}")
-
-        # Parse each selector
-        for selector in selectors_part.split(","):
-            selector = selector.strip()
-            if not selector:
-                continue
-
-            # Check for rename: member => alias
-            if "=>" in selector:
-                parts = selector.split("=>")
-                orig = parts[0].strip()
-                alias = parts[1].strip()
-                if orig != "_":  # Skip hiding imports like {SomeThing => _}
-                    full_module = f"{base_path}.{orig}" if base_path else orig
-                    results.append(
-                        {
-                            "module": full_module,
-                            "is_wildcard": False,
-                            "alias": alias if alias != "_" else None,
-                        }
-                    )
-            elif selector == "_":
-                # Wildcard inside braces: import foo.{_}
-                results.append(
-                    {
-                        "module": base_path,
-                        "is_wildcard": True,
-                        "alias": None,
-                    }
-                )
-            else:
-                full_module = f"{base_path}.{selector}" if base_path else selector
-                results.append(
-                    {
-                        "module": full_module,
-                        "is_wildcard": False,
-                        "alias": None,
-                    }
-                )
-    elif text.endswith("._"):
-        # Wildcard import: import scala.collection.mutable._
-        base_path = text[:-2]  # Remove ._
-        results.append(
-            {
-                "module": base_path,
-                "is_wildcard": True,
-                "alias": None,
-            }
-        )
-    else:
-        # Simple import: import scala.collection.mutable.ListBuffer
-        results.append(
-            {
-                "module": text,
-                "is_wildcard": False,
-                "alias": None,
-            }
-        )
-
-    return results
-
-
 def parse_c_imports(file_path: str | Path) -> list[dict]:
     """
     Extract #include statements from a C file.
@@ -1080,13 +660,13 @@ def parse_c_imports(file_path: str | Path) -> list[dict]:
     Returns:
         List of import info dicts with keys: module, is_system
     """
-    if not TREE_SITTER_C_AVAILABLE:
+    file_path = Path(file_path)
+    parser = get_parser("c")
+    if parser is None:
         return []
 
-    file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_c_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
@@ -1146,760 +726,6 @@ def _parse_c_include_node(node, source: bytes) -> dict | None:
         "module": module,
         "is_system": is_system,
     }
-
-
-def parse_cpp_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract #include statements from a C++ file.
-
-    Args:
-        file_path: Path to C++ file
-
-    Returns:
-        List of import info dicts with keys: module, is_system
-    """
-    if not TREE_SITTER_CPP_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_cpp_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        if node.type == "preproc_include":
-            import_info = _parse_cpp_include_node(node, source)
-            if import_info:
-                imports.append(import_info)
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_cpp_include_node(node, source: bytes) -> dict | None:
-    """Parse a single C++ #include statement."""
-    # Get the full include text
-    text = source[node.start_byte : node.end_byte].decode("utf-8")
-
-    # Check for system include <...> vs local include "..."
-    is_system = "<" in text
-
-    # Extract the module path
-    module = None
-    for child in node.children:
-        if child.type == "string_literal":
-            # Local include "file.hpp"
-            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
-            # Strip quotes
-            module = module_text.strip('"')
-            is_system = False
-            break
-        elif child.type == "system_lib_string":
-            # System include <file.h>
-            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
-            # Strip angle brackets
-            module = module_text.strip("<>")
-            is_system = True
-            break
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "is_system": is_system,
-    }
-
-
-def parse_ruby_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract require statements from a Ruby file.
-
-    Args:
-        file_path: Path to Ruby file
-
-    Returns:
-        List of import info dicts with keys: module, is_relative
-        - require 'json' -> module='json', is_relative=False
-        - require_relative 'helper' -> module='helper', is_relative=True
-    """
-    if not TREE_SITTER_RUBY_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_ruby_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # Ruby imports: require 'module' or require_relative 'module'
-        # These are call nodes with method name "require" or "require_relative"
-        if node.type == "call":
-            import_info = _parse_ruby_require_node(node, source)
-            if import_info:
-                imports.append(import_info)
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_ruby_require_node(node, source: bytes) -> dict | None:
-    """Parse a single Ruby require/require_relative statement."""
-    # Get the method name
-    method_node = node.child_by_field_name("method")
-    if not method_node:
-        return None
-
-    method_name = source[method_node.start_byte : method_node.end_byte].decode("utf-8")
-    if method_name not in ("require", "require_relative"):
-        return None
-
-    # Get the arguments
-    args_node = node.child_by_field_name("arguments")
-    if not args_node:
-        return None
-
-    # Find the string argument (first argument)
-    module = None
-    for child in args_node.children:
-        if child.type == "string":
-            # Get string content (skip the quotes)
-            string_content = child.child_by_field_name("content")
-            if string_content:
-                module = source[
-                    string_content.start_byte : string_content.end_byte
-                ].decode("utf-8")
-            else:
-                # Try to get the text directly and strip quotes
-                text = source[child.start_byte : child.end_byte].decode("utf-8")
-                # Strip quotes: 'module' or "module"
-                module = text.strip("'\"")
-            break
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "is_relative": method_name == "require_relative",
-    }
-
-
-def _get_lua_parser():
-    """Get or create a tree-sitter Lua parser."""
-    if not TREE_SITTER_LUA_AVAILABLE:
-        raise RuntimeError("tree-sitter-lua not available")
-
-    lua_lang = tree_sitter.Language(tree_sitter_lua.language())
-    parser = tree_sitter.Parser(lua_lang)
-    return parser
-
-
-def parse_lua_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract require/dofile/loadfile statements from a Lua file.
-
-    Args:
-        file_path: Path to Lua file
-
-    Returns:
-        List of import info dicts with keys: module, type
-        Types: "require", "dofile", "loadfile"
-    """
-    if not TREE_SITTER_LUA_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_lua_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # Lua imports are function calls: require("module"), dofile("path"), loadfile("path")
-        if node.type == "function_call":
-            import_info = _parse_lua_require_node(node, source)
-            if import_info:
-                imports.append(import_info)
-
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_lua_require_node(node, source: bytes) -> dict | None:
-    """Parse a single Lua require/dofile/loadfile call.
-
-    Handles:
-    - require("module_name")
-    - require "module_name" (parentheses optional for string literal)
-    - dofile("path.lua")
-    - loadfile("path.lua")
-    """
-    # Get the function being called
-    func_name = None
-    arguments = None
-
-    for child in node.children:
-        if child.type == "identifier":
-            func_name = source[child.start_byte : child.end_byte].decode("utf-8")
-        elif child.type == "arguments":
-            arguments = child
-        elif child.type == "string":
-            # require "module" syntax (no parentheses)
-            arguments = child
-
-    if func_name not in ("require", "dofile", "loadfile"):
-        return None
-
-    # Get the module/path argument
-    module = None
-
-    if arguments is not None:
-        if arguments.type == "string":
-            # Direct string (no parentheses case)
-            module = _extract_lua_string(arguments, source)
-        elif arguments.type == "arguments":
-            # Find the first string argument
-            for child in arguments.children:
-                if child.type == "string":
-                    module = _extract_lua_string(child, source)
-                    break
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "type": func_name,
-    }
-
-
-def _extract_lua_string(node, source: bytes) -> str | None:
-    """Extract string content from a Lua string node."""
-    # Lua strings can be:
-    # - "double quoted"
-    # - 'single quoted'
-    # - [[long brackets]]
-    text = source[node.start_byte : node.end_byte].decode("utf-8")
-
-    # Strip quotes
-    if text.startswith('"') and text.endswith('"'):
-        return text[1:-1]
-    elif text.startswith("'") and text.endswith("'"):
-        return text[1:-1]
-    elif text.startswith("[[") and text.endswith("]]"):
-        return text[2:-2]
-
-    return text
-
-
-def parse_elixir_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract alias/import/use/require statements from an Elixir file.
-
-    Args:
-        file_path: Path to Elixir file
-
-    Returns:
-        List of import info dicts with keys: module, type, as (optional)
-        Types: "alias", "import", "use", "require"
-    """
-    if not TREE_SITTER_ELIXIR_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_elixir_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # Elixir imports are call nodes with specific identifiers
-        if node.type == "call":
-            import_info = _parse_elixir_import_node(node, source)
-            if import_info:
-                imports.append(import_info)
-
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _get_elixir_parser():
-    """Get or create an Elixir tree-sitter parser."""
-    from tree_sitter import Language, Parser
-
-    parser = Parser()
-    parser.language = Language(tree_sitter_elixir.language())
-    return parser
-
-
-def _parse_elixir_import_node(node, source: bytes) -> dict | None:
-    """Parse a single Elixir import call.
-
-    Handles:
-    - alias Module.Name
-    - alias Module.Name, as: Alias
-    - import Module
-    - import Module, only: [...]
-    - use Module
-    - use Module, opts
-    - require Module
-    """
-    # Get the function being called
-    func_name = None
-    arguments = None
-
-    for child in node.children:
-        if child.type == "identifier":
-            func_name = source[child.start_byte : child.end_byte].decode("utf-8")
-        elif child.type == "arguments":
-            arguments = child
-
-    if func_name not in ("alias", "import", "use", "require"):
-        return None
-
-    if arguments is None:
-        return None
-
-    # Get the module argument (first argument)
-    module = None
-    alias_name = None
-
-    for child in arguments.children:
-        if child.is_named:
-            if child.type == "alias":
-                # Module reference like Phoenix.Controller
-                module = source[child.start_byte : child.end_byte].decode("utf-8")
-            elif child.type == "dot":
-                # Qualified module name
-                module = source[child.start_byte : child.end_byte].decode("utf-8")
-            elif child.type == "keywords":
-                # Keyword arguments like "as: AliasName"
-                for kw_child in child.children:
-                    if kw_child.type == "pair":
-                        key = None
-                        value = None
-                        for pair_child in kw_child.children:
-                            if pair_child.type == "keyword":
-                                key = (
-                                    source[pair_child.start_byte : pair_child.end_byte]
-                                    .decode("utf-8")
-                                    .rstrip(": ")
-                                )
-                            elif pair_child.type == "alias":
-                                value = source[
-                                    pair_child.start_byte : pair_child.end_byte
-                                ].decode("utf-8")
-                        if key == "as" and value:
-                            alias_name = value
-
-    if not module:
-        return None
-
-    result = {
-        "module": module,
-        "type": func_name,
-    }
-    if alias_name:
-        result["as"] = alias_name
-
-    return result
-
-
-def parse_php_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract use/require/include statements from a PHP file.
-
-    Args:
-        file_path: Path to PHP file
-
-    Returns:
-        List of import info dicts with keys: module, type
-        Types: "use", "require", "require_once", "include", "include_once"
-    """
-    if not TREE_SITTER_PHP_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_php_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        # use statements: use App\Models\User;
-        if node.type == "namespace_use_declaration":
-            _parse_php_use_node(node, source, imports)
-        # require/include statements
-        elif node.type in (
-            "include_expression",
-            "include_once_expression",
-            "require_expression",
-            "require_once_expression",
-        ):
-            import_info = _parse_php_require_include_node(node, source)
-            if import_info:
-                imports.append(import_info)
-
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_php_use_node(node, source: bytes, imports: list):
-    """Parse PHP use declaration(s).
-
-    Handles:
-    - Simple: use App\\Models\\User;
-    - Grouped: use App\\Models\\{User, Post};
-    - Aliased: use App\\Models\\User as UserModel;
-    - Function/const: use function array_map;
-    """
-    # Check if this has a namespace_use_group (grouped imports)
-    has_group = any(child.type == "namespace_use_group" for child in node.children)
-
-    if has_group:
-        # Grouped imports: use App\Models\{User, Post}
-        # Get the prefix from the namespace_name
-        prefix = ""
-        for child in node.children:
-            if child.type == "namespace_name":
-                prefix = source[child.start_byte : child.end_byte].decode("utf-8")
-                break
-
-        # Parse each group item
-        for child in node.children:
-            if child.type == "namespace_use_group":
-                for group_child in child.children:
-                    # In tree-sitter-php, grouped items are namespace_use_clause
-                    if group_child.type == "namespace_use_clause":
-                        clause_text = (
-                            source[group_child.start_byte : group_child.end_byte]
-                            .decode("utf-8")
-                            .strip()
-                        )
-                        # Handle alias: User as UserModel
-                        name = clause_text.split(" as ")[0].strip()
-                        full_module = f"{prefix}\\{name}" if prefix else name
-                        imports.append(
-                            {
-                                "module": full_module,
-                                "type": "use",
-                            }
-                        )
-    else:
-        # Simple imports: use App\Models\User;
-        for child in node.children:
-            if child.type == "namespace_use_clause":
-                clause_text = (
-                    source[child.start_byte : child.end_byte].decode("utf-8").strip()
-                )
-                # Handle alias: User as UserModel
-                module = clause_text.split(" as ")[0].strip()
-                imports.append(
-                    {
-                        "module": module,
-                        "type": "use",
-                    }
-                )
-
-
-def _parse_php_require_include_node(node, source: bytes) -> dict | None:
-    """Parse PHP require/include expression."""
-    node_type = node.type
-
-    # Map node type to import type
-    type_map = {
-        "include_expression": "include",
-        "include_once_expression": "include_once",
-        "require_expression": "require",
-        "require_once_expression": "require_once",
-    }
-    import_type = type_map.get(node_type, "require")
-
-    # Find the string literal or expression being included
-    module = None
-    for child in node.children:
-        if child.type in ("string", "encapsed_string"):
-            module_text = source[child.start_byte : child.end_byte].decode("utf-8")
-            # Strip quotes
-            module = module_text.strip("'\"")
-            break
-        elif child.type == "binary_expression":
-            # Handle expressions like __DIR__ . '/file.php'
-            # Just get the full text for now
-            module = source[child.start_byte : child.end_byte].decode("utf-8")
-            break
-
-    if not module:
-        # Try to get full text after the keyword
-        text = source[node.start_byte : node.end_byte].decode("utf-8")
-        # Extract path from require 'path' or require('path')
-        for pattern in ["require_once", "require", "include_once", "include"]:
-            if text.startswith(pattern):
-                rest = text[len(pattern) :].strip()
-                # Remove parentheses and quotes
-                rest = rest.strip("();'\" ")
-                if rest:
-                    module = rest
-                break
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "type": import_type,
-    }
-
-
-def parse_swift_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract import statements from a Swift file.
-
-    Args:
-        file_path: Path to Swift file
-
-    Returns:
-        List of import info dicts with keys: module, kind
-        - import Foundation -> module='Foundation', kind=None
-        - import struct Foundation.Date -> module='Foundation.Date', kind='struct'
-    """
-    if not TREE_SITTER_SWIFT_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_swift_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        if node.type == "import_declaration":
-            import_info = _parse_swift_import_node(node, source)
-            if import_info:
-                imports.append(import_info)
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_swift_import_node(node, source: bytes) -> dict | None:
-    """Parse a single Swift import statement.
-
-    Swift imports can be:
-    - import Foundation
-    - import struct Foundation.Date
-    - import func Foundation.strcmp
-    - import class UIKit.UIView
-    - @testable import MyApp
-    """
-    # Get the full import text
-    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
-
-    # Handle @testable or other attribute imports
-    # Remove leading @attribute if present
-    if text.startswith("@"):
-        # Find the import keyword
-        import_idx = text.find("import")
-        if import_idx == -1:
-            return None
-        text = text[import_idx:]
-
-    if not text.startswith("import"):
-        return None
-
-    # Remove 'import ' prefix
-    rest = text[6:].strip()
-
-    # Check for kind specifier (struct, class, func, enum, etc.)
-    kind = None
-    kind_specifiers = [
-        "struct",
-        "class",
-        "enum",
-        "protocol",
-        "func",
-        "var",
-        "let",
-        "typealias",
-    ]
-    for spec in kind_specifiers:
-        if rest.startswith(spec + " "):
-            kind = spec
-            rest = rest[len(spec) :].strip()
-            break
-
-    # The rest is the module path
-    module = rest
-
-    if not module:
-        return None
-
-    return {
-        "module": module,
-        "kind": kind,
-    }
-
-
-def parse_csharp_imports(file_path: str | Path) -> list[dict]:
-    """
-    Extract using statements from a C# file.
-
-    Args:
-        file_path: Path to C# file
-
-    Returns:
-        List of import info dicts with keys: module, is_static, alias
-        - using System; -> module='System'
-        - using static System.Math; -> module='System.Math', is_static=True
-        - using Alias = System.Collections; -> module='System.Collections', alias='Alias'
-        - global using System; -> module='System', is_global=True
-    """
-    if not TREE_SITTER_CSHARP_AVAILABLE:
-        return []
-
-    file_path = Path(file_path)
-    try:
-        source = file_path.read_bytes()
-        parser = _get_csharp_parser()
-        tree = parser.parse(source)
-    except (FileNotFoundError, Exception):
-        return []
-
-    imports = []
-
-    def walk_tree(node, depth=0, max_depth=500):
-        if depth > max_depth:
-            return
-        if node.type == "using_directive":
-            import_info = _parse_csharp_using_node(node, source)
-            if import_info:
-                imports.append(import_info)
-        for child in node.children:
-            walk_tree(child, depth + 1, max_depth)
-
-    walk_tree(tree.root_node)
-    return imports
-
-
-def _parse_csharp_using_node(node, source: bytes) -> dict | None:
-    """Parse a single C# using statement.
-
-    C# using directives can be:
-    - using System;
-    - using static System.Math;
-    - using Alias = System.Collections;
-    - global using System;
-    """
-    # Get the full using text
-    text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
-
-    result = {
-        "module": None,
-        "is_static": False,
-        "is_global": False,
-        "alias": None,
-    }
-
-    # Check for global using
-    if text.startswith("global"):
-        result["is_global"] = True
-        text = text[6:].strip()
-
-    # Check for using static
-    if "static" in text.split():
-        result["is_static"] = True
-
-    # Look for the qualified name in children
-    for child in node.children:
-        if child.type == "qualified_name":
-            result["module"] = source[child.start_byte : child.end_byte].decode("utf-8")
-        elif child.type == "identifier":
-            # Check if this is an alias (using Alias = ...)
-            # or just a simple namespace
-            next_sibling = None
-            for i, c in enumerate(node.children):
-                if c == child and i + 1 < len(node.children):
-                    next_sibling = node.children[i + 1]
-                    break
-            if next_sibling and next_sibling.type == "=":
-                result["alias"] = source[child.start_byte : child.end_byte].decode(
-                    "utf-8"
-                )
-            elif not result["module"]:
-                # Simple identifier without qualified name
-                result["module"] = source[child.start_byte : child.end_byte].decode(
-                    "utf-8"
-                )
-        elif child.type == "name_equals":
-            # This handles: using Alias = Something
-            alias_node = child.child_by_field_name("name")
-            if alias_node:
-                result["alias"] = source[
-                    alias_node.start_byte : alias_node.end_byte
-                ].decode("utf-8")
-
-    if not result["module"]:
-        return None
-
-    return result
-
-
-# Threshold for parallel processing - overhead isn't worth it for small projects
-MIN_FILES_FOR_PARALLEL = 15
 
 
 def _index_single_file(args: tuple[str, str, str]) -> dict:
@@ -1996,7 +822,7 @@ def build_function_index(
     )
 
     # Use parallel processing for larger projects
-    if len(source_files) > MIN_FILES_FOR_PARALLEL:
+    if len(source_files) >= MIN_FILES_FOR_PARALLEL:
         max_workers = min(os.cpu_count() or 4, 8)
         root_str = str(root)
         args_list = [(src_file, root_str, language) for src_file in source_files]
@@ -2075,12 +901,12 @@ def _index_typescript_file(
     src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
 ):
     """Index functions and classes from a TypeScript file."""
-    if not TREE_SITTER_AVAILABLE:
+    parser = get_parser("typescript")
+    if parser is None:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_ts_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2145,12 +971,12 @@ def _index_go_file(
     src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
 ):
     """Index functions, types, and methods from a Go file."""
-    if not TREE_SITTER_GO_AVAILABLE:
+    parser = get_parser("go")
+    if parser is None:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_go_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2227,12 +1053,12 @@ def _index_rust_file(
     src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
 ):
     """Index functions, structs, and impl blocks from a Rust file."""
-    if not TREE_SITTER_RUST_AVAILABLE:
+    parser = get_parser("rust")
+    if parser is None:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_rust_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2312,12 +1138,12 @@ def _index_java_file(
     src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
 ):
     """Index methods and classes from a Java file."""
-    if not TREE_SITTER_JAVA_AVAILABLE:
+    parser = get_parser("java")
+    if parser is None:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_java_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2389,12 +1215,12 @@ def _index_c_file(
     src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict
 ):
     """Index functions from a C file."""
-    if not TREE_SITTER_C_AVAILABLE:
+    parser = get_parser("c")
+    if parser is None:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_c_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2588,12 +1414,12 @@ def _extract_ts_file_calls(
         Dict mapping caller function name to list of (call_type, call_target) tuples
         call_type is 'direct', 'attr', or 'intra'
     """
-    if not TREE_SITTER_AVAILABLE:
+    parser = get_parser("typescript")
+    if parser is None:
         return {}
 
     try:
         source = file_path.read_bytes()
-        parser = _get_ts_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -2726,12 +1552,12 @@ def _extract_go_file_calls(
         Dict mapping caller function name to list of (call_type, call_target) tuples
         call_type is 'direct', 'attr', or 'intra'
     """
-    if not TREE_SITTER_GO_AVAILABLE:
+    parser = get_parser("go")
+    if parser is None:
         return {}
 
     try:
         source = file_path.read_bytes()
-        parser = _get_go_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -2833,12 +1659,12 @@ def _extract_rust_file_calls(
         Dict mapping caller function name to list of (call_type, call_target) tuples
         call_type is 'direct', 'attr', or 'intra'
     """
-    if not TREE_SITTER_RUST_AVAILABLE:
+    parser = get_parser("rust")
+    if parser is None:
         return {}
 
     try:
         source = file_path.read_bytes()
-        parser = _get_rust_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -2967,12 +1793,12 @@ def _extract_java_file_calls(
         Dict mapping caller method name to list of (call_type, call_target) tuples
         call_type is 'direct', 'attr', or 'intra'
     """
-    if not TREE_SITTER_JAVA_AVAILABLE:
+    parser = get_parser("java")
+    if parser is None:
         return {}
 
     try:
         source = file_path.read_bytes()
-        parser = _get_java_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -3122,12 +1948,12 @@ def _extract_c_file_calls(
         Dict mapping caller function name to list of (call_type, call_target) tuples
         call_type is 'direct' or 'intra'
     """
-    if not TREE_SITTER_C_AVAILABLE:
+    parser = get_parser("c")
+    if parser is None:
         return {}
 
     try:
         source = file_path.read_bytes()
-        parser = _get_c_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -3438,8 +2264,8 @@ def _build_typescript_call_graph(
             module = imp["module"]
             # Resolve relative imports
             if module.startswith("."):
-                # Convert relative path to file path
-                module_path = _resolve_ts_import(rel_path, module)
+                # Convert relative path to file path with index.ts resolution
+                module_path = _resolve_ts_import(rel_path, module, str(root))
             else:
                 module_path = module
 
@@ -3498,8 +2324,26 @@ def _build_typescript_call_graph(
 
 
 @lru_cache(maxsize=1024)
-def _resolve_ts_import(from_file: str, import_path: str) -> str:
-    """Resolve a relative TypeScript import path to a file path."""
+def _resolve_ts_import(from_file: str, import_path: str, root: str = "") -> str:
+    """Resolve a relative TypeScript import path to a file path.
+
+    Handles TypeScript module resolution order:
+    1. Exact file with .ts extension
+    2. Exact file with .tsx extension
+    3. Directory with index.ts
+    4. Directory with index.tsx
+
+    Args:
+        from_file: The file containing the import (relative path)
+        import_path: The import path (e.g., './utils', '../config')
+        root: Project root directory for file existence checks
+
+    Returns:
+        Resolved file path (relative to root), or base path if no file found
+    """
+    if not import_path.startswith("."):
+        return import_path  # External package, return as-is
+
     from_dir = str(Path(from_file).parent)
     if from_dir == ".":
         from_dir = ""
@@ -3519,6 +2363,23 @@ def _resolve_ts_import(from_file: str, import_path: str) -> str:
         resolved = "/".join(parts + import_parts)
     else:
         resolved = import_path
+
+    # Check for actual file existence in TypeScript resolution order
+    if root:
+        root_path = Path(root)
+        target = root_path / resolved
+
+        # TypeScript module resolution precedence
+        candidates = [
+            target.with_suffix(".ts"),
+            target.with_suffix(".tsx"),
+            target / "index.ts",
+            target / "index.tsx",
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate.relative_to(root_path))
 
     return resolved
 
@@ -3579,11 +2440,8 @@ def _build_go_call_graph(
             module = imp["module"]
             alias = imp.get("alias")
 
-            # Resolve relative imports (./pkg)
-            if module.startswith("./") or module.startswith("../"):
-                module_path = _resolve_go_import(rel_path, module)
-            else:
-                module_path = module
+            # Resolve imports (relative ./pkg or module-prefixed)
+            module_path = _resolve_go_import(rel_path, module, str(root))
 
             # Determine the local name (alias or last path component)
             if alias:
@@ -3619,9 +2477,62 @@ def _build_go_call_graph(
                                     break
 
 
+@lru_cache(maxsize=128)
+def _get_go_module_path(root: str) -> Optional[str]:
+    """Parse go.mod to get the module path.
+
+    Args:
+        root: Project root directory (as string for caching)
+
+    Returns:
+        Module path (e.g., 'github.com/user/repo') or None if go.mod not found
+    """
+    go_mod = Path(root) / "go.mod"
+    if not go_mod.exists():
+        return None
+
+    try:
+        content = go_mod.read_text()
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("module "):
+                # Handle: module github.com/user/repo
+                return line.split()[1]
+    except (OSError, IndexError):
+        pass
+
+    return None
+
+
 @lru_cache(maxsize=1024)
-def _resolve_go_import(from_file: str, import_path: str) -> str:
-    """Resolve a relative Go import path to a directory path."""
+def _resolve_go_import(from_file: str, import_path: str, root: str = "") -> str:
+    """Resolve a Go import path to a directory path.
+
+    Handles:
+    1. Relative imports (./pkg, ../pkg)
+    2. Module-prefixed imports (github.com/user/repo/internal/pkg)
+
+    Args:
+        from_file: The file containing the import (relative path)
+        import_path: The import path
+        root: Project root directory for go.mod parsing
+
+    Returns:
+        Resolved directory path (relative to root for internal packages)
+    """
+    # Check for module-prefixed internal imports first
+    if root and not import_path.startswith("."):
+        module_path = _get_go_module_path(root)
+        if module_path and import_path.startswith(module_path):
+            # Internal package - strip module prefix to get relative path
+            rel_path = import_path[len(module_path) :].lstrip("/")
+            if rel_path:
+                # Verify the directory exists
+                pkg_dir = Path(root) / rel_path
+                if pkg_dir.exists() and pkg_dir.is_dir():
+                    return rel_path
+            return rel_path if rel_path else "."
+
     from_dir = str(Path(from_file).parent)
     if from_dir == ".":
         from_dir = ""
@@ -3640,6 +2551,7 @@ def _resolve_go_import(from_file: str, import_path: str) -> str:
                 parts.pop()
         resolved = "/".join(parts + import_parts)
     else:
+        # External package, return as-is
         resolved = import_path
 
     return resolved

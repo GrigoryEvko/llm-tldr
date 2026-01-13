@@ -31,6 +31,7 @@ if os.name == 'nt':
         pass
 
 from . import __version__
+from .languages import EXTENSION_TO_LANGUAGE, detect_language_with_default
 
 
 def _get_subprocess_detach_kwargs() -> dict:
@@ -42,50 +43,6 @@ def _get_subprocess_detach_kwargs() -> dict:
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     else:  # Unix (Mac/Linux)
         return {"start_new_session": True}
-
-
-# Extension to language mapping for auto-detection
-EXTENSION_TO_LANGUAGE = {
-    ".java": "java",
-    ".py": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".go": "go",
-    ".rs": "rust",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".hpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".hh": "cpp",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".cs": "csharp",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".scala": "scala",
-    ".sc": "scala",
-    ".lua": "lua",
-    ".ex": "elixir",
-    ".exs": "elixir",
-}
-
-
-def detect_language_from_extension(file_path: str) -> str:
-    """Detect programming language from file extension.
-
-    Args:
-        file_path: Path to the source file
-
-    Returns:
-        Language name (defaults to 'python' if unknown)
-    """
-    ext = Path(file_path).suffix.lower()
-    return EXTENSION_TO_LANGUAGE.get(ext, "python")
 
 
 def _find_project_root(start_path: str | Path) -> Path:
@@ -574,6 +531,11 @@ Semantic Search:
     change_impact_p.add_argument(
         "--run", action="store_true", help="Actually run the affected tests"
     )
+    change_impact_p.add_argument(
+        "--project", "-p",
+        default=".",
+        help="Project directory to analyze (default: current directory)"
+    )
 
     # tldr diagnostics <file|path>
     diag_p = subparsers.add_parser(
@@ -645,25 +607,127 @@ Semantic Search:
         default=None,
         help="Embedding model: bge-large-en-v1.5 (1.3GB, default) or all-MiniLM-L6-v2 (80MB)",
     )
+    index_p.add_argument(
+        "--backend",
+        choices=["tei", "sentence_transformers", "auto"],
+        default="auto",
+        help="Inference backend (default: auto - prefers TEI server if available)",
+    )
+    index_p.add_argument(
+        "--dimension",
+        type=int,
+        help="MRL embedding dimension (Qwen3 only). Smaller = faster search, less memory.",
+    )
 
     # tldr semantic search <query> [path]
-    search_p = semantic_sub.add_parser(
+    semantic_search_p = semantic_sub.add_parser(
         "search",
         help="Search semantically",
         description="Search code using natural language queries.\nSearches unified index (all languages). Requires: tldr semantic index .",
         epilog="Examples:\n  tldr semantic search 'authentication logic' .\n  tldr semantic search 'database connection' src/ --k 10",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    search_p.add_argument("query", help="Natural language query")
-    search_p.add_argument("path", nargs="?", default=".", help="Project root")
-    search_p.add_argument("--k", type=int, default=5, help="Number of results")
-    search_p.add_argument(
+    semantic_search_p.add_argument("query", help="Natural language query")
+    semantic_search_p.add_argument("path", nargs="?", default=".", help="Project root")
+    semantic_search_p.add_argument("--k", type=int, default=5, help="Number of results")
+    semantic_search_p.add_argument(
         "--expand", action="store_true", help="Include call graph expansion"
     )
-    search_p.add_argument(
+    semantic_search_p.add_argument(
         "--model",
         default=None,
         help="Embedding model (uses index model if not specified)",
+    )
+    semantic_search_p.add_argument(
+        "--backend",
+        choices=["tei", "sentence_transformers", "auto"],
+        default="auto",
+        help="Inference backend (tei = text-embeddings-inference server)",
+    )
+    semantic_search_p.add_argument(
+        "--task",
+        choices=["code_search", "code_retrieval", "semantic_search", "default"],
+        default="code_search",
+        help="Query task type for instruction-aware models (default: code_search)",
+    )
+    semantic_search_p.add_argument(
+        "--force-reload",
+        action="store_true",
+        help="Bypass index cache and reload from disk",
+    )
+
+    # tldr semantic warmup
+    warmup_p = semantic_sub.add_parser(
+        "warmup",
+        help="Pre-load and warm up embedding model for faster first query",
+        description="Pre-load the embedding model into memory (and GPU if available).\nThis speeds up the first semantic search by eliminating model load time.",
+        epilog="Example: tldr semantic warmup --model Qwen3-Embedding-0.6B",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    warmup_p.add_argument(
+        "--model",
+        default=None,
+        help="Model name (default: Qwen3-Embedding-0.6B)",
+    )
+
+    # tldr semantic unload
+    unload_p = semantic_sub.add_parser(
+        "unload",
+        help="Unload model and free GPU memory",
+        description="Unload the embedding model from memory to free GPU/RAM.\nUseful when you need to free resources for other tasks.",
+        epilog="Example: tldr semantic unload",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # tldr semantic cache (clear|stats|invalidate)
+    cache_p = semantic_sub.add_parser(
+        "cache",
+        help="Index cache management",
+        description="Manage the semantic index cache.\nCached indexes speed up repeated searches but consume memory.",
+        epilog="Subcommands:\n  clear      Clear all cached indexes\n  stats      Show cache statistics\n  invalidate Invalidate index for a specific project",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cache_sub = cache_p.add_subparsers(dest="cache_action", required=True)
+
+    cache_sub.add_parser(
+        "clear",
+        help="Clear all cached indexes",
+        description="Remove all indexes from the in-memory cache.\nFrees memory but next search will need to reload from disk.",
+    )
+    cache_sub.add_parser(
+        "stats",
+        help="Show cache statistics",
+        description="Display current cache usage: number of cached projects, memory usage, limits.",
+    )
+
+    cache_invalidate_p = cache_sub.add_parser(
+        "invalidate",
+        help="Invalidate index for a specific project",
+        description="Remove a specific project's index from cache.\nUseful after manual index rebuild or when freeing memory for one project.",
+    )
+    cache_invalidate_p.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Project path to invalidate (default: current directory)",
+    )
+
+    # tldr semantic device
+    device_p = semantic_sub.add_parser(
+        "device",
+        help="Show compute device and backend info",
+        description="Show detected compute device (CUDA, MPS, CPU) and available backends.",
+        epilog="Example: tldr semantic device",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # tldr semantic memory
+    memory_p = semantic_sub.add_parser(
+        "memory",
+        help="Show GPU/memory statistics",
+        description="Show GPU memory usage and model statistics.\nRequires model to be loaded (run semantic search first).",
+        epilog="Example: tldr semantic memory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # tldr daemon start/stop/status/query
@@ -932,17 +996,23 @@ Semantic Search:
             print(ctx.to_llm_string())
 
         elif args.command == "cfg":
-            lang = args.lang or detect_language_from_extension(args.file)
+            if not Path(args.file).exists():
+                print(f"Error: File not found: {args.file}", file=sys.stderr)
+                sys.exit(1)
+            lang = args.lang or detect_language_with_default(args.file)
             result = get_cfg_context(args.file, args.function, language=lang)
             print(json.dumps(result, indent=2))
 
         elif args.command == "dfg":
-            lang = args.lang or detect_language_from_extension(args.file)
+            if not Path(args.file).exists():
+                print(f"Error: File not found: {args.file}", file=sys.stderr)
+                sys.exit(1)
+            lang = args.lang or detect_language_with_default(args.file)
             result = get_dfg_context(args.file, args.function, language=lang)
             print(json.dumps(result, indent=2))
 
         elif args.command == "slice":
-            lang = args.lang or detect_language_from_extension(args.file)
+            lang = args.lang or detect_language_with_default(args.file)
             lines = get_slice(
                 args.file,
                 args.function,
@@ -1028,7 +1098,7 @@ Semantic Search:
             if not file_path.exists():
                 print(f"Error: File not found: {args.file}", file=sys.stderr)
                 sys.exit(1)
-            lang = args.lang or detect_language_from_extension(args.file)
+            lang = args.lang or detect_language_with_default(args.file)
             result = get_imports(str(file_path), language=lang)
             print(json.dumps(result, indent=2))
 
@@ -1073,11 +1143,17 @@ Semantic Search:
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
 
+            # Resolve project path
+            project_path = Path(args.project).resolve()
+            if not project_path.exists():
+                print(f"Error: Project path not found: {args.project}", file=sys.stderr)
+                sys.exit(1)
+
             # Auto-detect language if not specified
-            lang = args.lang or _detect_project_language(".")
+            lang = args.lang or _detect_project_language(str(project_path))
 
             result = analyze_change_impact(
-                project_path=".",
+                project_path=str(project_path),
                 files=args.files if args.files else None,
                 use_session=args.session,
                 use_git=args.git,
@@ -1221,7 +1297,7 @@ Semantic Search:
                 print(f"Total: Indexed {len(all_files)} files, found {len(unique_edges)} edges")
 
         elif args.command == "semantic":
-            from .semantic import build_semantic_index, semantic_search
+            from .ml_engine import build_index, search, SUPPORTED_MODELS, DEFAULT_MODEL
 
             if args.action == "index":
                 project_path = Path(args.path).resolve()
@@ -1233,23 +1309,93 @@ Semantic Search:
                     sys.exit(1)
 
                 respect_ignore = not getattr(args, "no_ignore", False)
-                count = build_semantic_index(
+                # Resolve model name: use provided or default
+                model_name = args.model if args.model else DEFAULT_MODEL
+                count = build_index(
                     args.path,
                     lang=args.lang,
-                    model=args.model,
+                    model_name=model_name,
                     respect_ignore=respect_ignore,
+                    dimension=args.dimension,
+                    backend=args.backend,
                 )
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
-                results = semantic_search(
+                # Invalidate cache if force-reload requested
+                if getattr(args, "force_reload", False):
+                    from .ml_engine import get_index_manager
+                    im = get_index_manager()
+                    im.invalidate(str(Path(args.path).resolve()))
+
+                # ml_engine.search uses model from index metadata
+                results = search(
                     args.path,
                     args.query,
                     k=args.k,
+                    task=getattr(args, "task", "code_search"),
                     expand_graph=args.expand,
-                    model=args.model,
+                    backend=args.backend,
                 )
                 print(json.dumps(results, indent=2))
+
+            elif args.action == "warmup":
+                from .ml_engine import get_model_manager, DEFAULT_MODEL
+
+                mm = get_model_manager()
+                model = args.model or DEFAULT_MODEL
+                mm.load(model)
+                result = mm.warmup()
+                print(json.dumps(result, indent=2))
+
+            elif args.action == "unload":
+                from .ml_engine import get_model_manager
+
+                mm = get_model_manager()
+                mm.unload()
+                print("Model unloaded successfully")
+
+            elif args.action == "cache":
+                from .ml_engine import get_index_manager
+
+                im = get_index_manager()
+
+                if args.cache_action == "clear":
+                    im.clear()
+                    print("Index cache cleared")
+                elif args.cache_action == "stats":
+                    print(json.dumps(im.stats(), indent=2))
+                elif args.cache_action == "invalidate":
+                    project_path = Path(args.path).resolve()
+                    im.invalidate(str(project_path))
+                    print(f"Index invalidated for: {project_path}")
+
+            elif args.action == "device":
+                from .ml_engine import detect_device, check_tei_available
+
+                dev = detect_device()
+                # Get free memory dynamically for CUDA devices
+                free_memory = 0
+                if dev.name == "cuda":
+                    import torch
+                    torch.cuda.synchronize()
+                    free_memory = torch.cuda.mem_get_info()[0]
+                info = {
+                    "device": dev.name,
+                    "device_count": dev.device_count,
+                    "total_memory_gb": round(dev.total_memory / 1e9, 2),
+                    "free_memory_gb": round(free_memory / 1e9, 2),
+                    "supports_bf16": dev.supports_bf16,
+                    "tei_available": check_tei_available(),
+                }
+                print(json.dumps(info, indent=2))
+
+            elif args.action == "memory":
+                from .ml_engine import get_model_manager
+
+                mm = get_model_manager()
+                stats = mm.memory_stats()
+                print(json.dumps(stats, indent=2))
 
         elif args.command == "doctor":
             import shutil

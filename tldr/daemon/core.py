@@ -19,6 +19,30 @@ from typing import Any, Optional
 
 from tldr.dedup import ContentHashedIndex
 from tldr.salsa import SalsaDB
+
+# Lazy import for ml_engine to allow daemon to start even if ML deps missing
+# (torch, sentence_transformers, etc. are heavy optional dependencies)
+_ml_engine_available: bool | None = None
+
+
+def _check_ml_engine() -> bool:
+    """Check if ml_engine module is available (lazy import).
+
+    Returns True if torch/sentence_transformers are installed,
+    False otherwise. Result is cached for subsequent calls.
+    """
+    global _ml_engine_available
+    if _ml_engine_available is None:
+        try:
+            from tldr import ml_engine  # noqa: F401
+
+            _ml_engine_available = True
+        except ImportError as e:
+            logging.warning(f"ML engine not available: {e}. Semantic features disabled.")
+            _ml_engine_available = False
+    return _ml_engine_available
+
+
 from tldr.stats import (
     HookStats,
     HookStatsStore,
@@ -61,6 +85,10 @@ class TLDRDaemon:
     Automatically shuts down after IDLE_TIMEOUT seconds of inactivity.
     """
 
+    # Class-level flag to prevent memory leak from repeated atexit registrations
+    # (CRIT-008: each instance was registering new handlers, accumulating unboundedly)
+    _atexit_registered: bool = False
+
     def __init__(self, project_path: Path):
         """
         Initialize the daemon for a project.
@@ -92,10 +120,12 @@ class TLDRDaemon:
         self._dirty_count: int = 0
         self._dirty_files: set[str] = set()
         self._reindex_in_progress: bool = False
+        self._reindex_thread: Optional[threading.Thread] = None  # MED-025 FIX: Store for graceful shutdown
         self._semantic_config = self._load_semantic_config()
 
         # P7 Features: Per-session token stats tracking
         self._session_stats: dict[str, SessionStats] = {}
+        self._session_stats_lock = threading.Lock()  # HIGH-016 FIX: Thread safety for session stats
         self._stats_store: StatsStore = get_default_store()
 
         # P8 Features: Per-hook activity stats tracking with persistence
@@ -106,11 +136,27 @@ class TLDRDaemon:
         self._hook_flush_threshold: int = 5  # Flush every N invocations
         self._hook_stats_lock = threading.Lock()  # Thread safety for hook stats
 
-        # Cross-platform graceful shutdown: register atexit handler
-        # This ensures stats persist even if daemon is killed (works on all platforms)
+        # P9 Features: Persistent ML model for semantic search
+        # Model stays loaded in memory while daemon runs (no reload on each request)
+        # Type annotations use strings since ml_engine is lazily imported
+        self._model_manager: Optional["ModelManager"] = None  # type: ignore[name-defined]
+        self._index_manager: Optional["IndexManager"] = None  # type: ignore[name-defined]
+        self._model_loaded: bool = False
+        self._model_load_lock = threading.Lock()
+
+        # Cross-platform graceful shutdown: register atexit handlers
+        # This ensures stats persist and GPU memory is freed even if daemon is killed
+        # (works on all platforms). Note: SIGKILL (kill -9) still bypasses atexit.
         self._persist_lock = threading.Lock()  # Protects _stats_persisted check-and-set
         self._stats_persisted = False  # Guard against double-persist
-        atexit.register(self._persist_all_stats)
+        self._model_unloaded = False  # Guard against double-unload
+
+        # CRIT-008 FIX: Only register atexit handlers once per class to prevent
+        # memory leak from accumulating handlers when multiple instances are created
+        if not TLDRDaemon._atexit_registered:
+            atexit.register(self._persist_all_stats)
+            atexit.register(self._unload_model)
+            TLDRDaemon._atexit_registered = True
 
     def _compute_socket_path(self) -> Path:
         """Compute deterministic socket path from project path."""
@@ -187,6 +233,106 @@ class TLDRDaemon:
                 logger.warning(f"Failed to load TLDR config: {e}")
 
         return default_config
+
+    def _ensure_model_loaded(self) -> "ModelManager":  # type: ignore[name-defined]
+        """Lazily load and warm up the ML model.
+
+        Thread-safe: Uses lock to prevent multiple threads from loading simultaneously.
+        The model stays in memory until daemon shutdown.
+
+        Returns:
+            ModelManager singleton with loaded model.
+
+        Raises:
+            RuntimeError: If ML engine (torch, sentence_transformers) is not installed.
+        """
+        # Check ML engine availability before attempting to load
+        if not _check_ml_engine():
+            raise RuntimeError(
+                "ML engine not available - install with: pip install llm-tldr[ml] "
+                "(requires torch, sentence_transformers)"
+            )
+
+        if self._model_loaded and self._model_manager is not None:
+            return self._model_manager
+
+        with self._model_load_lock:
+            # Double-check inside lock
+            if self._model_loaded and self._model_manager is not None:
+                return self._model_manager
+
+            logger.info("Loading ML model for semantic search...")
+            try:
+                # Import lazily after availability check
+                from tldr.ml_engine import get_model_manager, get_index_manager
+
+                # Get singletons
+                self._model_manager = get_model_manager()
+                self._index_manager = get_index_manager()
+
+                # Get model name from config
+                model_name = self._semantic_config.get("model", "bge-large-en-v1.5")
+
+                # Map short names to full HF paths if needed
+                model_mapping = {
+                    "bge-large-en-v1.5": "BAAI/bge-large-en-v1.5",
+                    "qwen3-0.6b": "Qwen/Qwen3-Embedding-0.6B",
+                    "qwen3-4b": "Qwen/Qwen3-Embedding-4B",
+                }
+                hf_model = model_mapping.get(model_name, model_name)
+
+                # Load and warm up model
+                self._model_manager.load(hf_model)
+                warmup_stats = self._model_manager.warmup()
+                logger.info(
+                    f"ML model loaded: {hf_model} on {warmup_stats['device']} "
+                    f"(backend: {warmup_stats['backend']}, warmup: {warmup_stats['warmup_time_s']:.2f}s)"
+                )
+                self._model_loaded = True
+
+            except Exception as e:
+                logger.error(f"Failed to load ML model: {e}")
+                # Don't set _model_loaded = True, so we retry next time
+                raise
+
+            return self._model_manager
+
+    def _unload_model(self) -> None:
+        """Unload the ML model and free GPU/memory.
+
+        Thread-safe and idempotent: Uses lock + _model_unloaded guard to prevent
+        double-unload when both atexit and finally block trigger this method.
+        Safe to call from atexit - exceptions are caught and logged.
+
+        CRIT-007 FIX: Added lock protection. The original code had a race condition
+        where two threads could both pass the guard check before either set the flag,
+        causing double-unload which can crash GPU drivers or corrupt memory.
+        """
+        # CRIT-007 FIX: Wrap entire method in lock for atomic check-and-unload
+        with self._model_load_lock:
+            # Guard against double-unload (atexit + finally can both trigger)
+            if self._model_unloaded or not self._model_loaded:
+                return
+
+            if self._model_manager is not None:
+                try:
+                    logger.info("Unloading ML model...")
+                    self._model_manager.unload()
+                    logger.info("ML model unloaded")
+                except Exception as e:
+                    # Log but don't raise - safe for atexit context
+                    logger.error(f"Failed to unload ML model: {e}")
+
+            if self._index_manager is not None:
+                try:
+                    self._index_manager.clear()
+                    logger.info("Index cache cleared")
+                except Exception as e:
+                    # Log but don't raise - safe for atexit context
+                    logger.error(f"Failed to clear index cache: {e}")
+
+            self._model_loaded = False
+            self._model_unloaded = True
 
     def _get_connection_info(self) -> tuple[str, int | None]:
         """Return (address, port) - port is None for Unix sockets.
@@ -270,24 +416,43 @@ class TLDRDaemon:
         Normalizes session_id to 8 chars to match status.py convention.
         This allows both full UUIDs and truncated IDs to work.
 
+        Thread-safe: Uses _session_stats_lock to prevent concurrent access corruption.
         Memory safety: Limits dict to 10000 entries by evicting oldest when exceeded.
         Python 3.7+ dicts maintain insertion order, so first key is oldest.
+
+        HIGH-016 FIX: Added lock to prevent race conditions on concurrent access.
+        MED-026 FIX: Changed single eviction to loop eviction for batch additions.
         """
         # Normalize to 8 chars (matches status.py truncation)
         session_id = session_id[:8] if session_id else session_id
 
-        # Memory safety: evict oldest entries if dict is too large
-        if len(self._session_stats) > 10000:
-            oldest_key = next(iter(self._session_stats))
-            del self._session_stats[oldest_key]
-            logger.debug(f"Evicted oldest session stats entry: {oldest_key}")
+        with self._session_stats_lock:
+            # Memory safety: evict oldest entries until under threshold
+            # MED-026 FIX: Loop eviction handles batch additions that could
+            # otherwise cause unbounded growth with single-entry eviction
+            while len(self._session_stats) > 10000:
+                oldest_key = next(iter(self._session_stats))
+                del self._session_stats[oldest_key]
+                logger.debug(f"Evicted oldest session stats entry: {oldest_key}")
 
-        if session_id not in self._session_stats:
-            self._session_stats[session_id] = SessionStats(session_id=session_id)
-        return self._session_stats[session_id]
+            if session_id not in self._session_stats:
+                self._session_stats[session_id] = SessionStats(session_id=session_id)
+            return self._session_stats[session_id]
 
     def _get_hook_stats(self, hook_name: str) -> HookStats:
-        """Get or create hook stats for a hook name."""
+        """Get or create hook stats for a hook name.
+
+        MUST be called while holding self._hook_stats_lock.
+
+        HIGH-017 FIX: Added memory safety with loop eviction to prevent unbounded growth.
+        Memory safety: Limits dict to 1000 entries (hooks are finite, but defensive).
+        """
+        # Memory safety: evict oldest entries until under threshold
+        while len(self._hook_stats) > 1000:
+            oldest_key = next(iter(self._hook_stats))
+            del self._hook_stats[oldest_key]
+            logger.debug(f"Evicted oldest hook stats entry: {oldest_key}")
+
         if hook_name not in self._hook_stats:
             self._hook_stats[hook_name] = HookStats(hook_name=hook_name)
         return self._hook_stats[hook_name]
@@ -393,6 +558,19 @@ class TLDRDaemon:
             name: stats.to_dict() for name, stats in self._hook_stats.items()
         }
 
+        # Get ML model stats (P9)
+        ml_model_stats = {}
+        if self._model_loaded and self._model_manager:
+            try:
+                ml_model_stats = self._model_manager.memory_stats()
+                ml_model_stats["loaded"] = True
+                if self._index_manager:
+                    ml_model_stats["index_cache"] = self._index_manager.stats()
+            except Exception as e:
+                ml_model_stats = {"loaded": True, "error": str(e)}
+        else:
+            ml_model_stats = {"loaded": False}
+
         return {
             "status": self._status,
             "uptime": uptime,
@@ -403,12 +581,15 @@ class TLDRDaemon:
             "session_stats": session_stats,
             "all_sessions": all_sessions_stats,
             "hook_stats": hook_stats_dict,
+            "ml_model": ml_model_stats,
         }
 
     def _handle_shutdown(self, command: dict) -> dict:
-        """Handle shutdown command with stats persistence."""
+        """Handle shutdown command with stats persistence and model cleanup."""
         # Persist all session stats before shutdown
         self._persist_all_stats()
+        # Unload ML model to free GPU/memory
+        self._unload_model()
         self._shutdown_requested = True
         return {"status": "shutting_down"}
 
@@ -739,24 +920,94 @@ class TLDRDaemon:
             return {"status": "error", "message": str(e)}
 
     def _handle_semantic(self, command: dict) -> dict:
-        """Handle semantic search/index command."""
+        """Handle semantic search/index command using persistent ML model.
+
+        The model is loaded once on first use and stays in GPU/memory
+        until daemon shutdown. This avoids 5-10s model load on each request.
+
+        Gracefully handles missing ML dependencies (torch, sentence_transformers)
+        by returning helpful error messages with installation instructions.
+        """
         action = command.get("action", "search")
 
-        try:
-            from tldr.semantic import build_semantic_index, semantic_search
+        # For status action, report availability even if ML deps missing
+        if action == "status":
+            ml_available = _check_ml_engine()
+            if not ml_available:
+                return {
+                    "status": "ok",
+                    "model_loaded": False,
+                    "ml_available": False,
+                    "install_hint": "pip install llm-tldr[ml]",
+                }
+            if self._model_loaded and self._model_manager:
+                stats = self._model_manager.memory_stats()
+                idx_stats = self._index_manager.stats() if self._index_manager else {}
+                return {
+                    "status": "ok",
+                    "model_loaded": True,
+                    "ml_available": True,
+                    "model_stats": stats,
+                    "index_stats": idx_stats,
+                }
+            else:
+                return {
+                    "status": "ok",
+                    "model_loaded": False,
+                    "ml_available": True,
+                }
 
+        # All other actions require ML engine - check availability early
+        if not _check_ml_engine():
+            return {
+                "status": "error",
+                "message": (
+                    "Semantic features require ML dependencies. "
+                    "Install with: pip install llm-tldr[ml]"
+                ),
+                "ml_available": False,
+            }
+
+        try:
             if action == "index":
+                # For indexing, use ml_engine.build_index which uses ModelManager
+                from tldr.ml_engine import build_index
+
                 language = command.get("language", "python")
-                count = build_semantic_index(str(self.project), lang=language)
+
+                # Ensure model is loaded first (warm up)
+                self._ensure_model_loaded()
+
+                # Build index using persistent model
+                count = build_index(str(self.project), lang=language)
                 return {"status": "ok", "indexed": count}
 
             elif action == "search":
+                # For search, use ml_engine.search which uses ModelManager + IndexManager
+                from tldr.ml_engine import search
+
                 query = command.get("query")
                 if not query:
                     return {"status": "error", "message": "Missing required parameter: query"}
+
+                # Ensure model is loaded
+                self._ensure_model_loaded()
+
                 k = command.get("k", 10)
-                results = semantic_search(str(self.project), query, k=k)
+                expand_graph = command.get("expand_graph", False)
+                results = search(str(self.project), query, k=k, expand_graph=expand_graph)
                 return {"status": "ok", "results": results}
+
+            elif action == "warmup":
+                # Explicitly warm up the model (useful for pre-loading on daemon start)
+                mm = self._ensure_model_loaded()
+                stats = mm.memory_stats()
+                return {
+                    "status": "ok",
+                    "model": stats.get("model"),
+                    "device": stats.get("device"),
+                    "backend": mm.backend,
+                }
 
             else:
                 return {"status": "error", "message": f"Unknown action: {action}"}
@@ -999,8 +1250,9 @@ class TLDRDaemon:
                     self._reindex_in_progress = False
 
         # Run in thread to not block daemon
-        thread = threading.Thread(target=do_reindex, daemon=True)
-        thread.start()
+        # MED-025 FIX: Store thread reference for graceful shutdown tracking
+        self._reindex_thread = threading.Thread(target=do_reindex, daemon=True)
+        self._reindex_thread.start()
 
     def _handle_diagnostics(self, command: dict) -> dict:
         """Handle diagnostics command - type check + lint.
@@ -1319,10 +1571,6 @@ class TLDRDaemon:
             return status_file.read_text().strip()
         return "unknown"
 
-    def _create_socket(self):
-        """Create and bind the socket (legacy method, calls _create_server_socket)."""
-        self._socket = self._create_server_socket()
-
     def _create_server_socket(self) -> socket.socket:
         """Create appropriate socket for platform.
 
@@ -1449,9 +1697,17 @@ class TLDRDaemon:
 
         # Cross-platform signal handling for graceful shutdown
         # Signal handlers just set the flag - actual cleanup happens in finally block
+        #
+        # CRIT-009 FIX: Removed logger.info() from signal handler because logging
+        # is NOT async-signal-safe. If signal arrives while logging system holds a
+        # lock, calling logger.info() deadlocks waiting for the same lock.
+        # Only set the flag here; log the signal AFTER exiting the handler context.
+        _pending_signal: list[int] = []  # Mutable container to capture signal number
+
         def _signal_handler(signum: int, frame: Any) -> None:
-            signame = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
-            logger.info(f"Received {signame}, initiating graceful shutdown")
+            # CRIT-009: NO LOGGING HERE - not async-signal-safe!
+            # Only safe operations: setting flags, writing to pipes, sig_atomic ops
+            _pending_signal.append(signum)
             self._shutdown_requested = True
 
         # SIGINT works on all platforms (Ctrl+C)
@@ -1462,7 +1718,7 @@ class TLDRDaemon:
             signal.signal(signal.SIGTERM, _signal_handler)
 
         try:
-            self._create_socket()
+            self._socket = self._create_server_socket()
             self.write_status("ready")
 
             logger.info(f"TLDR daemon started for {self.project}")
@@ -1474,6 +1730,12 @@ class TLDRDaemon:
                 if self.is_idle():
                     logger.info("Idle timeout reached, shutting down")
                     break
+
+            # CRIT-009 FIX: Log signal info AFTER exiting handler context (now safe)
+            if _pending_signal:
+                signum = _pending_signal[0]
+                signame = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+                logger.info(f"Received {signame}, initiating graceful shutdown")
 
         except KeyboardInterrupt:
             logger.info("Received interrupt, shutting down")
@@ -1492,6 +1754,12 @@ class TLDRDaemon:
                 self._save_dedup_index()
             except Exception as e:
                 logger.error(f"Failed to save dedup index on shutdown: {e}")
+
+            # Unload ML model to free GPU/memory (P9)
+            try:
+                self._unload_model()
+            except Exception as e:
+                logger.error(f"Failed to unload ML model on shutdown: {e}")
 
             self._cleanup_socket()
             self.remove_pid_file()

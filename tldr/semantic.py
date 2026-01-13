@@ -1,54 +1,278 @@
 """
-Semantic search for code using 5-layer embeddings.
+Semantic search data structures and extraction utilities.
 
-Embeds functions/methods using all 5 TLDR analysis layers:
-- L1: Signature + docstring
-- L2: Top callers + callees (from call graph)
-- L3: Control flow summary
-- L4: Data flow summary
-- L5: Dependencies
+This module provides:
+- EmbeddingUnit: Dataclass for code units with 5-layer TLDR analysis
+- build_embedding_text: Convert units to embedding-ready text
+- extract_units_from_project: Extract all indexable code units from a project
+- Smart chunking for oversized units (>8K tokens)
+- Semantic pattern detection and code tagging
 
-Uses BAAI/bge-large-en-v1.5 for embeddings (1024 dimensions)
-and FAISS for fast vector similarity search.
+Token-based approach:
+- All code extraction uses token counting, not line counting
+- Oversized classes are split at method boundaries
+- Oversized functions are split at logical block boundaries
+- Each chunk maintains context with parent reference
+
+DEPRECATED (2024-01): The following functions were removed in favor of ml_engine.py:
+- build_semantic_index() -> use ml_engine.build_index()
+- semantic_search() -> use ml_engine.search()
+- get_model() -> use ml_engine.ModelManager
+- compute_embedding() -> use ml_engine.ModelManager.encode()
+
+The CLI (tldr semantic index/search) now uses ml_engine.py which provides:
+- Qwen3-Embedding models (better than BGE)
+- TEI backend for high-throughput inference
+- usearch for faster vector search
+- Matryoshka Representation Learning (MRL) support
 """
 
-import json
 import logging
 import os
-import sys
-import threading
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any, Set, Tuple
+
+from tldr.tokenizer import count_tokens, get_tokenizer, truncate_to_tokens
 
 logger = logging.getLogger("tldr.semantic")
 
 ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir"]
 
-# Lazy imports for heavy dependencies
-_model = None
-_model_name = None  # Track which model is loaded
-_model_lock = threading.Lock()  # Thread safety for model singleton
+# Token budget for embeddings (Qwen3 supports 32K, TEI configured for 16K)
+MAX_EMBEDDING_TOKENS = 8192  # Conservative limit for good retrieval quality
+MAX_CODE_PREVIEW_TOKENS = 6000  # Leave room for metadata in embedding text
+CHUNK_OVERLAP_TOKENS = 200  # Overlap between chunks for context continuity
 
-# Supported models with approximate download sizes
-SUPPORTED_MODELS = {
-    "bge-large-en-v1.5": {
-        "hf_name": "BAAI/bge-large-en-v1.5",
-        "size": "1.3GB",
-        "dimension": 1024,
-        "description": "High quality, recommended for production",
-    },
-    "all-MiniLM-L6-v2": {
-        "hf_name": "sentence-transformers/all-MiniLM-L6-v2",
-        "size": "80MB",
-        "dimension": 384,
-        "description": "Lightweight, good for testing",
-    },
+# Semantic pattern categories for code tagging
+SEMANTIC_PATTERNS = {
+    # Data operations
+    "crud": r"\b(create|read|update|delete|insert|select|save|load|fetch|store|persist|get|set|add|remove)\b",
+    "validation": r"\b(valid|validate|check|verify|assert|ensure|sanitize|normalize|parse|format)\b",
+    "transform": r"\b(convert|transform|map|reduce|filter|sort|merge|split|join|serialize|deserialize)\b",
+
+    # Control flow patterns
+    "error_handling": r"\b(try|catch|except|raise|throw|error|exception|fail|panic)\b",
+    "async_ops": r"\b(async|await|promise|future|callback|then|concurrent|parallel|thread)\b",
+    "iteration": r"\b(for|while|loop|iterate|each|map|reduce|filter)\b",
+
+    # Architecture patterns
+    "api_endpoint": r"\b(route|endpoint|handler|controller|get|post|put|delete|patch|request|response)\b",
+    "database": r"\b(query|sql|select|insert|update|delete|table|schema|migration|model|entity)\b",
+    "auth": r"\b(auth|login|logout|session|token|jwt|oauth|permission|role|access)\b",
+    "cache": r"\b(cache|memoize|memo|store|redis|memcache|ttl|expire|invalidate)\b",
+
+    # Code quality
+    "test": r"\b(test|spec|mock|stub|assert|expect|should|describe|it)\b",
+    "logging": r"\b(log|logger|debug|info|warn|error|trace|print|console)\b",
+    "config": r"\b(config|setting|option|env|environment|parameter|argument)\b",
 }
 
-DEFAULT_MODEL = "bge-large-en-v1.5"
+def extract_code_by_tokens(content: str, start_offset: int, max_tokens: int) -> Tuple[str, int]:
+    """Extract code from content starting at offset, limited by tokens.
+
+    Unlike line-based extraction, this scans character-by-character and
+    counts tokens to get the exact maximum context that fits.
+
+    Args:
+        content: Full file content.
+        start_offset: Character offset to start extraction (clamped to 0 if negative).
+        max_tokens: Maximum tokens to extract.
+
+    Returns:
+        Tuple of (extracted_code, end_offset).
+    """
+    start_offset = max(0, start_offset)
+    if start_offset >= len(content):
+        return "", start_offset
+
+    # Extract from start_offset to end
+    candidate = content[start_offset:]
+
+    # Count tokens and truncate if needed
+    token_count = count_tokens(candidate)
+    if token_count <= max_tokens:
+        return candidate, len(content)
+
+    # Binary search for the right length
+    tokenizer = get_tokenizer()
+    if tokenizer is None:
+        # Fallback: estimate ~4 chars per token
+        estimated_chars = max_tokens * 4
+        return candidate[:estimated_chars], start_offset + estimated_chars
+
+    # Encode and decode truncated
+    encoded = tokenizer.encode(candidate, add_special_tokens=False)
+    truncated_ids = encoded.ids[:max_tokens]
+    result = tokenizer.decode(truncated_ids)
+
+    return result, start_offset + len(result)
+
+
+def detect_semantic_patterns(code: str) -> Set[str]:
+    """Detect semantic patterns in code for tagging.
+
+    Scans code for common patterns (CRUD, validation, error handling, etc.)
+    and returns matching categories for semantic enrichment.
+
+    Args:
+        code: Code string to analyze.
+
+    Returns:
+        Set of matched pattern categories.
+    """
+    if not code:
+        return set()
+
+    code_lower = code.lower()
+    matched = set()
+
+    for pattern_name, pattern_regex in SEMANTIC_PATTERNS.items():
+        if re.search(pattern_regex, code_lower):
+            matched.add(pattern_name)
+
+    return matched
+
+
+def _get_indent_depth(line: str) -> int:
+    """Calculate indent depth handling both tabs and spaces.
+
+    Examines only leading whitespace to determine indentation level.
+    Tabs count as 1 level each, spaces count as 1 level per 4 spaces.
+
+    Args:
+        line: A single line of code.
+
+    Returns:
+        Indentation depth (number of levels).
+    """
+    stripped = line.lstrip()
+    if not stripped:
+        return 0
+    indent = len(line) - len(stripped)
+    # Check leading whitespace type
+    leading = line[:indent]
+    if '\t' in leading:
+        return leading.count('\t')
+    return indent // 4
+
+
+def detect_code_complexity(code: str) -> Dict[str, Any]:
+    """Analyze code complexity without full AST parsing.
+
+    Quick heuristic analysis of code structure for embedding enrichment.
+
+    Args:
+        code: Code string to analyze.
+
+    Returns:
+        Dict with complexity metrics.
+    """
+    if not code:
+        return {"depth": 0, "branches": 0, "loops": 0}
+
+    # Count indentation depth using helper that properly handles tabs vs spaces
+    max_depth = 0
+    for line in code.split("\n"):
+        depth = _get_indent_depth(line)
+        max_depth = max(max_depth, depth)
+
+    # Count control structures
+    branches = len(re.findall(r"\b(if|elif|else|case|switch|match)\b", code))
+    loops = len(re.findall(r"\b(for|while|loop)\b", code))
+
+    return {
+        "depth": max_depth,
+        "branches": branches,
+        "loops": loops,
+    }
+
+
+def split_into_chunks(
+    code: str,
+    max_tokens: int,
+    overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
+) -> List[Tuple[str, int, int]]:
+    """Split code into token-limited chunks with overlap.
+
+    Attempts to split at logical boundaries (blank lines, function defs).
+    Each chunk overlaps with the previous for context continuity.
+
+    Args:
+        code: Code string to split.
+        max_tokens: Maximum tokens per chunk.
+        overlap_tokens: Token overlap between chunks.
+
+    Returns:
+        List of (chunk_text, start_char, end_char) tuples.
+    """
+    if not code:
+        return []
+
+    total_tokens = count_tokens(code)
+    if total_tokens <= max_tokens:
+        return [(code, 0, len(code))]
+
+    chunks = []
+    tokenizer = get_tokenizer()
+
+    if tokenizer is None:
+        # Fallback: split by estimated character count
+        chars_per_chunk = max_tokens * 4
+        overlap_chars = overlap_tokens * 4
+        pos = 0
+        while pos < len(code):
+            end = min(pos + chars_per_chunk, len(code))
+            chunks.append((code[pos:end], pos, end))
+            # Ensure we always advance by at least 1 to avoid infinite loop
+            # when overlap_chars >= chars_per_chunk
+            pos = max(end - overlap_chars, pos + 1)
+        return chunks
+
+    # Token-based splitting with boundary detection
+    lines = code.split("\n")
+    current_chunk = []
+    current_tokens = 0
+    chunk_start = 0
+    char_offset = 0
+
+    for i, line in enumerate(lines):
+        line_with_newline = line + "\n" if i < len(lines) - 1 else line
+        line_tokens = count_tokens(line_with_newline)
+
+        # Check if adding this line would exceed limit
+        if current_tokens + line_tokens > max_tokens and current_chunk:
+            # Save current chunk - use original slice to preserve exact byte offsets
+            chunk_text = code[chunk_start:char_offset]
+            chunks.append((chunk_text, chunk_start, char_offset))
+
+            # Start new chunk with overlap
+            # Find lines for overlap
+            overlap_lines = []
+            overlap_count = 0
+            for prev_line in reversed(current_chunk):
+                prev_tokens = count_tokens(prev_line)
+                if overlap_count + prev_tokens > overlap_tokens:
+                    break
+                overlap_lines.insert(0, prev_line)
+                overlap_count += prev_tokens
+
+            current_chunk = overlap_lines
+            current_tokens = overlap_count
+            chunk_start = char_offset - sum(len(l) + 1 for l in overlap_lines)
+
+        current_chunk.append(line)
+        current_tokens += line_tokens
+        char_offset += len(line_with_newline)
+
+    # Don't forget the last chunk
+    if current_chunk:
+        chunk_text = code[chunk_start:char_offset]
+        chunks.append((chunk_text, chunk_start, char_offset))
+
+    return chunks
 
 
 @dataclass(slots=True)
@@ -61,6 +285,14 @@ class EmbeddingUnit:
     - L3: cfg_summary
     - L4: dfg_summary
     - L5: dependencies
+
+    Plus semantic enrichment:
+    - semantic_tags: Auto-detected patterns (crud, validation, async_ops, etc.)
+    - complexity: Quick complexity metrics (depth, branches, loops)
+    - chunk_index: For oversized units split into chunks
+    - chunk_total: Total chunks for this unit
+    - parent_name: For chunks, reference to parent unit
+    - token_count: Actual token count for this unit
     """
 
     name: str
@@ -68,7 +300,7 @@ class EmbeddingUnit:
     file: str
     line: int
     language: str
-    unit_type: str  # "function" | "method" | "class"
+    unit_type: str  # "function" | "method" | "class" | "chunk"
     signature: str
     docstring: str
     calls: List[str] = field(default_factory=list)
@@ -77,139 +309,123 @@ class EmbeddingUnit:
     dfg_summary: str = ""
     dependencies: str = ""
     code_preview: str = ""
+    # Semantic enrichment
+    semantic_tags: List[str] = field(default_factory=list)
+    complexity: Dict[str, int] = field(default_factory=dict)
+    # Chunking support
+    chunk_index: int = 0
+    chunk_total: int = 1
+    parent_name: str = ""
+    token_count: int = 0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return {
-            "name": self.name,
-            "qualified_name": self.qualified_name,
-            "file": self.file,
-            "line": self.line,
-            "language": self.language,
-            "unit_type": self.unit_type,
-            "signature": self.signature,
-            "docstring": self.docstring,
-            "calls": self.calls,
-            "called_by": self.called_by,
-            "cfg_summary": self.cfg_summary,
-            "dfg_summary": self.dfg_summary,
-            "dependencies": self.dependencies,
-            "code_preview": self.code_preview,
-        }
+        from dataclasses import asdict
+        return asdict(self)
+
+    def is_chunk(self) -> bool:
+        """Check if this unit is a chunk of a larger unit."""
+        return self.chunk_total > 1
+
+    def needs_chunking(self) -> bool:
+        """Check if this unit needs to be split into chunks."""
+        return self.token_count > MAX_EMBEDDING_TOKENS
 
 
-MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Legacy, use SUPPORTED_MODELS
+def chunk_unit(unit: EmbeddingUnit) -> List[EmbeddingUnit]:
+    """Split an oversized unit into token-limited chunks.
 
+    For classes: splits by method boundaries when possible.
+    For functions: splits at logical block boundaries.
 
-def _model_exists_locally(hf_name: str) -> bool:
-    """Check if a model is already downloaded locally."""
-    try:
-        from huggingface_hub import try_to_load_from_cache
-
-        # Check if model config exists in cache
-        result = try_to_load_from_cache(hf_name, "config.json")
-        return result is not None
-    except Exception:
-        return False
-
-
-def _confirm_download(model_key: str) -> bool:
-    """Prompt user to confirm model download. Returns True if confirmed."""
-    model_info = SUPPORTED_MODELS.get(model_key, {})
-    size = model_info.get("size", "unknown size")
-    hf_name = model_info.get("hf_name", model_key)
-
-    # Skip prompt if TLDR_AUTO_DOWNLOAD is set or not a TTY
-    if os.environ.get("TLDR_AUTO_DOWNLOAD") == "1":
-        return True
-    if not sys.stdin.isatty():
-        # Non-interactive: warn but proceed
-        print(f"⚠️  Downloading {hf_name} ({size})...", file=sys.stderr)
-        return True
-
-    print(f"\n⚠️  Semantic search requires embedding model: {hf_name}", file=sys.stderr)
-    print(f"   Download size: {size}", file=sys.stderr)
-    print("   (Set TLDR_AUTO_DOWNLOAD=1 to skip this prompt)\n", file=sys.stderr)
-
-    try:
-        response = input("Continue with download? [Y/n] ").strip().lower()
-        return response in ("", "y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        return False
-
-
-def get_model(model_name: Optional[str] = None):
-    """Lazy-load the embedding model (cached, thread-safe).
+    Each chunk inherits metadata from parent and includes:
+    - Signature and docstring in first chunk
+    - Parent reference in all chunks
+    - Chunk index/total for reconstruction
 
     Args:
-        model_name: Model key from SUPPORTED_MODELS, or None for default.
-                   Can also be a full HuggingFace model name.
+        unit: The EmbeddingUnit to split.
 
     Returns:
-        SentenceTransformer model instance.
-
-    Raises:
-        ValueError: If model not found or user declines download.
+        List of EmbeddingUnit chunks. Returns [unit] if no chunking needed.
     """
-    global _model, _model_name
+    if not unit.code_preview:
+        return [unit]
 
-    # Resolve model name
-    if model_name is None:
-        model_name = DEFAULT_MODEL
+    code_tokens = count_tokens(unit.code_preview)
+    if code_tokens <= MAX_CODE_PREVIEW_TOKENS:
+        # Update token count and return as-is
+        unit.token_count = code_tokens
+        return [unit]
 
-    # Get HuggingFace name
-    if model_name in SUPPORTED_MODELS:
-        hf_name = SUPPORTED_MODELS[model_name]["hf_name"]
+    # Split the code into chunks
+    chunks = split_into_chunks(unit.code_preview, MAX_CODE_PREVIEW_TOKENS)
+
+    if len(chunks) <= 1:
+        # Couldn't split effectively, just truncate
+        unit.code_preview = truncate_to_tokens(unit.code_preview, MAX_CODE_PREVIEW_TOKENS)
+        unit.token_count = count_tokens(unit.code_preview)
+        return [unit]
+
+    # Create chunk units
+    chunk_units = []
+    for i, (chunk_text, start_char, end_char) in enumerate(chunks):
+        chunk_name = f"{unit.name}[{i+1}/{len(chunks)}]"
+
+        chunk_unit = EmbeddingUnit(
+            name=chunk_name,
+            qualified_name=f"{unit.qualified_name}#chunk{i+1}",
+            file=unit.file,
+            line=unit.line + unit.code_preview[:start_char].count("\n") if i > 0 else unit.line,
+            language=unit.language,
+            unit_type="chunk",
+            # First chunk gets full signature/docstring, others get abbreviated
+            signature=unit.signature if i == 0 else f"// continued from {unit.name}",
+            docstring=unit.docstring if i == 0 else "",
+            calls=unit.calls if i == 0 else [],
+            called_by=unit.called_by if i == 0 else [],
+            cfg_summary=unit.cfg_summary if i == 0 else "",
+            dfg_summary=unit.dfg_summary if i == 0 else "",
+            dependencies=unit.dependencies,
+            code_preview=chunk_text,
+            # Semantic enrichment - detect for each chunk
+            semantic_tags=list(detect_semantic_patterns(chunk_text)),
+            complexity=detect_code_complexity(chunk_text),
+            # Chunk metadata
+            chunk_index=i,
+            chunk_total=len(chunks),
+            parent_name=unit.name,
+            token_count=count_tokens(chunk_text),
+        )
+        chunk_units.append(chunk_unit)
+
+    return chunk_units
+
+
+def enrich_unit(unit: EmbeddingUnit) -> EmbeddingUnit:
+    """Add semantic enrichment to a unit.
+
+    Detects patterns, calculates complexity, and computes token count.
+
+    Args:
+        unit: The EmbeddingUnit to enrich.
+
+    Returns:
+        The enriched unit (modified in place and returned).
+    """
+    if unit.code_preview:
+        # Detect semantic patterns
+        unit.semantic_tags = list(detect_semantic_patterns(unit.code_preview))
+        # Calculate complexity
+        unit.complexity = detect_code_complexity(unit.code_preview)
+        # Count tokens
+        unit.token_count = count_tokens(unit.code_preview)
     else:
-        # Allow arbitrary HuggingFace model names
-        hf_name = model_name
+        unit.semantic_tags = []
+        unit.complexity = {}
+        unit.token_count = 0
 
-    # Thread-safe model loading with double-checked locking
-    # First check without lock for fast path (model already loaded)
-    if _model is not None and _model_name == hf_name:
-        return _model
-
-    with _model_lock:
-        # Re-check under lock to prevent race condition
-        if _model is not None and _model_name == hf_name:
-            return _model
-
-        # Check if model needs downloading (outside lock would cause UI issues)
-        if not _model_exists_locally(hf_name):
-            model_key = model_name if model_name in SUPPORTED_MODELS else None
-            if model_key and not _confirm_download(model_key):
-                raise ValueError(
-                    "Model download declined. Use --model to choose a smaller model."
-                )
-
-        from sentence_transformers import SentenceTransformer
-        import torch
-
-        # Auto-select best device
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
-        _model = SentenceTransformer(hf_name, device=device)
-
-        # Best-effort dtype optimization (don't fail model load)
-        try:
-            _model = _model.to(torch.bfloat16)
-        except Exception:
-            pass  # Fall back to fp32 if bf16 unsupported
-
-        # Apply torch.compile() for optimized execution (PyTorch 2.0+)
-        try:
-            if hasattr(torch, "compile"):
-                _model = torch.compile(_model)
-        except Exception:
-            pass  # Silently fall back if compile unavailable
-
-        _model_name = hf_name
-        return _model
+    return unit
 
 
 def _parse_identifier_to_words(name: str) -> str:
@@ -230,8 +446,6 @@ def _parse_identifier_to_words(name: str) -> str:
     Returns:
         Space-separated lowercase words.
     """
-    import re
-
     # Remove leading/trailing underscores
     name = name.strip("_")
     if not name:
@@ -257,6 +471,8 @@ def _extract_inline_comments(code: str) -> List[str]:
 
     Parses # comments and extracts their text for semantic embedding.
     Comments often contain valuable natural language describing intent.
+    Uses state machine to avoid false positives from # inside strings
+    (e.g., f-string format specifiers like f"{value:#.2f}").
 
     Args:
         code: The code string to parse.
@@ -264,18 +480,54 @@ def _extract_inline_comments(code: str) -> List[str]:
     Returns:
         List of comment strings (without # prefix).
     """
-    import re
-
     comments = []
-    for line in code.split("\n"):
-        # Match # comments (but not in strings - simple heuristic)
-        # Skip shebang lines
-        match = re.search(r'(?<!["\'#])\s*#\s*(.+?)$', line)
-        if match:
-            comment = match.group(1).strip()
-            # Filter out noise comments
-            if len(comment) > 3 and not comment.startswith("!"):
-                comments.append(comment)
+    in_string = False
+    string_char = None
+    i = 0
+    code_len = len(code)
+
+    while i < code_len:
+        char = code[i]
+
+        # Track string state - handle escaped quotes
+        if char in ('"', "'") and (i == 0 or code[i - 1] != '\\'):
+            if not in_string:
+                # Check for triple-quoted strings
+                if i + 2 < code_len and code[i:i + 3] in ('"""', "'''"):
+                    in_string = True
+                    string_char = code[i:i + 3]
+                    i += 3
+                    continue
+                in_string = True
+                string_char = char
+            elif in_string:
+                # Check for closing triple quote
+                if len(string_char) == 3 and i + 2 < code_len and code[i:i + 3] == string_char:
+                    in_string = False
+                    string_char = None
+                    i += 3
+                    continue
+                # Check for closing single quote
+                elif len(string_char) == 1 and char == string_char:
+                    in_string = False
+                    string_char = None
+
+        # Only match # outside strings
+        elif char == '#' and not in_string:
+            # Skip shebang lines
+            if i > 0 and code[i - 1] == '\n' and i + 1 < code_len and code[i + 1] == '!':
+                pass
+            else:
+                # Extract comment text until end of line
+                end = code.find('\n', i)
+                comment_text = code[i + 1:end if end != -1 else code_len].strip()
+                # Filter out noise comments
+                if len(comment_text) > 3 and not comment_text.startswith("!"):
+                    comments.append(comment_text)
+                i = end if end != -1 else code_len
+                continue
+
+        i += 1
 
     return comments
 
@@ -307,8 +559,6 @@ def _generate_semantic_description(unit: "EmbeddingUnit") -> str:
 
     # Extract parameter semantics from signature
     if unit.signature:
-        import re
-
         # Extract parameter names from signature
         param_match = re.search(r"\((.*?)\)", unit.signature)
         if param_match:
@@ -330,8 +580,6 @@ def _generate_semantic_description(unit: "EmbeddingUnit") -> str:
 
     # Describe complexity in natural language
     if unit.cfg_summary:
-        import re
-
         complexity_match = re.search(r"complexity:(\d+)", unit.cfg_summary)
         if complexity_match:
             complexity = int(complexity_match.group(1))
@@ -346,8 +594,6 @@ def _generate_semantic_description(unit: "EmbeddingUnit") -> str:
 
     # Describe data handling
     if unit.dfg_summary:
-        import re
-
         vars_match = re.search(r"vars:(\d+)", unit.dfg_summary)
         if vars_match:
             var_count = int(vars_match.group(1))
@@ -364,11 +610,21 @@ def _generate_semantic_description(unit: "EmbeddingUnit") -> str:
 
 
 def build_embedding_text(unit: EmbeddingUnit) -> str:
-    """Build rich text for embedding from all 5 layers.
+    """Build rich text for embedding from all 5 layers plus semantic enrichment.
 
     Creates a single text string containing information from all
     analysis layers, suitable for embedding with a language model.
     Prioritizes natural language over code syntax for better semantic search.
+
+    Includes:
+    - Natural language description (docstring or generated)
+    - Parsed identifier as natural language
+    - Signature with type hints
+    - Call graph relationships
+    - Semantic tags (crud, validation, async_ops, etc.)
+    - Complexity metrics
+    - Chunk context (for oversized units)
+    - Code preview
 
     Args:
         unit: The EmbeddingUnit containing code analysis.
@@ -377,6 +633,21 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
         A text string combining all layer information.
     """
     parts = []
+
+    # Header with type and name
+    type_str = unit.unit_type if unit.unit_type else "function"
+    header = f"{type_str.capitalize()}: {unit.name}"
+
+    # For chunks, include parent context
+    if unit.is_chunk():
+        header = f"Chunk [{unit.chunk_index + 1}/{unit.chunk_total}] of {unit.parent_name}"
+
+    parts.append(header)
+
+    # Semantic tags - very important for semantic search
+    if unit.semantic_tags:
+        tags_str = ", ".join(sorted(unit.semantic_tags))
+        parts.append(f"Categories: {tags_str}")
 
     # Primary: Natural language description (most important for semantic search)
     # Use docstring if available, otherwise generate description
@@ -397,6 +668,18 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     if unit.signature:
         parts.append(f"Signature: {unit.signature}")
 
+    # Complexity info
+    if unit.complexity:
+        complexity_parts = []
+        if unit.complexity.get("depth", 0) > 3:
+            complexity_parts.append("deep nesting")
+        if unit.complexity.get("branches", 0) > 5:
+            complexity_parts.append("many branches")
+        if unit.complexity.get("loops", 0) > 2:
+            complexity_parts.append("multiple loops")
+        if complexity_parts:
+            parts.append(f"Complexity: {', '.join(complexity_parts)}")
+
     # L2: Call graph with natural language framing
     if unit.calls:
         calls_words = [_parse_identifier_to_words(c) for c in unit.calls[:5]]
@@ -414,43 +697,19 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     if unit.dependencies:
         parts.append(f"Dependencies: {unit.dependencies}")
 
-    # Code preview (last - code syntax is less useful for semantic matching)
+    # Code preview - include full context for better semantic matching
     if unit.code_preview:
         # Include comments from code which are natural language
         comments = _extract_inline_comments(unit.code_preview)
         if comments:
-            parts.append(f"Code comments: {'; '.join(comments[:5])}")
+            parts.append(f"Code comments: {'; '.join(comments[:20])}")
 
-        # Include code but truncated (syntax is less useful than semantics)
-        code_lines = unit.code_preview.split("\n")[:8]  # First 8 lines
-        parts.append(f"Code:\n{chr(10).join(code_lines)}")
+        # Include code preview
+        parts.append(f"Code:\n{unit.code_preview}")
 
-    # Add name and type for context (at start for clarity)
-    type_str = unit.unit_type if unit.unit_type else "function"
-    parts.insert(0, f"{type_str.capitalize()}: {unit.name}")
-
-    return "\n".join(parts)
-
-
-def compute_embedding(text: str, model_name: Optional[str] = None):
-    """Compute embedding vector for text.
-
-    Args:
-        text: The text to embed.
-        model_name: Model to use (from SUPPORTED_MODELS or HF name).
-
-    Returns:
-        numpy array with L2-normalized embedding.
-    """
-    import numpy as np
-
-    model = get_model(model_name)
-
-    # BGE models work best with instruction prefix for queries
-    # For document embedding, we use text directly
-    embedding = model.encode(text, normalize_embeddings=True)
-
-    return np.array(embedding, dtype=np.float32)
+    # Join and ensure final text fits within embedding token limit
+    result = "\n".join(parts)
+    return truncate_to_tokens(result, MAX_EMBEDDING_TOKENS)
 
 
 # Threshold for switching to parallel processing
@@ -515,8 +774,8 @@ def extract_units_from_project(
             if dst_func not in called_by_map:
                 called_by_map[dst_func] = []
             called_by_map[dst_func].append(src_func)
-    except Exception:
-        # Call graph may not be available for all projects
+    except Exception as e:
+        logger.debug(f"Call graph unavailable for project: {e}")
         calls_map = {}
         called_by_map = {}
 
@@ -524,21 +783,47 @@ def extract_units_from_project(
     files = structure.get("files", [])
     max_workers = int(os.environ.get("TLDR_MAX_WORKERS", os.cpu_count() or 4))
 
+    def _get_file_func_names(file_info: Dict[str, Any]) -> Set[str]:
+        """Extract all function/method names from a file_info dict."""
+        names = set(file_info.get("functions", []))
+        for class_info in file_info.get("classes", []):
+            if isinstance(class_info, dict):
+                names.update(class_info.get("methods", []))
+        return names
+
+    def _filter_call_maps(
+        func_names: Set[str],
+        calls: Dict[str, List[str]],
+        called_by: Dict[str, List[str]],
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Filter call maps to only include entries relevant to given functions.
+
+        Reduces pickle overhead when passing to worker processes.
+        """
+        filtered_calls = {k: v for k, v in calls.items() if k in func_names}
+        filtered_called_by = {k: v for k, v in called_by.items() if k in func_names}
+        return filtered_calls, filtered_called_by
+
     # Use parallel processing if we have enough files to justify overhead
     if len(files) >= MIN_FILES_FOR_PARALLEL and max_workers > 1:
         try:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
+                futures = {}
+                for file_info in files:
+                    # Filter call maps to reduce pickle overhead (Bug MED-005 fix)
+                    func_names = _get_file_func_names(file_info)
+                    filtered_calls, filtered_called_by = _filter_call_maps(
+                        func_names, calls_map, called_by_map
+                    )
+                    future = executor.submit(
                         _process_file_for_extraction,
                         file_info,
                         str(project),
                         lang,
-                        calls_map,
-                        called_by_map,
-                    ): file_info
-                    for file_info in files
-                }
+                        filtered_calls,
+                        filtered_called_by,
+                    )
+                    futures[future] = file_info
 
                 for future in as_completed(futures):
                     file_info = futures[future]
@@ -572,430 +857,6 @@ def extract_units_from_project(
                 logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
 
     return units
-
-
-def _build_parent_map(tree) -> dict:
-    """Build a mapping from each AST node to its parent in O(N) time.
-
-    Args:
-        tree: The root AST node.
-
-    Returns:
-        Dict mapping child nodes to their parent nodes.
-    """
-    import ast
-
-    parents = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-    return parents
-
-
-def _get_parent_class(node, parents: dict) -> str | None:
-    """Find the parent ClassDef name for a node, if any.
-
-    Walks up the parent chain to find if this node is directly
-    inside a class body (i.e., is a method).
-
-    Args:
-        node: The AST node to check.
-        parents: Parent map from _build_parent_map.
-
-    Returns:
-        Class name if node is a direct method of a class, None otherwise.
-    """
-    import ast
-
-    current = parents.get(node)
-    while current:
-        if isinstance(current, ast.ClassDef):
-            # Check if node is a direct child in the class body
-            if node in current.body:
-                return current.name
-            # Node is nested deeper (e.g., inside a nested function), not a direct method
-            return None
-        current = parents.get(current)
-    return None
-
-
-def _build_signature_from_node(node, lang: str) -> str:
-    """Build function signature string from AST node.
-
-    Extracts signature during single AST walk to avoid redundant parsing.
-
-    Args:
-        node: AST FunctionDef or AsyncFunctionDef node.
-        lang: Programming language.
-
-    Returns:
-        Signature string like "def func(arg1: int, arg2) -> str".
-    """
-    if lang != "python":
-        return f"function {node.name}(...)"
-
-    import ast
-
-    try:
-        args = []
-        for arg in node.args.args:
-            arg_str = arg.arg
-            if arg.annotation:
-                arg_str += f": {ast.unparse(arg.annotation)}"
-            args.append(arg_str)
-
-        returns = ""
-        if node.returns:
-            returns = f" -> {ast.unparse(node.returns)}"
-
-        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-        return f"{prefix} {node.name}({', '.join(args)}){returns}"
-    except Exception:
-        return f"def {node.name}(...)"
-
-
-def _parse_file_ast(file_path: Path, lang: str, content: Optional[str] = None) -> tuple:
-    """Parse file AST to extract line numbers, code previews, signatures, and docstrings.
-
-    Reads file content once and returns it along with parsed AST for reuse by callers,
-    eliminating redundant file I/O operations (reduces 4N+1 reads to 1 read per file).
-
-    Args:
-        file_path: Path to the source file.
-        lang: Programming language.
-        content: Optional pre-read file content to avoid redundant I/O.
-
-    Returns:
-        Tuple of (result_dict, content, ast_tree) where:
-        - result_dict: {
-            "functions": {func_name: {"line": int, "code_preview": str, "signature": str, "docstring": str|None}},
-            "classes": {class_name: {"line": int, "docstring": str|None}},
-            "methods": {"ClassName.method": {"line": int, "code_preview": str, "signature": str, "docstring": str|None}}
-          }
-        - content: File content (read once, reusable by callers)
-        - ast_tree: Parsed AST (for Python) or None (reusable by callers)
-
-    Performance: O(N) where N is number of AST nodes.
-    Uses parent map for efficient parent class lookup instead of nested ast.walk().
-    Extracts signature and docstring in the same pass to eliminate 2N redundant ast.parse() calls.
-    """
-    result = {"functions": {}, "classes": {}, "methods": {}}
-    ast_tree = None
-
-    # Read content only if not provided (single I/O per file)
-    if content is None:
-        if not file_path.exists():
-            return result, "", None
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return result, "", None
-
-    lines = content.split("\n")
-
-    try:
-        if lang == "python":
-            import ast
-
-            ast_tree = ast.parse(content)
-
-            # Build parent map in O(N) - replaces O(N^3) nested ast.walk() calls
-            parents = _build_parent_map(ast_tree)
-
-            for node in ast.walk(ast_tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # O(depth) parent lookup instead of O(N^2) nested walk
-                    parent_class = _get_parent_class(node, parents)
-
-                    # Extract code preview (first 10 lines of body)
-                    # AST uses 1-indexed line numbers, Python lists are 0-indexed
-                    start_line = node.lineno - 1  # Convert to 0-indexed for list access
-                    end_line = getattr(
-                        node, "end_lineno", node.lineno + 10
-                    )  # end_lineno is 1-indexed, works as exclusive slice bound
-                    body_lines = lines[start_line : min(end_line, start_line + 10)]
-                    code_preview = "\n".join(body_lines[:10])
-
-                    # Extract signature and docstring in the same AST walk
-                    # This eliminates 2N redundant ast.parse() calls per file
-                    signature = _build_signature_from_node(node, lang)
-                    docstring = ast.get_docstring(node)
-
-                    func_data = {
-                        "line": node.lineno,
-                        "code_preview": code_preview,
-                        "signature": signature,
-                        "docstring": docstring,
-                    }
-
-                    if parent_class:
-                        result["methods"][f"{parent_class}.{node.name}"] = func_data
-                    else:
-                        result["functions"][node.name] = func_data
-
-                elif isinstance(node, ast.ClassDef):
-                    result["classes"][node.name] = {
-                        "line": node.lineno,
-                        "docstring": ast.get_docstring(node),
-                    }
-
-    except Exception:
-        # Return empty result on any parsing error, but preserve content
-        pass
-
-    return result, content, ast_tree
-
-
-def _get_file_dependencies(file_path: Path, lang: str) -> str:
-    """Get file-level import dependencies as a string."""
-    if not file_path.exists():
-        return ""
-
-    try:
-        from tldr.api import get_imports
-
-        imports = get_imports(str(file_path), language=lang)
-
-        # Extract module names (limit to first 5 for brevity)
-        modules = []
-        for imp in imports[:5]:
-            module = imp.get("module", "")
-            if module:
-                modules.append(module)
-
-        return ", ".join(modules) if modules else ""
-    except Exception:
-        return ""
-
-
-def _get_cfg_summary(
-    file_path: Path, func_name: str, lang: str, content: Optional[str] = None
-) -> str:
-    """Get CFG summary (complexity, block count) for a function.
-
-    Args:
-        file_path: Path to the source file.
-        func_name: Name of the function to analyze.
-        lang: Programming language.
-        content: Optional pre-read file content to avoid redundant I/O.
-
-    Returns:
-        CFG summary string (e.g., "complexity:3, blocks:5").
-    """
-    if content is None:
-        if not file_path.exists():
-            return ""
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
-
-    try:
-        if lang == "python":
-            from tldr.cfg_extractor import extract_python_cfg
-
-            cfg = extract_python_cfg(content, func_name)
-            return f"complexity:{cfg.cyclomatic_complexity}, blocks:{len(cfg.blocks)}"
-        # Add other languages as needed
-    except Exception:
-        pass
-
-    return ""
-
-
-def _get_dfg_summary(
-    file_path: Path, func_name: str, lang: str, content: Optional[str] = None
-) -> str:
-    """Get DFG summary (variable count, def-use chains) for a function.
-
-    Args:
-        file_path: Path to the source file.
-        func_name: Name of the function to analyze.
-        lang: Programming language.
-        content: Optional pre-read file content to avoid redundant I/O.
-
-    Returns:
-        DFG summary string (e.g., "vars:5, def-use chains:8").
-    """
-    if content is None:
-        if not file_path.exists():
-            return ""
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return ""
-
-    try:
-        if lang == "python":
-            from tldr.dfg_extractor import extract_python_dfg
-
-            dfg = extract_python_dfg(content, func_name)
-
-            # Count unique variables and def-use chains
-            var_names = set()
-            for ref in dfg.var_refs:
-                var_names.add(ref.name)
-
-            return f"vars:{len(var_names)}, def-use chains:{len(dfg.dataflow_edges)}"
-        # Add other languages as needed
-    except Exception:
-        pass
-
-    return ""
-
-
-# Cached wrappers for CFG/DFG extraction to avoid repeated file I/O and parsing.
-# Uses string paths (hashable) as cache keys.
-# Cache size of 1000 handles typical project sizes; entries evicted LRU when exceeded.
-# NOTE: mtime_ns is included in cache key to auto-invalidate on file changes.
-
-
-def _get_file_mtime_ns(file_path: Path) -> int:
-    """Get file modification time in nanoseconds, or 0 if unavailable."""
-    try:
-        return file_path.stat().st_mtime_ns
-    except (OSError, IOError):
-        return 0
-
-
-@lru_cache(maxsize=1000)
-def _get_cfg_summary_cached(
-    file_path_str: str, func_name: str, lang: str, mtime_ns: int
-) -> str:
-    """Cached version of CFG summary extraction.
-
-    Args:
-        file_path_str: String path to the file (must be string for hashability).
-        func_name: Name of the function to analyze.
-        lang: Programming language.
-        mtime_ns: File modification time in nanoseconds (for cache invalidation).
-
-    Returns:
-        CFG summary string (complexity and block count).
-    """
-    # mtime_ns is only used as cache key - not passed to inner function
-    _ = mtime_ns
-    return _get_cfg_summary(Path(file_path_str), func_name, lang)
-
-
-@lru_cache(maxsize=1000)
-def _get_dfg_summary_cached(
-    file_path_str: str, func_name: str, lang: str, mtime_ns: int
-) -> str:
-    """Cached version of DFG summary extraction.
-
-    Args:
-        file_path_str: String path to the file (must be string for hashability).
-        func_name: Name of the function to analyze.
-        lang: Programming language.
-        mtime_ns: File modification time in nanoseconds (for cache invalidation).
-
-    Returns:
-        DFG summary string (variable count and def-use chains).
-    """
-    # mtime_ns is only used as cache key - not passed to inner function
-    _ = mtime_ns
-    return _get_dfg_summary(Path(file_path_str), func_name, lang)
-
-
-def _get_function_signature(
-    file_path: Path,
-    func_name: str,
-    lang: str,
-    content: Optional[str] = None,
-    ast_tree=None,
-) -> Optional[str]:
-    """Extract function signature from file.
-
-    Args:
-        file_path: Path to the source file.
-        func_name: Name of the function to extract signature for.
-        lang: Programming language.
-        content: Optional pre-read file content to avoid redundant I/O.
-        ast_tree: Optional pre-parsed AST tree (for Python) to avoid redundant parsing.
-
-    Returns:
-        Function signature string or None if not found.
-    """
-    import ast as ast_module
-
-    if content is None:
-        if not file_path.exists():
-            return None
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return None
-
-    try:
-        if lang == "python":
-            if ast_tree is None:
-                ast_tree = ast_module.parse(content)
-            for node in ast_module.walk(ast_tree):
-                if isinstance(node, ast_module.FunctionDef) and node.name == func_name:
-                    # Build signature from args
-                    args = []
-                    for arg in node.args.args:
-                        arg_str = arg.arg
-                        if arg.annotation:
-                            arg_str += f": {ast_module.unparse(arg.annotation)}"
-                        args.append(arg_str)
-
-                    returns = ""
-                    if node.returns:
-                        returns = f" -> {ast_module.unparse(node.returns)}"
-
-                    return f"def {func_name}({', '.join(args)}){returns}"
-
-
-        # For other languages, return simple signature
-        return f"function {func_name}(...)"
-
-    except Exception:
-        return None
-
-
-def _get_function_docstring(
-    file_path: Path,
-    func_name: str,
-    lang: str,
-    content: Optional[str] = None,
-    ast_tree=None,
-) -> Optional[str]:
-    """Extract function docstring from file.
-
-    Args:
-        file_path: Path to the source file.
-        func_name: Name of the function to extract docstring for.
-        lang: Programming language.
-        content: Optional pre-read file content to avoid redundant I/O.
-        ast_tree: Optional pre-parsed AST tree (for Python) to avoid redundant parsing.
-
-    Returns:
-        Function docstring or None if not found.
-    """
-    import ast as ast_module
-
-    if content is None:
-        if not file_path.exists():
-            return None
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return None
-
-    try:
-        if lang == "python":
-            if ast_tree is None:
-                ast_tree = ast_module.parse(content)
-            for node in ast_module.walk(ast_tree):
-                if isinstance(node, ast_module.FunctionDef) and node.name == func_name:
-                    return ast_module.get_docstring(node)
-
-        return None
-
-    except Exception:
-        return None
 
 
 def _process_file_for_extraction(
@@ -1036,6 +897,17 @@ def _process_file_for_extraction(
         logger.warning(f"Failed to read {file_path}: {e}")
         return units
 
+    # Build line offset map for character-based extraction
+    # This allows us to convert line numbers to character offsets
+    line_offsets = [0]  # Line 1 starts at offset 0
+    for i, line in enumerate(lines[:-1]):
+        line_offsets.append(line_offsets[-1] + len(line) + 1)  # +1 for newline
+
+    def get_char_offset(line_num: int) -> int:
+        """Convert 1-based line number to character offset."""
+        idx = max(0, min(line_num - 1, len(line_offsets) - 1))
+        return line_offsets[idx]
+
     # Use tree-sitter based extraction for ALL languages (not just Python)
     # This provides consistent line numbers, signatures, and docstrings
     ast_info = {"functions": {}, "classes": {}, "methods": {}}
@@ -1047,32 +919,39 @@ def _process_file_for_extraction(
         module_info = extract_file(str(full_path))
 
         # Build lookup dicts from extracted info
+        # Note: We extract generous amounts of code, chunking happens later if needed
         for func in module_info.functions:
-            # Extract code preview (first 10 lines from function start)
-            start_idx = max(0, func.line_number - 1)
-            end_idx = min(start_idx + 10, len(lines))
-            code_preview = '\n'.join(lines[start_idx:end_idx])
+            # Extract raw code without truncation - chunking handles oversized
+            start_offset = get_char_offset(func.line_number)
+            # Extract up to ~32K tokens worth (safe for model context, chunk if bigger)
+            raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
 
             ast_info["functions"][func.name] = {
                 "line": func.line_number,
-                "code_preview": code_preview,
+                "code_preview": raw_code,  # Will be chunked if > 6K tokens
             }
             all_signatures[func.name] = func.signature()
             all_docstrings[func.name] = func.docstring or ""
 
         for cls in module_info.classes:
-            ast_info["classes"][cls.name] = {"line": cls.line_number}
+            # Extract class body - large classes will be chunked
+            class_offset = get_char_offset(cls.line_number)
+            raw_code, _ = extract_code_by_tokens(content, class_offset, 32000)
+
+            ast_info["classes"][cls.name] = {
+                "line": cls.line_number,
+                "code_preview": raw_code,  # Will be chunked if > 6K tokens
+            }
 
             # Process methods within each class
             for method in cls.methods:
                 method_key = f"{cls.name}.{method.name}"
-                start_idx = max(0, method.line_number - 1)
-                end_idx = min(start_idx + 10, len(lines))
-                code_preview = '\n'.join(lines[start_idx:end_idx])
+                start_offset = get_char_offset(method.line_number)
+                raw_code, _ = extract_code_by_tokens(content, start_offset, 32000)
 
                 ast_info["methods"][method_key] = {
                     "line": method.line_number,
-                    "code_preview": code_preview,
+                    "code_preview": raw_code,  # Will be chunked if > 6K tokens
                 }
                 all_signatures[method_key] = method.signature()
                 all_docstrings[method_key] = method.docstring or ""
@@ -1087,8 +966,8 @@ def _process_file_for_extraction(
         imports = get_imports(str(full_path), language=lang)
         modules = [imp.get("module", "") for imp in imports[:5] if imp.get("module")]
         dependencies = ", ".join(modules)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to extract imports from {file_path}: {e}")
 
     # Pre-compute CFG/DFG for all functions at once
     cfg_cache = {}
@@ -1117,7 +996,7 @@ def _process_file_for_extraction(
             except Exception:
                 dfg_cache[func_name] = ""
 
-    # Process functions
+    # Process functions - create units, enrich, and chunk if needed
     for func_name in file_info.get("functions", []):
         func_info = ast_info.get("functions", {}).get(func_name, {})
         unit = EmbeddingUnit(
@@ -1136,7 +1015,11 @@ def _process_file_for_extraction(
             dependencies=dependencies,
             code_preview=func_info.get("code_preview", ""),
         )
-        units.append(unit)
+        # Enrich with semantic patterns and complexity
+        enrich_unit(unit)
+        # Chunk if oversized
+        chunked = chunk_unit(unit)
+        units.extend(chunked)
 
     # Process classes
     for class_info in file_info.get("classes", []):
@@ -1147,9 +1030,11 @@ def _process_file_for_extraction(
             class_name = class_info
             methods = []
 
-        class_line = ast_info.get("classes", {}).get(class_name, {}).get("line", 1)
+        class_ast = ast_info.get("classes", {}).get(class_name, {})
+        class_line = class_ast.get("line", 1)
+        class_code = class_ast.get("code_preview", "")
 
-        # Add class itself
+        # Add class itself with code preview
         unit = EmbeddingUnit(
             name=class_name,
             qualified_name=f"{file_path.replace('/', '.')}.{class_name}",
@@ -1164,9 +1049,13 @@ def _process_file_for_extraction(
             cfg_summary="",
             dfg_summary="",
             dependencies=dependencies,
-            code_preview="",
+            code_preview=class_code,
         )
-        units.append(unit)
+        # Enrich with semantic patterns and complexity
+        enrich_unit(unit)
+        # Chunk if oversized (large classes get split)
+        chunked = chunk_unit(unit)
+        units.extend(chunked)
 
         # Add methods
         for method in methods:
@@ -1189,354 +1078,10 @@ def _process_file_for_extraction(
                 dependencies=dependencies,
                 code_preview=method_info.get("code_preview", ""),
             )
-            units.append(unit)
+            # Enrich with semantic patterns and complexity
+            enrich_unit(unit)
+            # Chunk if oversized
+            chunked = chunk_unit(unit)
+            units.extend(chunked)
 
     return units
-
-
-def _get_progress_console():
-    """Get rich Console if available and TTY, else None."""
-    if not sys.stdout.isatty():
-        return None
-    if os.environ.get("NO_PROGRESS") or os.environ.get("CI"):
-        return None
-    try:
-        from rich.console import Console
-
-        return Console()
-    except ImportError:
-        return None
-
-
-def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -> List[str]:
-    """Scan project files to detect present languages."""
-    from tldr.tldrignore import load_ignore_patterns, should_ignore
-    
-    # Extension map (copied from cli.py to avoid circular import)
-    EXTENSION_TO_LANGUAGE = {
-        '.java': 'java',
-        '.py': 'python',
-        '.ts': 'typescript',
-        '.tsx': 'typescript',
-        '.js': 'javascript',
-        '.jsx': 'javascript',
-        '.go': 'go',
-        '.rs': 'rust',
-        '.c': 'c',
-        '.h': 'c',
-        '.cpp': 'cpp',
-        '.hpp': 'cpp',
-        '.cc': 'cpp',
-        '.cxx': 'cpp',
-        '.hh': 'cpp',
-        '.rb': 'ruby',
-        '.php': 'php',
-        '.swift': 'swift',
-        '.cs': 'csharp',
-        '.kt': 'kotlin',
-        '.kts': 'kotlin',
-        '.scala': 'scala',
-        '.sc': 'scala',
-        '.lua': 'lua',
-        '.ex': 'elixir',
-        '.exs': 'elixir',
-    }
-    
-    found_languages = set()
-    spec = load_ignore_patterns(project_path) if respect_ignore else None
-    
-    for root, dirs, files in os.walk(project_path):
-        # Prune common heavy dirs immediately for speed
-        dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '.tldr', 'venv', '__pycache__', '.idea', '.vscode'}]
-        
-        for file in files:
-             file_path = Path(root) / file
-             
-             # Check ignore patterns
-             if respect_ignore and should_ignore(file_path, project_path, spec):
-                 continue
-                 
-             ext = file_path.suffix.lower()
-             if ext in EXTENSION_TO_LANGUAGE:
-                 found_languages.add(EXTENSION_TO_LANGUAGE[ext])
-
-    # Return sorted list intersect with ALL_LANGUAGES to ensure validity
-    return sorted(list(found_languages & set(ALL_LANGUAGES)))
-
-
-def build_semantic_index(
-    project_path: str,
-    lang: str = "all",
-    model: Optional[str] = None,
-    show_progress: bool = True,
-    respect_ignore: bool = True,
-) -> int:
-    """Build and save FAISS index + metadata for a project.
-
-    Creates a unified index at .tldr/cache/semantic/:
-    - index.faiss - Vector index
-    - metadata.json - Unit metadata with language info
-
-    Args:
-        project_path: Path to project root.
-        lang: Language to index - "all" (default) auto-detects and indexes all.
-        model: Model name from SUPPORTED_MODELS or HuggingFace name.
-        show_progress: Show progress spinner (default: True).
-        respect_ignore: If True, respect .tldrignore patterns (default True).
-
-    Returns:
-        Number of indexed units.
-    """
-    import faiss
-    from tldr.tldrignore import ensure_tldrignore
-
-    console = _get_progress_console() if show_progress else None
-
-    # Ensure .tldrignore exists (create with defaults if not)
-    project = Path(project_path).resolve()
-    created, message = ensure_tldrignore(project)
-    if created and console:
-        console.print(f"[yellow]{message}[/yellow]")
-
-    # Resolve model name early to get HF name for metadata
-    model_key = model if model else DEFAULT_MODEL
-    if model_key in SUPPORTED_MODELS:
-        hf_name = SUPPORTED_MODELS[model_key]["hf_name"]
-    else:
-        hf_name = model_key
-
-    # Unified cache directory - no language suffix
-    # All languages stored together in single index
-    cache_dir = project / ".tldr" / "cache" / "semantic"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Extract all units (respecting .tldrignore)
-    indexed_languages: List[str] = []
-    if console:
-        with console.status("[bold green]Extracting code units...") as status:
-            if lang == "all":
-                # Auto-detect which languages are present
-                status.update("[bold green]Scanning project languages...")
-                indexed_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
-                if not indexed_languages:
-                    console.print("[yellow]No supported languages detected in project[/yellow]")
-                    return 0
-                console.print(f"[dim]Detected languages: {', '.join(indexed_languages)}[/dim]")
-
-                units = []
-                for lang_name in indexed_languages:
-                    status.update(f"[bold green]Extracting {lang_name} code units...")
-                    units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
-            else:
-                indexed_languages = [lang]
-                units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
-            status.update(f"[bold green]Extracted {len(units)} code units")
-    else:
-        if lang == "all":
-            indexed_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
-            if not indexed_languages:
-                return 0
-            units = []
-            for lang_name in indexed_languages:
-                units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
-        else:
-            indexed_languages = [lang]
-            units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
-
-    if not units:
-        logger.warning(
-            "No indexable code units found. Check project contains supported source files."
-        )
-        return 0
-
-    # Build all texts first for batch encoding
-    texts = [build_embedding_text(unit) for unit in units]
-
-    # Batch encode embeddings (10-50x faster than sequential)
-    # SentenceTransformers handles batching internally with optimal GPU utilization
-    model_obj = get_model(model)
-    if console:
-        console.print(f"[bold green]Computing embeddings for {len(texts)} units...")
-    embeddings_matrix = model_obj.encode(
-        texts,
-        batch_size=32,
-        normalize_embeddings=True,
-        show_progress_bar=show_progress and console is not None,
-    )
-
-    # Build FAISS index (inner product for normalized vectors = cosine similarity)
-    if console:
-        with console.status("[bold green]Building FAISS index..."):
-            dimension = embeddings_matrix.shape[1]
-            index = faiss.IndexFlatIP(dimension)
-            index.add(embeddings_matrix)
-    else:
-        dimension = embeddings_matrix.shape[1]
-        index = faiss.IndexFlatIP(dimension)
-        index.add(embeddings_matrix)
-
-    # Save index and metadata atomically using temp files + rename
-    # This prevents corruption if crash occurs between writes
-    index_file = cache_dir / "index.faiss"
-    metadata_file = cache_dir / "metadata.json"
-    temp_index = cache_dir / "index.faiss.tmp"
-    temp_metadata = cache_dir / "metadata.json.tmp"
-
-    # Prepare metadata with version for future migrations
-    metadata = {
-        "version": 2,  # v2 = unified index format
-        "units": [u.to_dict() for u in units],
-        "model": hf_name,
-        "dimension": dimension,
-        "count": len(units),
-        "languages": indexed_languages,
-    }
-
-    # Write to temp files first
-    faiss.write_index(index, str(temp_index))
-    temp_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-    # Atomic replace (os.replace works cross-platform, unlike Path.rename on Windows)
-    os.replace(temp_index, index_file)
-    os.replace(temp_metadata, metadata_file)
-
-    if console:
-        console.print(f"[bold green]✓[/] Indexed {len(units)} code units")
-
-    return len(units)
-
-
-def semantic_search(
-    project_path: str,
-    query: str,
-    k: int = 5,
-    expand_graph: bool = False,
-    model: Optional[str] = None,
-    lang: Optional[str] = None,  # Ignored - searches unified index
-) -> List[dict]:
-    """Search for code units semantically.
-
-    Searches the unified index containing all languages.
-
-    Args:
-        project_path: Path to project root.
-        query: Natural language query.
-        k: Number of results to return.
-        expand_graph: If True, include callers/callees in results.
-        model: Model to use for query embedding. If None, uses
-               the model from the index metadata.
-        lang: Deprecated - ignored. Searches unified index with all languages.
-
-    Returns:
-        List of result dictionaries with name, file, line, score, language, etc.
-    """
-    import faiss
-    import warnings
-
-    # Validate inputs
-    if query is None:
-        raise TypeError("query cannot be None")
-    if not query.strip():
-        raise ValueError("query cannot be empty")
-    if k <= 0:
-        raise ValueError("k must be positive")
-
-    # Deprecation warning for lang parameter
-    if lang is not None:
-        warnings.warn(
-            "lang parameter is deprecated. Unified index searches all languages.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-
-    project = Path(project_path).resolve()
-    # Unified cache directory - same as build_semantic_index
-    cache_dir = project / ".tldr" / "cache" / "semantic"
-
-    index_file = cache_dir / "index.faiss"
-    metadata_file = cache_dir / "metadata.json"
-
-    # Check index exists - with migration hint for old lang-specific indexes
-    if not index_file.exists():
-        # Check for old language-specific indexes
-        for old_lang in ALL_LANGUAGES:
-            old_index = cache_dir / old_lang / "index.faiss"
-            if old_index.exists():
-                raise FileNotFoundError(
-                    f"Found old index at {old_index}. "
-                    f"Run 'tldr semantic index .' to migrate to unified index."
-                )
-        raise FileNotFoundError(
-            f"Semantic index not found. Run: tldr semantic index {project}"
-        )
-
-    if not metadata_file.exists():
-        raise FileNotFoundError(
-            f"Metadata not found at {metadata_file}. Run: tldr semantic index ."
-        )
-
-    # Load index and metadata
-    try:
-        index = faiss.read_index(str(index_file))
-    except RuntimeError as e:
-        if "not recognized" in str(e):
-            raise ValueError(
-                f"Corrupted index at {index_file}. Rebuild: tldr semantic index ."
-            ) from e
-        raise
-    metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
-    units = metadata["units"]
-
-    # Validate dimension matches
-    expected_dim = metadata.get("dimension")
-    if expected_dim and index.d != expected_dim:
-        raise ValueError(
-            f"Index dimension ({index.d}) != metadata ({expected_dim}). "
-            "Rebuild: tldr semantic index ."
-        )
-
-    # Use model from metadata if not specified (ensures matching embeddings)
-    index_model = metadata.get("model")
-    if model is None and index_model:
-        model = index_model
-
-    # Embed query (with instruction prefix for BGE)
-    query_text = f"Represent this code search query: {query}"
-    query_embedding = compute_embedding(query_text, model_name=model)
-    query_embedding = query_embedding.reshape(1, -1)
-
-    # Search
-    k = min(k, len(units))
-    scores, indices = index.search(query_embedding, k)
-
-    # Build results
-    results = []
-    for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-        if idx < 0 or idx >= len(units):
-            continue
-
-        unit = units[idx]
-        result = {
-            "name": unit["name"],
-            "qualified_name": unit["qualified_name"],
-            "file": unit["file"],
-            "line": unit["line"],
-            "language": unit.get("language", "unknown"),
-            "unit_type": unit["unit_type"],
-            "signature": unit["signature"],
-            "docstring": unit.get("docstring", ""),
-            "code_preview": unit.get("code_preview", ""),
-            "score": float(score),
-        }
-
-        # Include graph expansion if requested
-        if expand_graph:
-            result["calls"] = unit.get("calls", [])
-            result["called_by"] = unit.get("called_by", [])
-            result["related"] = list(
-                set(unit.get("calls", []) + unit.get("called_by", []))
-            )
-
-        results.append(result)
-
-    return results

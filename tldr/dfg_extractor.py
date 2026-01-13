@@ -18,6 +18,11 @@ Uses reaching definitions analysis on CFG to build def-use chains.
 import ast
 from dataclasses import dataclass
 
+# Excluded variable patterns - only single underscore (_) used as throwaway
+# and double underscore (__) used for name mangling. Legitimate variables
+# like _temp, _result, _count should NOT be excluded.
+EXCLUDED_VAR_PATTERNS: frozenset[str] = frozenset({'_', '__'})
+
 
 @dataclass(slots=True)
 class VarRef:
@@ -113,11 +118,14 @@ class PythonDefUseVisitor(ast.NodeVisitor):
     Extract variable definitions and uses from Python AST.
 
     Builds a list of VarRefs for all variable references.
+    Properly handles scope to exclude nested function variables.
     """
 
     def __init__(self):
         self.refs: list[VarRef] = []
-        self.scope_stack: list[set[str]] = [set()]  # Track local scope
+        self._depth: int = 0  # Track function nesting depth
+        self._global_vars: set[str] = set()  # Variables declared global
+        self._nonlocal_vars: set[str] = set()  # Variables declared nonlocal
 
     def _add_ref(self, name: str, ref_type: str, node: ast.AST):
         """Add a variable reference."""
@@ -129,22 +137,73 @@ class PythonDefUseVisitor(ast.NodeVisitor):
         )
         self.refs.append(ref)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        """Handle function definition - parameters are definitions."""
-        # Add parameters as definitions
-        for arg in node.args.args:
+    def _add_function_params(self, args: ast.arguments):
+        """Add all parameter types as definitions."""
+        for arg in args.args:
             self._add_ref(arg.arg, "definition", arg)
+        for arg in args.kwonlyargs:
+            self._add_ref(arg.arg, "definition", arg)
+        for arg in args.posonlyargs:
+            self._add_ref(arg.arg, "definition", arg)
+        if args.vararg:
+            self._add_ref(args.vararg.arg, "definition", args.vararg)
+        if args.kwarg:
+            self._add_ref(args.kwarg.arg, "definition", args.kwarg)
 
-        # Process body
-        for stmt in node.body:
-            self.visit(stmt)
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Handle function definition - parameters are definitions.
+
+        Nested functions are skipped - they have their own DFG scope.
+        """
+        self._depth += 1
+        try:
+            if self._depth > 1:
+                # Nested function - skip entirely (it has its own scope)
+                return
+
+            # Add parameters as definitions
+            self._add_function_params(node.args)
+
+            # Process body (nested functions will be skipped due to depth check)
+            for stmt in node.body:
+                self.visit(stmt)
+        finally:
+            self._depth -= 1
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        """Handle async function - same as regular function."""
-        for arg in node.args.args:
-            self._add_ref(arg.arg, "definition", arg)
-        for stmt in node.body:
-            self.visit(stmt)
+        """Handle async function - same as regular function.
+
+        Nested functions are skipped - they have their own DFG scope.
+        """
+        self._depth += 1
+        try:
+            if self._depth > 1:
+                # Nested function - skip entirely
+                return
+
+            self._add_function_params(node.args)
+            for stmt in node.body:
+                self.visit(stmt)
+        finally:
+            self._depth -= 1
+
+    def visit_Global(self, node: ast.Global):
+        """Handle global declaration.
+
+        Global variables reference module-level scope, not local definitions.
+        We track them but don't add as definitions (they're defined elsewhere).
+        """
+        for name in node.names:
+            self._global_vars.add(name)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal):
+        """Handle nonlocal declaration.
+
+        Nonlocal variables reference enclosing scope, not local definitions.
+        We track them but don't add as definitions (they're defined elsewhere).
+        """
+        for name in node.names:
+            self._nonlocal_vars.add(name)
 
     def visit_Assign(self, node: ast.Assign):
         """Handle assignment: target = value."""
@@ -222,6 +281,31 @@ class PythonDefUseVisitor(ast.NodeVisitor):
             self._add_ref(node.id, "use", node)
         # Store context is handled by parent (Assign, etc.)
 
+    def visit_Import(self, node: ast.Import):
+        """Handle import statement - imported names are definitions.
+
+        For 'import foo.bar', the definition is 'foo' (top-level module).
+        For 'import foo as f', the definition is 'f' (the alias).
+        """
+        for alias in node.names:
+            if alias.asname:
+                # import foo as f -> defines 'f'
+                name = alias.asname
+            else:
+                # import foo.bar -> defines 'foo' (top-level only)
+                name = alias.name.split(".")[0]
+            self._add_ref(name, "definition", alias)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Handle from ... import - imported names are definitions.
+
+        For 'from foo import bar', the definition is 'bar'.
+        For 'from foo import bar as b', the definition is 'b'.
+        """
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            self._add_ref(name, "definition", alias)
+
     def visit_comprehension(self, node: ast.comprehension):
         """Handle comprehension - target is definition, iter/ifs are uses."""
         self.visit(node.iter)
@@ -258,7 +342,58 @@ class PythonDefUseVisitor(ast.NodeVisitor):
         """Handle lambda - parameters are definitions."""
         for arg in node.args.args:
             self._add_ref(arg.arg, "definition", arg)
+        for arg in node.args.kwonlyargs:
+            self._add_ref(arg.arg, "definition", arg)
+        # Note: posonlyargs not valid in lambda syntax
+        if node.args.vararg:
+            self._add_ref(node.args.vararg.arg, "definition", node.args.vararg)
+        if node.args.kwarg:
+            self._add_ref(node.args.kwarg.arg, "definition", node.args.kwarg)
         self.visit(node.body)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr):
+        """Handle walrus operator := (Python 3.8+)."""
+        # The target is a definition
+        self._add_ref(node.target.id, "definition", node.target)
+        # Visit the value (may have uses)
+        self.visit(node.value)
+
+    def visit_Match(self, node: ast.Match):
+        """Handle match statement (Python 3.10+)."""
+        self.visit(node.subject)
+        for case in node.cases:
+            self._visit_pattern(case.pattern)
+            if case.guard:
+                self.visit(case.guard)
+            for stmt in case.body:
+                self.visit(stmt)
+
+    def _visit_pattern(self, pattern: ast.AST):
+        """Extract variable bindings from match patterns."""
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.name:
+                self._add_ref(pattern.name, "definition", pattern)
+            if pattern.pattern:
+                self._visit_pattern(pattern.pattern)
+        elif isinstance(pattern, ast.MatchOr):
+            for p in pattern.patterns:
+                self._visit_pattern(p)
+        elif isinstance(pattern, ast.MatchSequence):
+            for p in pattern.patterns:
+                self._visit_pattern(p)
+        elif isinstance(pattern, ast.MatchMapping):
+            for p in pattern.patterns:
+                self._visit_pattern(p)
+            if pattern.rest:
+                self._add_ref(pattern.rest, "definition", pattern)
+        elif isinstance(pattern, ast.MatchClass):
+            for p in pattern.patterns:
+                self._visit_pattern(p)
+            for p in pattern.kwd_patterns:
+                self._visit_pattern(p)
+        elif isinstance(pattern, ast.MatchStar):
+            if pattern.name:
+                self._add_ref(pattern.name, "definition", pattern)
 
     # Generic visitor for expressions with children
     def generic_visit(self, node: ast.AST):
@@ -415,6 +550,31 @@ class CFGReachingDefsAnalyzer:
                     if new_range < existing_range:
                         line_to_block[line] = block.id
 
+        # Find entry block for orphan line assignment
+        entry_block_id = None
+        for block in self.cfg.blocks:
+            if block.block_type == "entry":
+                entry_block_id = block.id
+                break
+        # Fallback: find block with no predecessors
+        if entry_block_id is None:
+            for block in self.cfg.blocks:
+                if not self.predecessors.get(block.id):
+                    entry_block_id = block.id
+                    break
+
+        # Handle orphan lines: defs/uses not covered by any CFG block
+        # Assign them to the entry block so their definitions propagate
+        orphan_lines = set()
+        for line in self.defs_by_line:
+            if line not in line_to_block and entry_block_id is not None:
+                line_to_block[line] = entry_block_id
+                orphan_lines.add(line)
+        for line in self.uses_by_line:
+            if line not in line_to_block and entry_block_id is not None:
+                line_to_block[line] = entry_block_id
+                orphan_lines.add(line)
+
         for block in self.cfg.blocks:
             for line in self._get_block_lines(block):
                 # Only count this line's defs if this block owns the line
@@ -426,6 +586,14 @@ class CFGReachingDefsAnalyzer:
                         gen[block.id][def_ref.name] = [def_ref]
                         # Kill: this block kills prior definitions of same var
                         kill[block.id].add(def_ref.name)
+
+        # Process orphan lines explicitly (they were assigned to entry block but not in its line range)
+        if entry_block_id is not None and orphan_lines:
+            for line in sorted(orphan_lines):  # Process in order for deterministic behavior
+                if line in self.defs_by_line:
+                    for def_ref in self.defs_by_line[line]:
+                        gen[entry_block_id][def_ref.name] = [def_ref]
+                        kill[entry_block_id].add(def_ref.name)
 
         # Worklist algorithm - iterate until fixed point
         changed = True
@@ -475,7 +643,14 @@ class CFGReachingDefsAnalyzer:
             # Get reaching defs at start of block - DEEP COPY
             block_reaching = {k: list(v) for k, v in reaching_in[block.id].items()}
 
-            for line in self._get_block_lines(block):
+            # Build the list of lines to process for this block
+            # Include orphan lines if this is the entry block
+            lines_to_process = list(self._get_block_lines(block))
+            if block.id == entry_block_id and orphan_lines:
+                # Add orphan lines and sort to maintain proper definition order
+                lines_to_process = sorted(set(lines_to_process) | orphan_lines)
+
+            for line in lines_to_process:
                 # Only process lines that this block owns
                 if line_to_block.get(line) != block.id:
                     continue
@@ -497,12 +672,12 @@ class CFGReachingDefsAnalyzer:
         return edges
 
 
-def extract_python_dfg(code: str, function_name: str) -> DFGInfo:
+def _extract_python_dfg_impl(code: str, function_name: str) -> DFGInfo:
     """
-    Extract DFG for a Python function using CFG-based reaching definitions.
+    Internal implementation of Python DFG extraction.
 
-    This properly handles control flow - definitions from both if/else
-    branches will reach uses after the merge point.
+    Uses CFG-based reaching definitions analysis when CFG extraction succeeds,
+    otherwise falls back to simple linear analysis.
 
     Args:
         code: Python source code
@@ -551,7 +726,7 @@ def extract_python_dfg(code: str, function_name: str) -> DFGInfo:
     )
 
 
-def extract_python_dfg_with_cfg(code: str, function_name: str) -> DFGInfo:
+def extract_python_dfg(code: str, function_name: str) -> DFGInfo:
     """
     Extract DFG for a Python function using CFG-based reaching definitions.
 
@@ -565,55 +740,41 @@ def extract_python_dfg_with_cfg(code: str, function_name: str) -> DFGInfo:
     Returns:
         DFGInfo with variable references and def-use chains
     """
-    from tldr.cfg_extractor import extract_python_cfg
+    return _extract_python_dfg_impl(code, function_name)
 
-    tree = ast.parse(code)
 
-    # Find the function
-    func_node = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == function_name:
-                func_node = node
-                break
+def extract_python_dfg_with_cfg(code: str, function_name: str) -> DFGInfo:
+    """
+    Extract DFG for a Python function using CFG-based reaching definitions.
 
-    if func_node is None:
-        return DFGInfo(
-            function_name=function_name,
-            var_refs=[],
-            dataflow_edges=[],
-        )
+    This is an alias for extract_python_dfg() - both functions use CFG-based
+    analysis when available, falling back to simple linear analysis otherwise.
 
-    # Extract definitions and uses
-    visitor = PythonDefUseVisitor()
-    visitor.visit(func_node)
+    Args:
+        code: Python source code
+        function_name: Name of function to analyze
 
-    # Get CFG for the function
-    try:
-        cfg = extract_python_cfg(code, function_name)
-    except ValueError:
-        # Fall back to simple analysis if CFG extraction fails
-        analyzer = PythonReachingDefsAnalyzer(visitor.refs)
-        edges = analyzer.compute_def_use_chains()
-        return DFGInfo(
-            function_name=function_name,
-            var_refs=visitor.refs,
-            dataflow_edges=edges,
-        )
-
-    # Compute def-use chains using CFG
-    analyzer = CFGReachingDefsAnalyzer(visitor.refs, cfg)
-    edges = analyzer.compute_def_use_chains()
-
-    return DFGInfo(
-        function_name=function_name,
-        var_refs=visitor.refs,
-        dataflow_edges=edges,
-    )
+    Returns:
+        DFGInfo with variable references and def-use chains
+    """
+    return _extract_python_dfg_impl(code, function_name)
 
 
 # =============================================================================
 # Tree-sitter based DFG extraction (TypeScript, Go, Rust)
+# =============================================================================
+#
+# NOTE: Non-Python languages currently use simple linear reaching definitions
+# analysis, which processes lines in source order without CFG-based control
+# flow awareness. This means:
+# - Branch merge points don't combine definitions from both paths
+# - Loop back-edges aren't modeled (definitions from loop body don't reach
+#   subsequent iterations)
+#
+# FUTURE ENHANCEMENT (HIGH-024): Add CFG-based analysis for non-Python languages
+# by building CFG from tree-sitter parse trees and using CFGReachingDefsAnalyzer.
+# Priority: High - affects dataflow accuracy for TypeScript, Go, Rust, etc.
+#
 # =============================================================================
 
 # Tree-sitter imports (optional)
@@ -943,7 +1104,7 @@ class TreeSitterDefUseVisitor:
             "break",
             "continue",
         }
-        return name not in keywords and not name.startswith("_")
+        return name not in keywords and name not in EXCLUDED_VAR_PATTERNS
 
     def _add_ref(self, name: str, ref_type: str, node):
         """Add a variable reference."""
@@ -2268,7 +2429,7 @@ class CSharpDefUseVisitor:
             "using",
             "namespace",
         }
-        return name not in keywords and not name.startswith("_")
+        return name not in keywords and name not in EXCLUDED_VAR_PATTERNS
 
     def _handle_local_declaration(self, node):
         """Handle C# local variable declaration: int x = 5; or var x = 5;"""
@@ -2521,7 +2682,7 @@ class KotlinDefUseVisitor:
             "open",
             "sealed",
         }
-        return name not in keywords and not name.startswith("_")
+        return name not in keywords and name not in EXCLUDED_VAR_PATTERNS
 
     def _handle_property_declaration(self, node):
         """Handle Kotlin property declaration: val x = ... or var x = ..."""
@@ -2800,7 +2961,7 @@ class ScalaDefUseVisitor:
             "Unit",
             "Any",
         }
-        return name not in keywords and not name.startswith("_")
+        return name not in keywords and name not in EXCLUDED_VAR_PATTERNS
 
     def _handle_val_definition(self, node):
         """Handle Scala val definition: val x = ..."""
@@ -3104,7 +3265,7 @@ class LuaDefUseVisitor:
             "in",
             "self",  # convention for method receiver
         }
-        return name not in keywords and not name.startswith("_")
+        return name not in keywords and name not in EXCLUDED_VAR_PATTERNS
 
     def _handle_local_declaration(self, node):
         """Handle Lua local variable declaration: local x = ... or local x, y = ..."""
